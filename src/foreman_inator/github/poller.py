@@ -44,11 +44,34 @@ Requests per repo per poll (``PollResult.requests``)
 *changed* issue that has an open ticket or is an ``agent``-labeled open candidate ·
 ``+1`` ``get_pr`` per open ticket with a PR · ``+1`` ``list_reviews`` per ticket in
 testing. Only when a new human review arrives: ``+1`` ``get_branch_sha`` (head check),
-and for request-changes ``+1`` ``get_issue`` on the PR (kickback label) and ``+1``
-``list_issue_events`` on the PR if a kickback label is present. Plus one ``bot_login``
+and for request-changes on the head ``+1`` ``get_issue`` on the PR (kickback label),
+``+1`` ``list_issue_events`` on the PR if a kickback label is present, and (#42) ``+1``
+``list_review_comments`` for the review's line comments. Plus one ``bot_login``
 per ``Poller``. An idle repo with one ticket in testing costs 3 requests per poll; with
 none open, 1. First poll of a repo (no cursor): the listing is ``label=agent,
 state=open`` and every open ticket not in it gets one ``get_issue``.
+
+GitHub CI (#41, opt-in: ``Poller(..., ci=True)``)
+------------------------------------------------
+For each ticket in ``testing`` whose PR attempt passed its local checks and waits on CI
+(``outcome`` and ``ci_status`` NULL, no live AI review yet): ``+1`` ``list_check_runs`` on
+the PR head per poll. When the runs are red, once: ``+1`` ``get_branch_sha`` (base head)
+and ``+1`` ``list_check_runs`` on it, and ``+1`` ``get_job_log_tail`` for the first red
+job charged to the attempt (its 302 download is one more HTTP request, outside the API
+rate limit). The decision is ``lifecycle.decide_ci`` with this poller's clock, counted
+from the attempt's ``ended_at``; ``CiResult`` is emitted only once it is decided, and
+stops once the worker stored ``attempts.ci_status`` (no cursor needed). A 403 on the
+check runs (an App without ``checks: read``) logs one warning per ``Poller``, emits
+``CiResult(state="no_permission")`` and skips CI reads for the rest of the process.
+
+Base conflicts (#43, opt-in: ``Poller(..., conflicts=True)``)
+------------------------------------------------------------
+No extra requests: ``mergeable`` comes from the ``get_pr`` above. A ticket in ``testing``
+whose PR has ``mergeable is False`` gives one ``BaseConflict`` per PR head (cursor
+``conflict:<pr>`` = the head sha it was handled on); ``None`` (GitHub still computing) and
+``True`` (including "behind but clean") give nothing. A new review event for the ticket in
+the same poll wins (its attempt starts from the PR anyway); CI is not read for a ticket
+that conflicts.
 
 Edge cases (decisions, todo #11)
 --------------------------------
@@ -75,31 +98,52 @@ Edge cases (decisions, todo #11)
 from __future__ import annotations
 
 import json
+import logging
 import re
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from foreman_inator.config import Config
-from foreman_inator.db.store import OPEN_COLUMNS, Store, Ticket
-from foreman_inator.github.client import GitHubAPI, Issue, IssueEvent, PullRequest
+from foreman_inator.db.store import OPEN_COLUMNS, Attempt, Store, Ticket
+from foreman_inator.github.app_auth import GitHubError
+from foreman_inator.github.client import (
+    GitHubAPI,
+    Issue,
+    IssueEvent,
+    MissingPermission,
+    PullRequest,
+)
 from foreman_inator.tickets.lifecycle import (
     KICKBACK_TAGS,
     AgentLabelRemoved,
+    BaseConflict,
+    CiResult,
     ClosedUnmerged,
     GitHubEvent,
     IssueEdited,
+    LineComment,
     Merged,
     ReviewSubmitted,
     TicketRequested,
     TierOverride,
+    count_rebase_attempts,
+    decide_ci,
 )
 
 AGENT_LABEL = "agent"
 REVIEW_SKIP_LABEL = "review:skip"
 ISSUES_CURSOR = "issues_since"
 DEFAULT_OVERLAP = timedelta(seconds=60)
+#: Printed once per Poller when the App cannot read check runs (#41).
+CI_PERMISSION_WARNING = (
+    "GitHub CI is not checked: the App lacks the 'checks: read' (and 'actions: read') "
+    "permission. Run `fman setup` to see how to add them; until then PRs go to AI review "
+    "without waiting for CI."
+)
+
+log = logging.getLogger("foreman_inator.poller")
 
 _TIER = re.compile(r"^tier:([123])$", re.IGNORECASE)
 _KICKBACK = re.compile(r"^kickback:(\w+)$", re.IGNORECASE)
@@ -116,6 +160,10 @@ def tier_cursor(issue_number: int) -> str:
 
 def review_cursor(pr_number: int) -> str:
     return f"review:{pr_number}"
+
+
+def conflict_cursor(pr_number: int) -> str:
+    return f"conflict:{pr_number}"
 
 
 @dataclass
@@ -164,6 +212,9 @@ class Poller:
         repos: Iterable[str] | None = None,
         agent_label: str = AGENT_LABEL,
         overlap: timedelta = DEFAULT_OVERLAP,
+        ci: bool = False,
+        conflicts: bool = False,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.api = api
         self.store = store
@@ -171,7 +222,13 @@ class Poller:
         self.repos = tuple(repos if repos is not None else config.repos)
         self.agent_label = agent_label
         self.overlap = overlap
+        #: #41: read GitHub CI for tickets waiting on it (off until the worker wires it).
+        self.ci = ci
+        #: #43: emit BaseConflict for a conflicting PR in testing (off until wired).
+        self.conflicts = conflicts
+        self.clock = clock or (lambda: datetime.now(UTC))
         self._bot: str | None = None
+        self._ci_forbidden = False
 
     # ------------------------------------------------------------------ public API
 
@@ -322,7 +379,12 @@ class Poller:
                     )
                 )
         if pr is not None and t.column == "testing":
+            before = len(out)
             self._review_event(api, repo, t, pr, out)
+            if self.conflicts and len(out) == before:
+                self._conflict_event(repo, t, pr, out)
+            if self.ci and len(out) == before:
+                self._ci_event(api, repo, t, pr, out)
 
     def _review_event(
         self, api: Any, repo: str, t: Ticket, pr: PullRequest, out: list[GitHubEvent]
@@ -337,8 +399,13 @@ class Poller:
         on_head = review.commit_id is None or review.commit_id == head
         verdict = _HUMAN_VERDICTS[review.state]
         tag = label = None
+        comments: tuple[LineComment, ...] = ()
         if verdict == "changes" and on_head:
             tag, label = self._kickback_tag(api, repo, pr.number)
+            comments = tuple(
+                LineComment(c.path, c.line, c.diff_hunk, c.body)
+                for c in api.list_review_comments(repo, pr.number, review.id)
+            )
         out.append(
             ReviewSubmitted(
                 repo,
@@ -353,9 +420,107 @@ class Poller:
                 kickback_label=label,
                 commit_id=review.commit_id,
                 on_head=on_head,
+                line_comments=comments,
                 cursors=((review_cursor(pr.number), str(max(r.id for r in new))),),
             )
         )
+
+    def _conflict_event(
+        self, repo: str, t: Ticket, pr: PullRequest, out: list[GitHubEvent]
+    ) -> None:
+        if pr.state != "open" or pr.mergeable is not False or not pr.head_sha:
+            return
+        if self.store.get_cursor(repo, conflict_cursor(pr.number)) == pr.head_sha:
+            return  # this head's conflict was already handled (rebase started, or flagged)
+        out.append(
+            BaseConflict(
+                repo,
+                t.issue_number,
+                ticket_id=t.id,
+                pr_number=pr.number,
+                head_sha=pr.head_sha,
+                rebases_done=count_rebase_attempts(self.store.list_attempts(t.id)),
+                cursors=((conflict_cursor(pr.number), pr.head_sha),),
+            )
+        )
+
+    def _ci_event(
+        self, api: Any, repo: str, t: Ticket, pr: PullRequest, out: list[GitHubEvent]
+    ) -> None:
+        att = self._waiting_on_ci(t)
+        if att is None or not pr.head_sha:
+            return
+
+        def emit(state: str, **kw: Any) -> None:
+            out.append(
+                CiResult(
+                    repo,
+                    t.issue_number,
+                    ticket_id=t.id,
+                    attempt_id=att.id,
+                    head_sha=pr.head_sha,
+                    state=state,  # type: ignore[arg-type]
+                    **kw,
+                )
+            )
+
+        if self._ci_forbidden:
+            emit("no_permission", note="CI not checked: the App lacks 'checks: read'")
+            return
+        try:
+            runs = api.list_check_runs(repo, pr.head_sha)
+        except MissingPermission:
+            self._ci_forbidden = True
+            log.warning(CI_PERMISSION_WARNING)
+            emit("no_permission", note="CI not checked: the App lacks 'checks: read'")
+            return
+        now = self.clock()
+        assert att.ended_at is not None
+        decision = decide_ci(runs, waiting_since=att.ended_at, now=now)
+        if decision.state == "needs_base":
+            try:
+                base_runs = api.list_check_runs(repo, api.get_branch_sha(repo, pr.base_ref))
+            except GitHubError as exc:  # base unreadable: the red runs are charged
+                log.info("CI on the base of %s#%d not read: %s", repo, pr.number, exc)
+                base_runs = []
+            decision = decide_ci(runs, waiting_since=att.ended_at, now=now, base_runs=base_runs)
+        if not decision.decided:
+            return
+        output = None
+        if decision.state == "failed":
+            output = self._ci_failure_output(api, repo, runs, decision.failed)
+        emit(decision.state, note=decision.note, failed_jobs=decision.failed, failure_output=output)
+
+    def _waiting_on_ci(self, t: Ticket) -> Attempt | None:
+        """The ticket's PR attempt, if it passed its local checks and CI has not been
+        decided for it yet (and no AI review was stored for it)."""
+        attempts = self.store.list_attempts(t.id)
+        if not attempts:
+            return None
+        att = attempts[-1]
+        if not att.tests_passed or att.outcome is not None or att.ended_at is None:
+            return None
+        if att.ci_status is not None or self.store.list_reviews(attempt_id=att.id, shadow=False):
+            return None
+        return att
+
+    def _ci_failure_output(
+        self, api: Any, repo: str, runs: Iterable[Any], failed: tuple[str, ...]
+    ) -> str:
+        red = [r for r in runs if r.name in failed and r.status == "completed"]
+        head = "GitHub CI failed on the pull request: " + ", ".join(
+            f"{r.name} ({r.conclusion})" for r in red
+        )
+        job = next((r for r in red if r.job_id is not None), None)
+        if job is None:
+            return head + "\n(no job log: these checks are not GitHub Actions jobs)"
+        try:
+            tail = api.get_job_log_tail(repo, job.job_id)
+        except MissingPermission:
+            return head + "\n(no job log: the App lacks 'actions: read')"
+        except GitHubError as exc:
+            return head + f"\n(no job log: {exc.status} {exc.message})"
+        return f"{head}\nEnd of the log of job {job.name}:\n{tail}"
 
     # ------------------------------------------------------------------ helpers
 
@@ -433,12 +598,14 @@ def _last_unlabel_actor(events: Iterable[IssueEvent], label: str) -> str | None:
 
 __all__ = [
     "AGENT_LABEL",
+    "CI_PERMISSION_WARNING",
     "DEFAULT_OVERLAP",
     "ISSUES_CURSOR",
     "REVIEW_SKIP_LABEL",
     "PollResult",
     "Poller",
     "agent_cursor",
+    "conflict_cursor",
     "review_cursor",
     "tier_cursor",
 ]

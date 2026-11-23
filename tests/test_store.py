@@ -92,7 +92,15 @@ ITEM_COLUMNS: dict[str, list[str]] = {
 # Beyond SPEC and the item: every addition is listed here so a change is deliberate.
 EXTRA_COLUMNS: dict[str, list[str]] = {
     "tickets": ["routed_tier", "flag_reason", "flagged_at"],
-    "attempts": ["started_at", "ended_at", "base_commit", "verify_output_path"],
+    "attempts": [
+        "started_at",
+        "ended_at",
+        "base_commit",
+        "verify_output_path",
+        # migration 002 (#41)
+        "ci_passed",
+        "ci_status",
+    ],
     "kickbacks": ["failure_step_index"],
     "reviews": ["created_at", "shadow"],
     "variants": ["created_at"],
@@ -118,7 +126,15 @@ EXTRA_COLUMNS: dict[str, list[str]] = {
 SPEC_ENUMS: dict[tuple[str, str], list[str]] = {
     ("tickets", "column"): ["todo", "in_progress", "testing", "done", "dropped"],
     ("tickets", "source"): ["issue", "botinator", "ci"],
-    ("attempts", "trigger"): ["first", "escalation", "kickback", "ai_kickback", "explore"],
+    # "rebase": migration 003 (#43); SPEC's attempts.trigger gains it at wave close.
+    ("attempts", "trigger"): [
+        "first",
+        "escalation",
+        "kickback",
+        "ai_kickback",
+        "explore",
+        "rebase",
+    ],
     ("attempts", "outcome"): ["accepted", "kicked_back", "failed_checks", "superseded"],
     ("kickbacks", "by"): ["user", "reviewer"],
     ("kickbacks", "tag"): ["wrong", "incomplete", "broke", "style"],
@@ -225,20 +241,21 @@ def test_fresh_db_has_every_spec_table_and_column(store: Store, db_path: Path) -
 
 def test_migrating_twice_is_a_noop(store: Store, db_path: Path) -> None:
     before = _schema_dump(db_path)
-    assert store.schema_version() == 1
+    packaged = load_migrations()
+    assert store.schema_version() == packaged[-1].version
     assert store.migrate() == []
     store.close()
     with Store(db_path) as again:
         assert again.migrate() == []
         rows = again.query("SELECT version, name FROM schema_migrations")
-        assert [(r["version"], r["name"]) for r in rows] == [(1, "001_initial.sql")]
+        assert [(r["version"], r["name"]) for r in rows] == [(m.version, m.name) for m in packaged]
     assert _schema_dump(db_path) == before
 
 
 def test_first_open_applies_migration_one(db_path: Path) -> None:
     s = Store(db_path, auto_migrate=False)
     assert s.schema_version() == 0
-    assert s.migrate() == [1]
+    assert s.migrate() == [m.version for m in load_migrations()]  # 1, then 002_ci, ...
     assert s.migrate() == []
     s.close()
 

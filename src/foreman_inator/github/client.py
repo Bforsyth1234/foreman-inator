@@ -23,6 +23,35 @@ Endpoints relied on (rule 12, read 2026-11-23, API version 2026-03-10):
   endpoint exists) https://docs.github.com/en/graphql/reference/pulls
 - reviews: ``GET|POST /repos/{o}/{r}/pulls/{n}/reviews`` (event COMMENT)
   https://docs.github.com/en/rest/pulls/reviews
+
+Added in wave 6b (rule 12, read 2026-11-23, same API version):
+- check runs (#41): ``GET /repos/{o}/{r}/commits/{ref}/check-runs`` -> ``{total_count,
+  check_runs: [...]}`` (``filter=latest`` is the default; ``per_page`` max 100; only the
+  1000 most recent check suites of a ref). ``status`` is queued | in_progress | completed |
+  waiting | requested | pending; ``conclusion`` success | failure | neutral | cancelled |
+  skipped | timed_out | action_required | null. GitHub App permission: Checks (read).
+  https://docs.github.com/en/rest/checks/runs#list-check-runs-for-a-git-reference
+- job logs (#41): ``GET /repos/{o}/{r}/actions/jobs/{job_id}/logs`` -> 302 with a
+  ``Location`` download URL that expires after 1 minute (fetched without our token).
+  GitHub App permission: Actions (read).
+  https://docs.github.com/en/rest/actions/workflow-jobs#download-job-logs-for-a-workflow-run
+  The docs do not say a check run's id is its job's id; the job id is read from the check
+  run's ``details_url`` (``.../actions/runs/<run>/job/<job>``), falling back to the check
+  run id for the ``github-actions`` app.
+- review comments (#42): ``GET /repos/{o}/{r}/pulls/{n}/reviews/{review_id}/comments``
+  (paginated list of "Legacy Review Comment": ``id``, ``path``, ``line``,
+  ``original_line``, ``start_line``, ``side``, ``position``, ``original_position``,
+  ``diff_hunk``, ``body``, ``user``, ``commit_id``, ``subject_type`` line | file).
+  GitHub App permission: Pull requests (read), which the App already has.
+  https://docs.github.com/en/rest/pulls/reviews#list-comments-for-a-pull-request-review
+- mergeable (#43): ``GET /repos/{o}/{r}/pulls/{n}`` has ``mergeable`` true | false | null;
+  null means GitHub started a background job to compute it ("after giving the job time to
+  complete, resubmit the request"). Read from the ``get_pr`` the poller already makes.
+  https://docs.github.com/en/rest/pulls/pulls#get-a-pull-request
+- permissions per endpoint:
+  https://docs.github.com/en/rest/authentication/permissions-required-for-github-apps
+  A 403 that is not a rate limit is raised as ``MissingPermission`` (catchable: an App
+  created before #41 lacks Checks/Actions read).
 """
 
 from __future__ import annotations
@@ -40,11 +69,13 @@ import httpx
 
 from .app_auth import (
     API_URL,
+    USER_AGENT,
     AppAuth,
     Clock,
     ForbiddenOperation,
     GitHubError,
     GitHubNotFound,
+    GitHubRateLimited,
     InstallationAuth,
     Sleep,
     default_headers,
@@ -53,6 +84,17 @@ from .app_auth import (
 )
 
 BRANCH_PREFIX = "fman/"
+#: Characters of a job log kept by ``get_job_log_tail`` (the prompt builder clips further).
+LOG_TAIL_CHARS = 16_000
+
+
+class MissingPermission(GitHubError):
+    """403 on an endpoint the App has no permission for (e.g. ``checks`` or ``actions``
+    on an App registered before #41). Never a rate limit (those are ``GitHubRateLimited``)."""
+
+    def __init__(self, permission: str, err: GitHubError) -> None:
+        super().__init__(err.status, err.message, err.method, err.url)
+        self.permission = permission
 
 
 # --------------------------------------------------------------------------- dataclasses
@@ -111,6 +153,41 @@ class PullRequest:
     base_ref: str
     author: str | None
     html_url: str
+    head_sha: str = ""  # the PR head commit (``head.sha``); CI runs on it (#41)
+    #: #43: True | False (conflicts with its base) | None (GitHub is still computing it)
+    mergeable: bool | None = None
+
+
+@dataclass(frozen=True)
+class CheckRun:
+    """One check run on a commit (#41)."""
+
+    id: int
+    name: str
+    status: str  # queued | in_progress | completed | waiting | requested | pending
+    conclusion: str | None  # success | failure | neutral | cancelled | skipped | timed_out | ...
+    head_sha: str
+    app_slug: str | None  # "github-actions" for Actions jobs
+    details_url: str
+    started_at: datetime | None
+    completed_at: datetime | None
+    job_id: int | None  # the Actions job behind it (for its log); None for other apps
+
+
+@dataclass(frozen=True)
+class ReviewComment:
+    """One line comment inside a PR review (#42)."""
+
+    id: int
+    review_id: int | None
+    author: str | None
+    path: str
+    line: int | None  # ``line``, else ``original_line``; None for a file-level comment
+    start_line: int | None
+    diff_hunk: str
+    body: str
+    commit_id: str | None
+    created_at: datetime | None
 
 
 @dataclass(frozen=True)
@@ -172,6 +249,15 @@ class GitHubAPI(Protocol):
         self, repo: str, number: int, body: str, *, commit_id: str | None = None
     ) -> Review: ...
     def list_reviews(self, repo: str, number: int) -> list[Review]: ...
+
+    def list_review_comments(
+        self, repo: str, pr_number: int, review_id: int
+    ) -> list[ReviewComment]: ...
+
+    def list_check_runs(self, repo: str, sha: str) -> list[CheckRun]: ...
+    def get_job_log_tail(
+        self, repo: str, job_id: int, *, max_chars: int = LOG_TAIL_CHARS
+    ) -> str: ...
 
 
 #: Client-facing methods that change GitHub state. The fake records each call to one of these.
@@ -289,7 +375,47 @@ def pr_from_json(d: dict[str, Any]) -> PullRequest:
         base_ref=d["base"]["ref"],
         author=_login(d.get("user")),
         html_url=d.get("html_url") or "",
+        head_sha=(d.get("head") or {}).get("sha") or "",
+        mergeable=d.get("mergeable") if isinstance(d.get("mergeable"), bool) else None,
     )
+
+
+_JOB_URL = re.compile(r"/actions/runs/\d+/job/(\d+)")
+
+
+def check_run_from_json(d: dict[str, Any]) -> CheckRun:
+    app = d.get("app") or {}
+    slug = app.get("slug") if isinstance(app, dict) else None
+    details = d.get("details_url") or d.get("html_url") or ""
+    m = _JOB_URL.search(details)
+    job_id = int(m.group(1)) if m else (int(d["id"]) if slug == "github-actions" else None)
+    return CheckRun(
+        id=int(d["id"]),
+        name=d.get("name") or "",
+        status=d.get("status") or "queued",
+        conclusion=d.get("conclusion"),
+        head_sha=d.get("head_sha") or "",
+        app_slug=slug,
+        details_url=details,
+        started_at=_ts(d.get("started_at")),
+        completed_at=_ts(d.get("completed_at")),
+        job_id=job_id,
+    )
+
+
+_LOG_STAMP = re.compile(r"^\ufeff?\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z ", re.MULTILINE)
+
+
+def log_tail(text: str, max_chars: int) -> str:
+    """The last ``max_chars`` characters of an Actions log, without per-line timestamps."""
+    text = _LOG_STAMP.sub("", text.replace("\r\n", "\n"))
+    return text[-max_chars:] if len(text) > max_chars else text
+
+
+def _as_missing(permission: str, exc: GitHubError) -> GitHubError:
+    if exc.status == 403 and not isinstance(exc, GitHubRateLimited):
+        return MissingPermission(permission, exc)
+    return exc
 
 
 def review_from_json(d: dict[str, Any]) -> Review:
@@ -300,6 +426,26 @@ def review_from_json(d: dict[str, Any]) -> Review:
         body=d.get("body") or "",
         submitted_at=_ts(d.get("submitted_at")),
         commit_id=d.get("commit_id"),
+    )
+
+
+def review_comment_from_json(d: dict[str, Any]) -> ReviewComment:
+    line = d.get("line")
+    if line is None:
+        line = d.get("original_line")
+    if d.get("subject_type") == "file":
+        line = None
+    return ReviewComment(
+        id=int(d["id"]),
+        review_id=d.get("pull_request_review_id"),
+        author=_login(d.get("user")),
+        path=d.get("path") or "",
+        line=int(line) if line is not None else None,
+        start_line=d.get("start_line"),
+        diff_hunk=d.get("diff_hunk") or "",
+        body=d.get("body") or "",
+        commit_id=d.get("commit_id"),
+        created_at=_ts(d.get("created_at")),
     )
 
 
@@ -578,6 +724,56 @@ class GitHubClient:
         return [
             review_from_json(d) for d in self._paginate(f"/repos/{o}/{r}/pulls/{number}/reviews")
         ]
+
+    def list_review_comments(
+        self, repo: str, pr_number: int, review_id: int
+    ) -> list[ReviewComment]:
+        """The line comments of one review (#42), in GitHub's order."""
+        o, r = _split(repo)
+        rows = self._paginate(f"/repos/{o}/{r}/pulls/{pr_number}/reviews/{review_id}/comments")
+        return [review_comment_from_json(d) for d in rows]
+
+    # -- CI (#41)
+
+    def list_check_runs(self, repo: str, sha: str) -> list[CheckRun]:
+        """Latest check runs on commit ``sha``. ``MissingPermission("checks")`` on a 403."""
+        o, r = _split(repo)
+        params: dict[str, Any] | None = {"per_page": 100}
+        url: str | None = f"/repos/{o}/{r}/commits/{sha}/check-runs"
+        out: list[CheckRun] = []
+        try:
+            while url is not None:
+                resp = self._send("GET", url, params=params)
+                raise_for_status(resp)
+                out.extend(check_run_from_json(d) for d in resp.json().get("check_runs", []))
+                match = _NEXT_LINK.search(resp.headers.get("link", ""))
+                url, params = (match.group(1), None) if match else (None, None)
+        except GitHubError as exc:
+            raise _as_missing("checks", exc) from None
+        return out
+
+    def get_job_log_tail(self, repo: str, job_id: int, *, max_chars: int = LOG_TAIL_CHARS) -> str:
+        """The end of an Actions job's log. GitHub answers with a 302 to a short-lived
+        download URL, fetched without our token. ``MissingPermission("actions")`` on a 403;
+        ``GitHubNotFound`` when the log is gone."""
+        o, r = _split(repo)
+        resp = self._send("GET", f"/repos/{o}/{r}/actions/jobs/{int(job_id)}/logs")
+        if resp.status_code in (301, 302, 303, 307, 308) and "location" in resp.headers:
+            tail = ""
+            with self._http.stream(
+                "GET", resp.headers["location"], headers={"User-Agent": USER_AGENT}
+            ) as dl:
+                if dl.status_code >= 400:
+                    dl.read()
+                    raise_for_status(dl)
+                for chunk in dl.iter_text():
+                    tail = (tail + chunk)[-(max_chars * 2) :]
+            return log_tail(tail, max_chars)
+        try:
+            raise_for_status(resp)
+        except GitHubError as exc:
+            raise _as_missing("actions", exc) from None
+        return log_tail(resp.text, max_chars)
 
     def close(self) -> None:
         self._http.close()

@@ -16,6 +16,17 @@ What the writer sees, by situation (SPEC "Ticket lifecycle", "Routing and escala
 * escalation (trigger ``escalation``): plus the facts of every earlier attempt, the last
   check output if it failed, and every review note.
 
+* rebase (trigger ``rebase``, #43): the base branch moved and the PR conflicts; the change
+  was replayed onto the new base (``worktree.replay_onto_base``). Plus the list of files
+  with conflict markers (``conflicted_files``), and the check output when the previous
+  rebase attempt failed its checks. No history or notes: the job is to keep the change.
+
+A user's kickback note can carry the review's line comments (#42): the stored note is the
+review body, ``lifecycle.LINE_COMMENTS_MARKER``, then the comments already rendered as
+``path:line``, the last 3 hunk lines and the text (``lifecycle.format_line_comments``).
+The builder splits it there and shows the comments in their own fenced block under the
+note, defused and cut to ``LINE_COMMENTS_BUDGET`` with a visible marker.
+
 Invariant 7f, mirrored: the writer gets the reviewer's and the user's notes, never its
 own earlier reasoning or transcript. ``PriorAttempt`` has no field that could carry one,
 ``build_writer_prompt`` takes keyword-only arguments, and ``load_history`` reads only the
@@ -43,6 +54,7 @@ from typing import Literal
 from fde_kit.prompts import PromptRef, load_prompt
 
 from foreman_inator.db.store import KICKBACK_BY, TAGS, Attempt, Kickback, Review, Store, Ticket
+from foreman_inator.tickets.lifecycle import split_kickback_note
 
 WRITER_PROMPT_NAME = "writer-v1"
 
@@ -54,13 +66,14 @@ CONVENTIONS_BUDGET = 6_000
 FAILURE_OUTPUT_BUDGET = 4_000  # the tail is kept: the end of a test run says what failed
 NOTE_BUDGET = 2_000  # per note
 NOTES_TOTAL_BUDGET = 6_000  # all notes; the newest are kept
+LINE_COMMENTS_BUDGET = 6_000  # a review's line comments (#42), the first ones kept
 OWNED_FILES_MAX = 40  # list entries
 OWNED_FILE_BUDGET = 200  # per path
 HISTORY_MAX = 10  # attempts listed; the newest are kept
 
 CONVENTIONS_FILES = ("AGENTS.md", "CLAUDE.md")  # first one found wins
 
-Situation = Literal["first", "retry", "kickback", "escalation"]
+Situation = Literal["first", "retry", "kickback", "escalation", "rebase"]
 
 _SECTION = re.compile(r"^<!-- section: ([a-z_]+) -->$", re.MULTILINE)
 _MARKER = re.compile(r"-{3,}\s*(?:BEGIN|END)\b", re.IGNORECASE)
@@ -181,6 +194,8 @@ def defuse(text: str) -> str:
 def situation_for(attempt: Attempt, history: Sequence[PriorAttempt]) -> Situation:
     """Which section the attempt gets. The store's trigger enum has no "retry" value, so
     a same-tier retry after failed checks is recognized from the previous attempt."""
+    if attempt.trigger == "rebase":
+        return "rebase"
     if attempt.trigger == "escalation":
         return "escalation"
     if attempt.trigger in ("kickback", "ai_kickback"):
@@ -199,6 +214,7 @@ def build_writer_prompt(
     conventions: str | None = None,
     conventions_name: str = "AGENTS.md",
     template: PromptRef | None = None,
+    conflicted_files: Sequence[str] = (),
 ) -> WriterPrompt:
     """Render the writer's session prompt for ``attempt`` of ``ticket``.
 
@@ -206,6 +222,7 @@ def build_writer_prompt(
     ``verify_command`` is ``VerifyCommand.display`` (None when the repo has none).
     ``conventions`` is the text of the repo's AGENTS.md / CLAUDE.md (``read_conventions``).
     ``template`` defaults to the packaged ``writer-v1``; replays pass a recorded one.
+    ``conflicted_files`` is ``Replay.conflicted`` for a ``rebase`` attempt (#43).
     """
     if attempt.ticket_id != ticket.id:
         raise ValueError(f"attempt {attempt.id} belongs to ticket {attempt.ticket_id}")
@@ -255,19 +272,29 @@ def build_writer_prompt(
                 kickback_by=s[f"by_{note.by}"].substitute(),
                 kickback_tag=note.tag or "none",
                 tag_meaning=s[f"tag_{note.tag or 'none'}"].substitute(),
-                kickback_note=_note_text(note),
+                kickback_note=_note_text(s, note),
             )
         )
+        comments = _line_comments(s, note)
+        if comments:
+            blocks.append(comments)
         if last is not None and last.attempt.outcome == "failed_checks":
             # A same-tier retry of a kickback-triggered attempt keeps the trigger, so it
             # is still a "kickback" situation, but it must also see why its checks failed.
+            blocks.append(s["escalation_failure"].substitute(failure_output=_failure(last)))
+    elif situation == "rebase":
+        if conflicted_files:
+            blocks.append(s["rebase"].substitute(conflicted_files=_owned_files(conflicted_files)))
+        else:
+            blocks.append(s["rebase_clean"].substitute())
+        if last is not None and last.attempt.outcome == "failed_checks":
             blocks.append(s["escalation_failure"].substitute(failure_output=_failure(last)))
     else:
         blocks.append(s["escalation"].substitute())
         if last is not None and last.attempt.outcome == "failed_checks":
             blocks.append(s["escalation_failure"].substitute(failure_output=_failure(last)))
 
-    if situation != "first" and history:
+    if situation not in ("first", "rebase") and history:
         lines = [
             s["history_line"].substitute(
                 number=numbers[p.attempt.id],
@@ -311,8 +338,21 @@ def _failure(prior: PriorAttempt | None) -> str:
     return defuse(clip_tail(text, FAILURE_OUTPUT_BUDGET))
 
 
-def _note_text(note: Note) -> str:
-    return defuse(clip_head(note.text, NOTE_BUDGET)) or "(the note was empty)"
+def _note_text(s: dict[str, Template], note: Note) -> str:
+    body, comments = split_kickback_note(note.text)
+    text = defuse(clip_head(body, NOTE_BUDGET))
+    if not text and comments:
+        return s["note_only_line_comments"].substitute()
+    return text or "(the note was empty)"
+
+
+def _line_comments(s: dict[str, Template], note: Note, budget: int = LINE_COMMENTS_BUDGET) -> str:
+    """The note's line comments block (#42), or "" when it has none. The note being
+    answered gets ``LINE_COMMENTS_BUDGET``; older notes in the history get ``NOTE_BUDGET``."""
+    _body, comments = split_kickback_note(note.text)
+    if not comments:
+        return ""
+    return s["line_comments"].substitute(line_comments=defuse(clip_head(comments, budget)))
 
 
 def _latest_note(history: Sequence[PriorAttempt]) -> tuple[tuple[int, int], Note] | None:
@@ -335,14 +375,14 @@ def _notes_block(
         for ni, note in enumerate(prior.notes):
             if (hi, ni) == skip:
                 continue
-            items.append(
-                s["note_item"].substitute(
-                    number=numbers[prior.attempt.id],
-                    by=s[f"by_{note.by}"].substitute(),
-                    tag=note.tag or "none",
-                    note=_note_text(note),
-                )
+            item = s["note_item"].substitute(
+                number=numbers[prior.attempt.id],
+                by=s[f"by_{note.by}"].substitute(),
+                tag=note.tag or "none",
+                note=_note_text(s, note),
             )
+            comments = _line_comments(s, note, NOTE_BUDGET)
+            items.append(f"{item}\n{comments}" if comments else item)
     kept: list[str] = []
     used = 0
     for item in reversed(items):  # newest first, until the budget is spent
@@ -416,8 +456,10 @@ def writer_prompt_for(
     *,
     worktree: str | Path,
     verify_command: str | None,
+    conflicted_files: Sequence[str] = (),
 ) -> WriterPrompt:
-    """Caller-side convenience for the worker (#14): read everything, then build."""
+    """Caller-side convenience for the worker (#14): read everything, then build.
+    ``conflicted_files``: ``Replay.conflicted`` for a ``rebase`` attempt (#43)."""
     conv = read_conventions(worktree)
     return build_writer_prompt(
         ticket,
@@ -426,4 +468,5 @@ def writer_prompt_for(
         verify_command=verify_command,
         conventions=conv[1] if conv else None,
         conventions_name=conv[0] if conv else "AGENTS.md",
+        conflicted_files=conflicted_files,
     )

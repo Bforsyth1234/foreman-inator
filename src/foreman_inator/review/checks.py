@@ -25,6 +25,14 @@ model input, the PR comment and the span). The pure helpers (``is_test_path``,
 
 ``hard_findings`` is the verdict policy for checks 1-4; see its docstring. The model in
 check 5 cannot overrule a hard finding.
+
+Sandbox (#40): each check takes ``sandbox=`` (a ``runner.sandbox.Policy``); with none
+given it uses ``sandbox.current()`` (set by the worker with ``sandbox.active(policy)``
+around ``review_change``), and with neither it runs as before. The policy is bound to the
+scratch worktree each command runs in, plus the check's own work dir (coverage data);
+network stays as the policy says (none unless the repo has ``sandbox_network = "allow"``).
+The reviewer's own git calls (``revert_sources``) are not model-written code and run
+outside it.
 """
 
 from __future__ import annotations
@@ -41,7 +49,9 @@ from pathlib import Path
 from threading import Event
 from typing import Literal
 
+from foreman_inator.runner import sandbox as sandbox_mod
 from foreman_inator.runner import verify
+from foreman_inator.runner.sandbox import Policy
 from foreman_inator.runner.verify import VerifyCommand, VerifyResult
 from foreman_inator.runner.worktree import _git
 
@@ -358,11 +368,19 @@ def check_tests(
     timeout: float,
     output_path: Path,
     cancel: Event | None = None,
+    sandbox: Policy | None = None,
 ) -> TestsCheck:
     """Check 1: run ``command`` (from ``verify.detect``) in ``worktree``."""
     if command is None:
         return TestsCheck("unknown", None, reason="no verify command for this repo")
-    res = verify.run(command, worktree, timeout=timeout, output_path=output_path, cancel=cancel)
+    res = verify.run(
+        command,
+        worktree,
+        timeout=timeout,
+        output_path=output_path,
+        cancel=cancel,
+        sandbox=_policy(sandbox, worktree),
+    )
     tail = res.output_tail(OUTPUT_TAIL_CHARS)
     if res.timed_out or res.exit_code is None:
         why = f"timed out after {timeout:.0f}s" if res.timed_out else "cancelled"
@@ -407,6 +425,7 @@ def check_coverage(
     work_dir: Path,
     python: str = "python3",
     cancel: Event | None = None,
+    sandbox: Policy | None = None,
 ) -> CoverageCheck:
     """Check 2: run pytest under the target repo's ``coverage`` and measure changed lines.
 
@@ -425,6 +444,7 @@ def check_coverage(
     sources = {p: _read(worktree / p) for p in changed}
     dirs = sorted({str(Path(p).parent) for p in changed})
     work_dir.mkdir(parents=True, exist_ok=True)
+    policy = _policy(sandbox, worktree, writes=[work_dir])  # coverage writes its data there
     data_file = work_dir / ".coverage"
     report_file = work_dir / "coverage.json"
     env = {"COVERAGE_FILE": str(data_file)}
@@ -439,6 +459,7 @@ def check_coverage(
         output_path=work_dir / "coverage-run.log",
         env=env,
         cancel=cancel,
+        sandbox=policy,
     )
     if res.timed_out:
         return CoverageCheck(
@@ -458,6 +479,7 @@ def check_coverage(
         output_path=work_dir / "coverage-json.log",
         env=env,
         cancel=cancel,
+        sandbox=policy,
     )
     try:
         report = json.loads(report_file.read_text())
@@ -516,6 +538,7 @@ def check_revert(
     output_path: Path,
     python: str = "python3",
     cancel: Event | None = None,
+    sandbox: Policy | None = None,
 ) -> RevertCheck:
     """Check 3 in ``worktree``, a scratch worktree at the change (it is modified)."""
     tests = tuple(p for p in changed_files if is_runnable_test(p) and (worktree / p).is_file())
@@ -528,8 +551,11 @@ def check_revert(
         return RevertCheck(
             "unknown", None, tests, reason="cannot run single test files in this ecosystem"
         )
+    policy = _policy(sandbox, worktree)
     reverted = tuple(revert_sources(worktree, base_sha, changed_files))
-    res = verify.run(command, worktree, timeout=timeout, output_path=output_path, cancel=cancel)
+    res = verify.run(
+        command, worktree, timeout=timeout, output_path=output_path, cancel=cancel, sandbox=policy
+    )
     tail = res.output_tail(OUTPUT_TAIL_CHARS)
     if res.timed_out or res.exit_code is None:
         return RevertCheck(
@@ -614,10 +640,19 @@ def _first_script(pyproject: Path) -> tuple[str, str] | None:
     return None
 
 
-def _run_entry(entry: EntryPoint, cwd: Path, timeout: float, out: Path, cancel: Event | None):
+def _run_entry(
+    entry: EntryPoint,
+    cwd: Path,
+    timeout: float,
+    out: Path,
+    cancel: Event | None,
+    sandbox: Policy | None = None,
+):
     window = min(START_SMOKE_S, timeout) if entry.smoke else timeout
     cmd = VerifyCommand(entry.argv, "run_app", entry.display)
-    res: VerifyResult = verify.run(cmd, cwd, timeout=window, output_path=out, cancel=cancel)
+    res: VerifyResult = verify.run(
+        cmd, cwd, timeout=window, output_path=out, cancel=cancel, sandbox=_policy(sandbox, cwd)
+    )
     ok = res.passed or (entry.smoke and res.timed_out)
     return ok, res
 
@@ -630,6 +665,7 @@ def check_run_app(
     work_dir: Path,
     python: str = "python3",
     cancel: Event | None = None,
+    sandbox: Policy | None = None,
 ) -> RunAppCheck:
     """Check 4 at ``head``; on failure, the same entry point at ``base`` (a worktree with
     the base's source, or None when the change touched no source) decides regression."""
@@ -637,7 +673,7 @@ def check_run_app(
     if entry is None:
         return RunAppCheck("skipped", "not_runnable", reason="no safe entry point detected")
     work_dir.mkdir(parents=True, exist_ok=True)
-    ok, res = _run_entry(entry, head, timeout, work_dir / "run-app-head.log", cancel)
+    ok, res = _run_entry(entry, head, timeout, work_dir / "run-app-head.log", cancel, sandbox)
     tail = res.output_tail(OUTPUT_TAIL_CHARS)
     if ok:
         return RunAppCheck("passed", "yes", entry.display, output_tail=tail)
@@ -648,7 +684,9 @@ def check_run_app(
     base_entry = detect_entry_point(base, python=python)
     base_ok = False
     if base_entry is not None:
-        base_ok, _ = _run_entry(base_entry, base, timeout, work_dir / "run-app-base.log", cancel)
+        base_ok, _ = _run_entry(
+            base_entry, base, timeout, work_dir / "run-app-base.log", cancel, sandbox
+        )
     if base_ok:
         return RunAppCheck("failed", "no", entry.display, regression=True, output_tail=tail)
     return RunAppCheck(
@@ -657,6 +695,17 @@ def check_run_app(
 
 
 # --------------------------------------------------------------------------- utilities
+
+
+def _policy(
+    sandbox: Policy | None, worktree: Path, *, writes: Sequence[Path] = ()
+) -> Policy | None:
+    """The check's sandbox: the given one, else the active one (``sandbox.active``),
+    bound to ``worktree`` with ``writes`` writable; None when there is neither."""
+    policy = sandbox if sandbox is not None else sandbox_mod.current()
+    if policy is None or policy.mode == "off":
+        return policy
+    return policy.bind(worktree, writes=writes)
 
 
 def _listdir(path: Path) -> list[str]:

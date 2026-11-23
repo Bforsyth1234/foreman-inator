@@ -4,7 +4,9 @@
 the same dataclasses as the real ``GitHubClient``. Client-facing methods act as the App's bot
 user; setup helpers (``create_repo``, ``create_issue``, ``apply_label``, ``submit_review``,
 ``merge_pr``, ``close_pr``, ``close_issue_as``, ``comment_as``, ``push_branch``) act as a human
-and are never recorded as bot writes.
+and are never recorded as bot writes. CI (#41) is set up the same way: ``add_check_run``,
+``set_check_run``, ``attach_job_log``, and ``deny_permission("checks" | "actions")`` for an
+App registered before those permissions existed.
 
 Every bot write is appended to ``fake.writes``, so a test can assert "no GitHub writes"
 (``assert_no_writes()``) or forbid them outright (``forbid_writes()`` makes the next write
@@ -16,7 +18,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -32,7 +34,14 @@ from foreman_inator.github import (
     Ref,
     Review,
 )
-from foreman_inator.github.client import require_fman_branch
+from foreman_inator.github.client import (
+    LOG_TAIL_CHARS,
+    CheckRun,
+    MissingPermission,
+    ReviewComment,
+    log_tail,
+    require_fman_branch,
+)
 
 BOT_LOGIN = "foreman-inator[bot]"
 FAKE_TOKEN = "ghs_fake_installation_token"
@@ -81,6 +90,8 @@ class _Item:
     draft: bool = False
     merged_at: datetime | None = None
     reviews: list[Review] = field(default_factory=list)
+    review_comments: dict[int, list[ReviewComment]] = field(default_factory=dict)
+    mergeable: bool | None = None  # #43: None until set_conflict_state (GitHub "computing")
 
 
 @dataclass
@@ -90,6 +101,9 @@ class _Repo:
     branches: dict[str, str]
     items: dict[int, _Item] = field(default_factory=dict)
     next_number: int = 1
+    #: sha -> check runs on that commit, in creation order (#41)
+    checks: dict[str, list[CheckRun]] = field(default_factory=dict)
+    job_logs: dict[int, str] = field(default_factory=dict)
 
 
 class FakeGitHub:
@@ -107,6 +121,7 @@ class FakeGitHub:
         self.git_pushes: list[Call] = []
         self._writes_forbidden: str | None = None
         self._failures: dict[str, list[Exception]] = {}
+        self._denied: set[str] = set()
         self._next_id = 1000
 
     # ------------------------------------------------------------------ test controls
@@ -129,6 +144,79 @@ class FakeGitHub:
         self._failures.setdefault(method, []).append(
             error or GitHubError(502, "fake failure", "FAKE", method)
         )
+
+    def deny_permission(self, permission: str) -> None:
+        """Answer 403 on endpoints needing ``permission`` ("checks", "actions"), as GitHub
+        does for an App installed without it."""
+        self._denied.add(permission)
+
+    def _require(self, permission: str, method: str) -> None:
+        if permission in self._denied:
+            err = GitHubError(403, "Resource not accessible by integration", "GET", method)
+            raise MissingPermission(permission, err)
+
+    # ------------------------------------------------------------------ human-side CI (#41)
+
+    def add_check_run(
+        self,
+        repo: str,
+        sha: str,
+        name: str,
+        *,
+        status: str = "queued",
+        conclusion: str | None = None,
+        app: str = "github-actions",
+        log: str | None = None,
+    ) -> int:
+        """A check run on commit ``sha`` (an Actions job unless ``app`` says otherwise).
+        Returns its id, which is also its job id for ``github-actions``."""
+        r = self._repo(repo)
+        run_id = self._id()
+        now = self.clock()
+        job = run_id if app == "github-actions" else None
+        details = (
+            f"https://github.com/{repo}/actions/runs/{run_id + 50000}/job/{run_id}"
+            if job is not None
+            else f"https://ci.example.com/{repo}/{run_id}"
+        )
+        run = CheckRun(
+            id=run_id,
+            name=name,
+            status=status,
+            conclusion=conclusion,
+            head_sha=sha,
+            app_slug=app,
+            details_url=details,
+            started_at=now if status != "queued" else None,
+            completed_at=now if status == "completed" else None,
+            job_id=job,
+        )
+        r.checks.setdefault(sha, []).append(run)
+        if log is not None and job is not None:
+            r.job_logs[job] = log
+        return run_id
+
+    def set_check_run(
+        self, repo: str, run_id: int, *, status: str, conclusion: str | None = None
+    ) -> None:
+        """Move a check run on (queued -> in_progress -> completed with a conclusion)."""
+        r = self._repo(repo)
+        for runs in r.checks.values():
+            for i, run in enumerate(runs):
+                if run.id == run_id:
+                    now = self.clock()
+                    runs[i] = replace(
+                        run,
+                        status=status,
+                        conclusion=conclusion if status == "completed" else None,
+                        started_at=run.started_at or now,
+                        completed_at=now if status == "completed" else None,
+                    )
+                    return
+        raise KeyError(f"no check run {run_id} in {repo}")
+
+    def attach_job_log(self, repo: str, job_id: int, text: str) -> None:
+        self._repo(repo).job_logs[job_id] = text
 
     # ------------------------------------------------------------------ human-side setup
 
@@ -164,9 +252,19 @@ class FakeGitHub:
         return self._comment(self._item(repo, number), body, by)
 
     def submit_review(
-        self, repo: str, number: int, *, by: str, state: str, body: str = ""
+        self,
+        repo: str,
+        number: int,
+        *,
+        by: str,
+        state: str,
+        body: str = "",
+        comments: Sequence[dict[str, Any]] = (),
     ) -> Review:
-        """A human review. ``state``: APPROVE | REQUEST_CHANGES | COMMENT (as the REST event)."""
+        """A human review. ``state``: APPROVE | REQUEST_CHANGES | COMMENT (as the REST event).
+
+        ``comments`` are its line comments (#42), each ``{"path", "line", "body"}`` plus an
+        optional ``"diff_hunk"`` (default: a small made-up hunk ending at that line)."""
         pr = self._pr(repo, number)
         mapped = {
             "APPROVE": "APPROVED",
@@ -175,7 +273,24 @@ class FakeGitHub:
         }[state]
         if pr.author == by and mapped != "COMMENTED":
             raise GitHubError(422, "Can not approve or request changes on your own pull request")
-        return self._review(pr, by, mapped, body)
+        review = self._review(pr, by, mapped, body)
+        pr.review_comments[review.id] = [
+            ReviewComment(
+                id=self._id(),
+                review_id=review.id,
+                author=by,
+                path=c["path"],
+                line=c.get("line"),
+                start_line=c.get("start_line"),
+                diff_hunk=c.get("diff_hunk")
+                or f"@@ -1,3 +1,4 @@\n context\n+added at {c['path']}\n line {c.get('line')}",
+                body=c["body"],
+                commit_id=review.commit_id,
+                created_at=review.submitted_at,
+            )
+            for c in comments
+        ]
+        return review
 
     def merge_pr(self, repo: str, number: int, *, by: str = "brooks") -> PullRequest:
         """The human merges. Closes issues named by closing keywords in the PR body."""
@@ -213,8 +328,27 @@ class FakeGitHub:
         require_fman_branch(branch)
         sha = sha or _sha(f"{repo}-{branch}-{len(self.git_pushes)}")
         self.repos[repo].branches[branch] = sha
+        for item in self.repos[repo].items.values():
+            if item.is_pr and item.head == branch:
+                item.mergeable = None  # recomputed after a push
         self.git_pushes.append(Call("git_push", {"repo": repo, "branch": branch, "sha": sha}))
         return sha
+
+    def set_conflict_state(self, repo: str, number: int, value: bool | None) -> None:
+        """What GitHub computed as the PR's ``mergeable`` (#43): False = conflicts with its
+        base, None = still computing. (Named so no helper name contains "merge" but the
+        human ``merge_pr``: see test_no_merge_or_approve_surface.)"""
+        self._pr(repo, number).mergeable = value
+
+    def push_base(self, repo: str, branch: str | None = None) -> str:
+        """Someone moves the base branch (e.g. merges another PR). Returns the new sha."""
+        r = self._repo(repo)
+        branch = branch or r.default_branch
+        r.branches[branch] = _sha(f"{repo}-{branch}-moved-{self._id()}")
+        for item in r.items.values():
+            if item.is_pr and item.base == branch:
+                item.mergeable = None  # GitHub recomputes after the base moves
+        return r.branches[branch]
 
     def human_branch(self, repo: str, branch: str, sha: str | None = None) -> str:
         """A branch someone else created (the worker must not touch it)."""
@@ -383,6 +517,30 @@ class FakeGitHub:
         self._call("list_reviews", repo=repo, number=number)
         return list(self._pr(repo, number).reviews)
 
+    def list_review_comments(
+        self, repo: str, pr_number: int, review_id: int
+    ) -> list[ReviewComment]:
+        self._call("list_review_comments", repo=repo, pr_number=pr_number, review_id=review_id)
+        pr = self._pr(repo, pr_number)
+        if not any(r.id == review_id for r in pr.reviews):
+            raise GitHubNotFound(404, "Not Found", "GET", f"{repo}/reviews/{review_id}/comments")
+        return list(pr.review_comments.get(review_id, []))
+
+    # ------------------------------------------------------------------ GitHubAPI: CI (#41)
+
+    def list_check_runs(self, repo: str, sha: str) -> list[CheckRun]:
+        self._call("list_check_runs", repo=repo, sha=sha)
+        self._require("checks", "list_check_runs")
+        return list(self._repo(repo).checks.get(sha, []))
+
+    def get_job_log_tail(self, repo: str, job_id: int, *, max_chars: int = LOG_TAIL_CHARS) -> str:
+        self._call("get_job_log_tail", repo=repo, job_id=job_id, max_chars=max_chars)
+        self._require("actions", "get_job_log_tail")
+        logs = self._repo(repo).job_logs
+        if job_id not in logs:
+            raise GitHubNotFound(404, "Not Found", "GET", f"{repo}/actions/jobs/{job_id}/logs")
+        return log_tail(logs[job_id], max_chars)
+
     # ------------------------------------------------------------------ internals
 
     def _call(self, method: str, **args: Any) -> None:
@@ -504,6 +662,8 @@ class FakeGitHub:
             base_ref=item.base,
             author=item.author,
             html_url=f"https://github.com/{repo}/pull/{item.number}",
+            head_sha=self.repos[repo].branches.get(item.head, ""),
+            mergeable=item.mergeable,
         )
 
 

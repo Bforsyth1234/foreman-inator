@@ -920,6 +920,137 @@
     "state": "closed",
     "state_reason": "completed"
    }
+  },
+  {
+   "method": "GET",
+   "path": "/repos/octo/widgets/commits/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/check-runs",
+   "query": {
+    "per_page": "100"
+   },
+   "status": 200,
+   "body": {
+    "total_count": 2,
+    "check_runs": [
+     {
+      "id": 9101,
+      "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "node_id": "CR_9101",
+      "external_id": "",
+      "url": "https://api.github.com/repos/octo/widgets/check-runs/9101",
+      "html_url": "https://github.com/octo/widgets/runs/9101",
+      "details_url": "https://github.com/octo/widgets/actions/runs/7700/job/9201",
+      "status": "completed",
+      "conclusion": "success",
+      "started_at": "2026-11-23T09:05:00Z",
+      "completed_at": "2026-11-23T09:07:00Z",
+      "output": {
+       "title": null,
+       "summary": null,
+       "text": null,
+       "annotations_count": 0,
+       "annotations_url": ""
+      },
+      "name": "lint",
+      "check_suite": {
+       "id": 5500
+      },
+      "app": {
+       "id": 15368,
+       "slug": "github-actions",
+       "name": "GitHub Actions"
+      },
+      "pull_requests": []
+     },
+     {
+      "id": 9102,
+      "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "node_id": "CR_9102",
+      "external_id": "",
+      "url": "https://api.github.com/repos/octo/widgets/check-runs/9102",
+      "html_url": "https://github.com/octo/widgets/runs/9102",
+      "details_url": "https://github.com/octo/widgets/actions/runs/7700/job/9202",
+      "status": "completed",
+      "conclusion": "failure",
+      "started_at": "2026-11-23T09:05:00Z",
+      "completed_at": "2026-11-23T09:07:00Z",
+      "output": {
+       "title": null,
+       "summary": null,
+       "text": null,
+       "annotations_count": 0,
+       "annotations_url": ""
+      },
+      "name": "test",
+      "check_suite": {
+       "id": 5500
+      },
+      "app": {
+       "id": 15368,
+       "slug": "github-actions",
+       "name": "GitHub Actions"
+      },
+      "pull_requests": []
+     }
+    ]
+   }
+  },
+  {
+   "method": "GET",
+   "path": "/repos/octo/widgets/actions/jobs/9202/logs",
+   "status": 302,
+   "body": null,
+   "headers": {
+    "location": "https://pipelines.actions.githubusercontent.example/logs/9202?sig=x"
+   }
+  },
+  {
+   "method": "GET",
+   "path": "/logs/9202",
+   "no_auth": true,
+   "status": 200,
+   "text": "2026-11-23T09:06:01.0000000Z ##[group]Run uv run pytest\n2026-11-23T09:06:30.1234567Z FAILED tests/test_cli.py::test_verbose - AssertionError\n2026-11-23T09:06:30.2000000Z ##[error]Process completed with exit code 1.\n"
+  },
+  {
+   "method": "GET",
+   "path": "/repos/octo/widgets/pulls/2/reviews/8002/comments",
+   "query": {
+    "per_page": "100"
+   },
+   "status": 200,
+   "body": [
+    {
+     "url": "https://api.github.com/repos/octo/widgets/pulls/comments/8101",
+     "pull_request_review_id": 8002,
+     "id": 8101,
+     "node_id": "PRRC_8101",
+     "diff_hunk": "@@ -20,4 +20,6 @@ def main(argv):\n     args = parse(argv)\n+    if args.verbose:\n+        log.setLevel(DEBUG)",
+     "path": "src/widgets/cli.py",
+     "position": 4,
+     "original_position": 4,
+     "commit_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+     "original_commit_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+     "user": {
+      "login": "brooks",
+      "id": 101,
+      "node_id": "U_brooks",
+      "type": "User",
+      "site_admin": false
+     },
+     "body": "Use the logger's verbose helper here.",
+     "created_at": "2026-11-23T09:04:00Z",
+     "updated_at": "2026-11-23T09:04:00Z",
+     "html_url": "https://github.com/octo/widgets/pull/2#discussion_r8101",
+     "pull_request_url": "https://api.github.com/repos/octo/widgets/pulls/2",
+     "author_association": "OWNER",
+     "start_line": null,
+     "original_start_line": null,
+     "start_side": null,
+     "line": 22,
+     "original_line": 22,
+     "side": "RIGHT",
+     "subject_type": "line"
+    }
+   ]
   }
  ]
 }

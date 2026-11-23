@@ -360,6 +360,10 @@ class Recorded:
             payload = json.loads(request.content)
             assert "markPullRequestReadyForReview" in payload["query"]
             assert payload["variables"] == {"id": "PR_kwDOfake2"}
+        if x.get("no_auth"):
+            # A signed download URL (job logs, #41): our token must never be sent there.
+            assert "authorization" not in request.headers
+            return httpx.Response(x["status"], text=x["text"], headers=x.get("headers"))
         assert request.headers["authorization"].startswith("Bearer ")
         assert request.headers["x-github-api-version"] == app_auth.API_VERSION
         return httpx.Response(x["status"], json=x["body"], headers=x.get("headers"))
@@ -381,13 +385,54 @@ def _setup_fake() -> tuple[FakeGitHub, dict[str, Callable[..., Any]]]:
     fake.remove_label_as(REPO, n, "agent", by="brooks")
     fake.apply_label(REPO, n, "agent", by="brooks")
     human = {
-        "approve": lambda: fake.submit_review(REPO, 2, by="brooks", state="APPROVE", body="LGTM"),
+        "approve": lambda: fake.submit_review(
+            REPO,
+            2,
+            by="brooks",
+            state="APPROVE",
+            body="LGTM",
+            comments=[
+                {
+                    "path": "src/widgets/cli.py",
+                    "line": 22,
+                    "body": "Use the logger's verbose helper here.",
+                    "diff_hunk": "@@ -20,4 +20,6 @@ def main(argv):\n     args = parse(argv)\n"
+                    "+    if args.verbose:\n+        log.setLevel(DEBUG)",
+                }
+            ],
+        ),
         "merge": lambda: fake.merge_pr(REPO, 2, by="brooks"),
     }
+    fake.add_check_run(REPO, "a" * 40, "lint", status="completed", conclusion="success")
+    fake.add_check_run(
+        REPO,
+        "a" * 40,
+        "test",
+        status="completed",
+        conclusion="failure",
+        log="##[group]Run uv run pytest\n"
+        "FAILED tests/test_cli.py::test_verbose - AssertionError\n"
+        "##[error]Process completed with exit code 1.\n",
+    )
     return fake, human
 
 
-VOLATILE = {"id", "created_at", "updated_at", "submitted_at", "node_id", "commit_id", "html_url"}
+VOLATILE = {
+    "id",
+    "created_at",
+    "updated_at",
+    "submitted_at",
+    "node_id",
+    "commit_id",
+    "html_url",
+    # wave 6b: commit shas and CI ids/urls/times differ between the fixture and the fake
+    "head_sha",
+    "job_id",
+    "details_url",
+    "started_at",
+    "completed_at",
+    "review_id",
+}
 
 
 def norm(value: Any) -> Any:
@@ -431,7 +476,8 @@ def scenario(api: GitHubAPI, human: dict[str, Callable[..., Any]]) -> list[Any]:
     )
     out.append(norm(api.mark_ready_for_review(REPO, pr.number)))
     human["approve"]()
-    out.append(norm(api.list_reviews(REPO, pr.number)))
+    reviews = api.list_reviews(REPO, pr.number)
+    out.append(norm(reviews))
     out.append(api.add_labels(REPO, 1, ["fman:working"]))
     out.append(api.remove_label(REPO, 1, "fman:working"))
     out.append(api.remove_label(REPO, 1, "fman:working"))  # already gone: idempotent
@@ -442,6 +488,13 @@ def scenario(api: GitHubAPI, human: dict[str, Callable[..., Any]]) -> list[Any]:
     out.append(norm(api.get_pr(REPO, pr.number)))
     out.append(norm(api.get_issue(REPO, 1)))
     out.append(norm(api.close_issue(REPO, 1)))
+    # wave 6b (#41): CI on the PR head and the failing job's log
+    runs = api.list_check_runs(REPO, sha)
+    out.append(norm(runs))
+    red = next(r for r in runs if r.conclusion == "failure")
+    out.append(api.get_job_log_tail(REPO, red.job_id))
+    # wave 6b (#42): line comments of the human review
+    out.append(norm(api.list_review_comments(REPO, pr.number, reviews[-1].id)))
     return out
 
 
@@ -475,6 +528,14 @@ def test_fake_and_real_client_share_the_interface(rsa_pem: str) -> None:
     assert [r[1]["state"] for r in real[10]] == ["COMMENTED", "APPROVED"]
     assert real[17][1]["merged"] is True
     assert real[18][1]["state"] == "closed" and real[18][1]["state_reason"] == "completed"
+    assert [(r[1]["name"], r[1]["conclusion"], r[1]["app_slug"]) for r in real[20]] == [
+        ("lint", "success", "github-actions"),
+        ("test", "failure", "github-actions"),
+    ]
+    assert "FAILED tests/test_cli.py" in real[21] and "2026-11-23T" not in real[21]
+    assert [(c[1]["path"], c[1]["line"], c[1]["author"]) for c in real[22]] == [
+        ("src/widgets/cli.py", 22, "brooks")
+    ]
 
 
 def test_protocol_signatures_match() -> None:

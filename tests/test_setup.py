@@ -38,6 +38,9 @@ SNAPSHOT_MANIFEST = {
         "pull_requests": "write",
         "contents": "write",
         "metadata": "read",
+        # #41: GitHub CI on the PR head and its job logs
+        "checks": "read",
+        "actions": "read",
     },
 }
 
@@ -61,7 +64,7 @@ class FakeGitHub:
         self.requests: list[httpx.Request] = []
         self.installation_polls = 0
         self.installed_after = 2  # the App shows up on the second poll
-        self.pulled = pulled if pulled is not None else ["qwen3.6:35b-a3b", "qwen3.8:27b"]
+        self.pulled = pulled if pulled is not None else ["inkling-2-mini:latest", "qwen3.8:27b"]
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
@@ -193,7 +196,8 @@ def _setup(tmp_path: Path, gh: FakeGitHub, browser: Browser, lc: Launchctl, **kw
 def test_manifest_matches_spec_permissions_snapshot():
     built = manifest.build_manifest("http://127.0.0.1:5555/callback", "foreman-inator-test")
     assert built == SNAPSHOT_MANIFEST
-    # SPEC: Issues RW, Pull requests RW, Contents RW, Metadata R. Nothing else.
+    # SPEC: Issues RW, Pull requests RW, Contents RW, Metadata R, plus (#41) Checks R and
+    # Actions R. Nothing else.
     assert SNAPSHOT_MANIFEST["default_permissions"] == manifest.PERMISSIONS
 
 
@@ -367,7 +371,7 @@ def test_missing_tools_print_install_commands_and_never_run_them(tmp_path):
         ran.append(list(argv))
         return "git version 2.40.0\n"
 
-    gh = FakeGitHub("unused", pulled=["qwen3.6:35b-a3b"])
+    gh = FakeGitHub("unused", pulled=["inkling-2-mini:latest"])  # Ollama's name when untagged
     checks = deps.check_all(
         config.Config(),
         which=fake_which({"git": "/usr/bin/git"}),
@@ -378,7 +382,7 @@ def test_missing_tools_print_install_commands_and_never_run_them(tmp_path):
     assert by["git"].ok
     assert not by["opencode"].ok and "opencode.ai" in by["opencode"].fix
     assert not by["ollama"].ok and "brew install ollama" in by["ollama"].fix
-    assert by["model tier 1: qwen3.6:35b-a3b"].ok
+    assert by["model tier 1: inkling-2-mini"].ok
     assert by["model tier 2: qwen3.8:27b"].fix == "ollama pull qwen3.8:27b"
     assert ran == [["git", "--version"]]  # only version probes, no installs or pulls
     report = deps.format_report(checks)
@@ -392,7 +396,7 @@ def test_ollama_unreachable_is_reported():
     checks = deps.check_models(config.Config(), transport=httpx.MockTransport(down))
     assert len(checks) == 2
     assert all(not c.ok and "not reachable" in c.detail for c in checks)
-    assert checks[0].fix.endswith("ollama pull qwen3.6:35b-a3b")
+    assert checks[0].fix.endswith("ollama pull inkling-2-mini")
 
 
 def test_ollama_host_and_latest_tag():

@@ -11,6 +11,12 @@ enters as the repo's override.
 executable or a timeout all come back as ``passed=False``. The full output is
 written to a file the caller chooses (it becomes a trace attachment); the timeout
 kills the command's whole process group.
+
+Sandbox (#40): ``run(..., sandbox=policy)`` runs the command under ``runner.sandbox``
+(macOS ``sandbox-exec``), bound to ``cwd``. The one exception to "never raises":
+``sandbox.SandboxUnavailable`` when the sandbox is on and cannot run, raised before
+anything starts (fail closed; the worker flags the ticket). No ``sandbox`` (the default)
+runs the command exactly as before.
 """
 
 from __future__ import annotations
@@ -20,6 +26,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import signal
 import subprocess
 import threading
@@ -27,6 +34,9 @@ import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+
+from foreman_inator.runner import sandbox as sandbox_mod
+from foreman_inator.runner.sandbox import Policy
 
 DEFAULT_TIMEOUT_S = 20 * 60
 """Default verify timeout in seconds."""
@@ -246,6 +256,7 @@ def run(
     *,
     env: Mapping[str, str] | None = None,
     cancel: threading.Event | None = None,
+    sandbox: Policy | None = None,
 ) -> VerifyResult:
     """Run ``cmd`` in ``cwd`` with stdout+stderr saved to ``output_path``.
 
@@ -254,11 +265,14 @@ def run(
     environment (``CI=1`` and colour-off variables are always set). Never raises
     for a failing, missing or hanging command. ``cancel`` (the worker shutting down):
     once set, the command's process group is killed and the result is a failure.
+    ``sandbox`` (#40): run under this policy, bound to ``cwd``; raises
+    ``sandbox.SandboxUnavailable`` (before running anything) when it cannot.
     """
     cwd = Path(cwd)
     out = Path(output_path) if output_path is not None else cwd / ".fman-verify.log"
     out.parent.mkdir(parents=True, exist_ok=True)
     full_env = _child_env(env)
+    argv, full_env, missing = _sandboxed(cmd.argv, cwd, full_env, sandbox)
     start = time.monotonic()
     exit_code: int | None
     timed_out = False
@@ -266,8 +280,10 @@ def run(
         fh.write(f"$ {cmd.display}\n".encode())
         fh.flush()
         try:
+            if missing:
+                raise FileNotFoundError(2, "No such file or directory", cmd.argv[0])
             proc = subprocess.Popen(
-                cmd.argv,
+                argv,
                 cwd=cwd,
                 env=full_env,
                 stdin=subprocess.DEVNULL,
@@ -304,6 +320,22 @@ def run(
         seconds=seconds,
         command=cmd.display,
     )
+
+
+def _sandboxed(
+    argv: Sequence[str], cwd: Path, env: dict[str, str], policy: Policy | None
+) -> tuple[list[str], dict[str, str], bool]:
+    """``(argv, env, missing)`` for running ``argv`` under ``policy`` (unchanged without
+    one). ``missing``: the executable is not on PATH, reported like an unsandboxed
+    launch (exit 127) instead of ``sandbox-exec``'s own exit 71."""
+    if policy is None or policy.mode == "off":
+        return list(argv), env, False
+    bound = policy.bind(cwd, argv0=argv[0])
+    wrapped = sandbox_mod.wrap(argv, bound)  # SandboxUnavailable: fail closed, nothing ran
+    full = sandbox_mod.apply_env(env, bound)
+    exe = argv[0]
+    found = os.access(exe, os.X_OK) if os.sep in exe else shutil.which(exe, path=full["PATH"])
+    return wrapped, full, not found
 
 
 class _Cancelled(Exception):

@@ -27,7 +27,7 @@ from foreman_inator.routing.escalation import (
 )
 
 T0 = datetime(2026, 11, 23, tzinfo=UTC)
-LADDER = build_ladder(default_models())  # tier 1 qwen, tier 2 qwen, tier 3 glm, tier 3 claude
+LADDER = build_ladder(default_models())  # tier 1 inkling, tier 2 qwen, tier 3 glm, tier 3 claude
 Q1, Q2, GLM, CLAUDE = LADDER
 
 

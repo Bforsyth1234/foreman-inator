@@ -177,10 +177,12 @@ def test_reviewer_independence_picks_other_family() -> None:
     cfg = Config()
     glm = cfg.model("glm")
     claude = cfg.model("claude-sonnet")
-    qwen = cfg.models_for_tier(1)[0]
+    tier1, tier2 = cfg.models_for_tier(1)[0], cfg.models_for_tier(2)[0]
     assert cfg.reviewer_for(glm) == claude
     assert cfg.reviewer_for(claude) == glm
-    assert cfg.reviewer_for(qwen) == claude
+    assert cfg.reviewer_for(tier1) == claude
+    assert cfg.reviewer_for(tier2) == claude
+    assert tier1.family != tier2.family  # an escalation 1 -> 2 changes model family
     only_claude = Config(reviewer_models=("claude-sonnet",))
     assert only_claude.reviewer_for(claude) is None
 

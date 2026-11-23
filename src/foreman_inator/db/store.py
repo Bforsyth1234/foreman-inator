@@ -32,7 +32,7 @@ from typing import Any, Literal
 
 Column = Literal["todo", "in_progress", "testing", "done", "dropped"]
 Source = Literal["issue", "botinator", "ci"]
-Trigger = Literal["first", "escalation", "kickback", "ai_kickback", "explore"]
+Trigger = Literal["first", "escalation", "kickback", "ai_kickback", "explore", "rebase"]
 Outcome = Literal["accepted", "kicked_back", "failed_checks", "superseded"]
 KickbackBy = Literal["user", "reviewer"]
 Tag = Literal["wrong", "incomplete", "broke", "style"]
@@ -45,11 +45,20 @@ Role = Literal["writer", "reviewer"]
 ExperimentMode = Literal["replay", "seeded", "shadow", "split", "pair"]
 ExperimentStatus = Literal["running", "promoted", "rejected"]
 SpendBucket = Literal["live", "experiments"]
+CiStatus = Literal["passed", "failed", "base_red", "no_ci", "timed_out", "no_permission"]
 
 COLUMNS: tuple[str, ...] = ("todo", "in_progress", "testing", "done", "dropped")
 OPEN_COLUMNS: tuple[str, ...] = ("todo", "in_progress", "testing")
 SOURCES: tuple[str, ...] = ("issue", "botinator", "ci")
-TRIGGERS: tuple[str, ...] = ("first", "escalation", "kickback", "ai_kickback", "explore")
+#: "rebase" added by migration 003 (#43): replay the PR's change onto a moved base branch.
+TRIGGERS: tuple[str, ...] = (
+    "first",
+    "escalation",
+    "kickback",
+    "ai_kickback",
+    "explore",
+    "rebase",
+)
 OUTCOMES: tuple[str, ...] = ("accepted", "kicked_back", "failed_checks", "superseded")
 KICKBACK_BY: tuple[str, ...] = ("user", "reviewer")
 TAGS: tuple[str, ...] = ("wrong", "incomplete", "broke", "style")
@@ -67,6 +76,15 @@ ROLES: tuple[str, ...] = ("writer", "reviewer")
 EXPERIMENT_MODES: tuple[str, ...] = ("replay", "seeded", "shadow", "split", "pair")
 EXPERIMENT_STATUSES: tuple[str, ...] = ("running", "promoted", "rejected")
 SPEND_BUCKETS: tuple[str, ...] = ("live", "experiments")
+#: attempts.ci_status (#41, migration 002). Only "failed" is charged to the attempt.
+CI_STATUSES: tuple[str, ...] = (
+    "passed",
+    "failed",
+    "base_red",
+    "no_ci",
+    "timed_out",
+    "no_permission",
+)
 
 DEFAULT_CURSOR = "default"
 
@@ -127,6 +145,9 @@ class Attempt:
     ended_at: datetime | None
     base_commit: str | None
     verify_output_path: str | None
+    # migration 002 (#41): GitHub CI on the PR head. Defaults keep hand-built rows valid.
+    ci_passed: bool | None = None
+    ci_status: CiStatus | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -239,7 +260,9 @@ class Migration:
 
 # --- Conversions ----------------------------------------------------------------------
 
-_BOOL_FIELDS = frozenset({"tests_passed", "build_passed", "tests_nonvacuous", "shadow"})
+_BOOL_FIELDS = frozenset(
+    {"tests_passed", "build_passed", "tests_nonvacuous", "shadow", "ci_passed"}
+)
 _JSON_TUPLE_FIELDS = frozenset({"owned_files"})
 
 
@@ -283,6 +306,9 @@ def _row_to[T](cls: type[T], row: sqlite3.Row) -> T:
 # --- Migrations -----------------------------------------------------------------------
 
 _MIGRATION_FILE = re.compile(r"^(\d{3})_([a-z0-9_]+)\.sql$")
+#: First line of a migration that rebuilds a referenced table (#43): applied with foreign
+#: keys off, and checked with ``PRAGMA foreign_key_check`` before it commits.
+FK_OFF_PRAGMA = "-- fman: foreign_keys off"
 
 
 def default_migrations() -> Traversable:
@@ -473,6 +499,9 @@ class Store:
         if not body.endswith(";"):
             body += ";"
         name = m.name.replace("'", "''")
+        # A table rebuild (SQLite's documented procedure) needs foreign keys off, which
+        # cannot change inside a transaction; the check below stands in for them.
+        fk_off = m.sql.lstrip().startswith(FK_OFF_PRAGMA)
         # The schema_migrations row goes first, so a second process racing on the same
         # version fails on its primary key and rolls back instead of re-running DDL.
         script = (
@@ -480,16 +509,27 @@ class Store:
             "INSERT INTO schema_migrations (version, name, applied_at) "
             f"VALUES ({m.version}, '{name}', '{_ts(self.now())}');\n"
             f"{body}\n"
-            "COMMIT;\n"
         )
+        if fk_off:
+            self._conn.execute("PRAGMA foreign_keys = OFF")
         try:
             self._conn.executescript(script)
-        except sqlite3.Error:
+            if fk_off:
+                bad = self._conn.execute("PRAGMA foreign_key_check").fetchall()
+                if bad:
+                    raise StoreError(
+                        f"migration {m.name} broke foreign keys: {[tuple(r) for r in bad][:5]}"
+                    )
+            self._conn.execute("COMMIT")
+        except (sqlite3.Error, StoreError):
             if self._conn.in_transaction:
                 self._conn.execute("ROLLBACK")
             if m.version in self._applied_versions():
                 return  # another process applied it first
             raise
+        finally:
+            if fk_off:
+                self._conn.execute("PRAGMA foreign_keys = ON")
 
     # -- tickets --
 
@@ -730,6 +770,31 @@ class Store:
                 {"ended_at": ended, "outcome": outcome},
                 frozenset({"ended_at", "outcome"}),
             )
+        return self.get_attempt(attempt_id)
+
+    def set_ci_result(
+        self, attempt_id: int, status: CiStatus, *, failure_output_path: str | None = None
+    ) -> Attempt:
+        """Record how the CI step ended for an attempt (#41), in one transaction.
+
+        ``ci_passed`` follows from ``status``: True for ``passed``, False for ``failed``,
+        None otherwise (CI did not judge the change). ``failed`` also stores the attempt
+        as ``failed_checks`` and points ``verify_output_path`` at ``failure_output_path``
+        (the CI log tail the worker saved), so escalation counts it as failed checks and
+        the retry prompt shows that log (``prompt.read_failure_output``)."""
+        passed = {"passed": True, "failed": False}.get(status)
+        values: dict[str, Any] = {"ci_status": status, "ci_passed": passed}
+        if status == "failed":
+            values["outcome"] = "failed_checks"
+            if failure_output_path is not None:
+                values["verify_output_path"] = failure_output_path
+        self._update(
+            "attempts",
+            "id",
+            attempt_id,
+            values,
+            frozenset({"ci_status", "ci_passed", "outcome", "verify_output_path"}),
+        )
         return self.get_attempt(attempt_id)
 
     def set_attempt_outcome(self, attempt_id: int, outcome: Outcome) -> Attempt:
