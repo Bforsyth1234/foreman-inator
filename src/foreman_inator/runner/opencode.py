@@ -816,12 +816,14 @@ class OpenCodeDriver:
                 return self._drive(
                     api, server, attempt_id, prompt, endpoint, limit, t0, cancel=cancel
                 )
-            except OpenCodeError as exc:
+            except (OpenCodeError, httpx.HTTPError) as exc:
+                # httpx.HTTPError: the server died mid-request (a crash races the reply), so
+                # the transport error reaches us before the adapter can wrap it.
                 return AttemptResult(
                     status="errored",
                     outcome=OUTCOME_FAILED,
                     final_message="",
-                    error=str(exc),
+                    error=str(exc) or type(exc).__name__,
                     session_id=api.session_id if api else None,
                     seconds=time.monotonic() - t0,
                 )
