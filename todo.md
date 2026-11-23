@@ -59,7 +59,7 @@ in the item, and put the shape you rely on behind one small adapter so a
 change touches one file.
 ============================================================ -->
 
-Next ID: #45
+Next ID: #51
 Legend: `[ ]` todo · `[~]` in progress · `[~] live` built, waiting on its live check · `[x]` done (move to DONE.md)
 
 ## Wave plan
@@ -85,7 +85,7 @@ Package root below is `src/foreman_inator/` (written `pkg/`).
 | 2 | A: #2 · B: #3 · C: #4 · D: #5 · E: #6 · F: #7 | A `pkg/paths.py`, `pkg/config.py` · B `pkg/db/schema.sql`, `pkg/db/store.py`, `pkg/db/__init__.py` · C `pkg/github/app_auth.py`, `pkg/github/client.py`, `pkg/github/__init__.py`, `tests/fakes/github.py` · D `pkg/tracing/otel.py`, `pkg/tracing/recorder.py`, `pkg/tracing/__init__.py` · E `pkg/runner/verify.py`, `tests/fixtures/repos/` · F `pkg/runner/worktree.py`, `pkg/runner/__init__.py` (+ each slot's own `tests/test_<module>.py`). Runner at close: `pyproject.toml` deps | [x] |
 | 3 | A: #8 · B: #9 · C: #10 · D: #11 · E: #12 · F: #13 | A `pkg/setup/manifest.py`, `pkg/setup/deps.py`, `pkg/setup/launchd.py`, `pkg/setup/__init__.py` · B `pkg/proxy/server.py`, `pkg/proxy/pricing.py`, `pkg/proxy/__init__.py`, `tests/fakes/models.py` · C `pkg/runner/opencode.py`, `tests/fakes/opencode.py` · D `pkg/github/poller.py`, `pkg/tickets/lifecycle.py`, `pkg/tickets/__init__.py` · E `pkg/pr/publisher.py`, `pkg/pr/__init__.py` · F `pkg/prompts/writer-v1.md`, `pkg/tickets/prompt.py` (+ own tests). Runner at close: `cli.py` (`setup`), `pyproject.toml` deps | [x] built; live checks open for #8, #10 |
 | 4 | A: #14 (alone: the main loop) | `pkg/worker.py`, `pkg/cli.py` (`run`, `status`), `tests/test_worker_v1.py`, `tests/fakes/` (additive only) | [x] built; live check open for #14 |
-| 5 | A: #15 · B: #16 · C: #17 · D: #18 · E: #19 · F: #20 | A `pkg/routing/rules.py`, `pkg/routing/__init__.py`, `pkg/prompts/router-v1.md` · B `pkg/routing/escalation.py` · C `pkg/review/reviewer.py`, `pkg/review/checks.py`, `pkg/review/__init__.py`, `pkg/prompts/reviewer-v1.md` · D `pkg/spend.py` · E `pkg/locks.py` · F `pkg/metrics/queries.py`, `pkg/metrics/web.py`, `pkg/metrics/__init__.py`, `pkg/pr/summary.py` (+ own tests). Runner at close: `pyproject.toml` deps | [ ] |
+| 5 | A: #15 · B: #16 · C: #17 · D: #18 · E: #19 · F: #20 | A `pkg/routing/rules.py`, `pkg/routing/__init__.py`, `pkg/prompts/router-v1.md` · B `pkg/routing/escalation.py` · C `pkg/review/reviewer.py`, `pkg/review/checks.py`, `pkg/review/__init__.py`, `pkg/prompts/reviewer-v1.md` · D `pkg/spend.py` · E `pkg/locks.py` · F `pkg/metrics/queries.py`, `pkg/metrics/web.py`, `pkg/metrics/__init__.py`, `pkg/pr/summary.py` (+ own tests). Runner at close: `pyproject.toml` deps | [x] built; live check open for #17 |
 | 6 | A: #21 (alone: the main loop) | `pkg/worker.py`, `pkg/cli.py` (`metrics`), `pkg/pr/publisher.py` (ready-for-review + bot review posting), `tests/test_worker_v2.py` | [ ] |
 | 6b | A: #40 · B: #41, #42, #43 (one agent, in order: all three edit the GitHub client and poller) · C: #44 | A `pkg/runner/sandbox.py`; edits `pkg/runner/opencode.py`, `pkg/runner/verify.py`, `pkg/review/checks.py`, `pkg/config.py` · B `pkg/github/client.py`, `tests/fakes/github.py`, `pkg/github/poller.py`, `pkg/tickets/lifecycle.py`, `pkg/tickets/prompt.py`, `pkg/setup/manifest.py`, `pkg/runner/worktree.py`, `pkg/db/store.py`, `pkg/db/migrations/002_*.sql` · C `pkg/tickets/clarify.py`, `pkg/prompts/clarify-v1.md` (+ own tests). Runner at close: `worker.py` wiring for all five; for #44 the `NeedsInfoAnswered` event in `poller.py`/`lifecycle.py` and the Q&A block in `tickets/prompt.py` (after slot B is merged into the wave branch); `pyproject.toml` deps | [ ] |
 | 7 | A: #22 (cross-repo, optional) | bot-inator repo only; nothing in this repo | [ ] |
@@ -93,6 +93,7 @@ Package root below is `src/foreman_inator/` (written `pkg/`).
 | 9 | A: #29 (alone: wiring) | `pkg/worker.py`, `pkg/cli.py` (`experiment`, `replay`), `pkg/metrics/web.py` (new routes and failure-step columns), `tests/test_worker_v3.py` | [ ] |
 | 10 | A: #30 · B: #31 · C: #32 | A `pkg/export.py` · B `pyproject.toml` (metadata, entry points), `.github/workflows/release.yml`, `docs/releasing.md` · C `README.md`, `docs/setup.md`, `docs/how-it-works.md`, `docs/demo.gif` (+ own tests). Runner at close: `cli.py` (`export`) | [ ] |
 | — | #33–#39 | unscheduled (SPEC milestone 5) | open |
+| — | #45–#50 | unscheduled (gap review, 2026-11-23) | open |
 
 ### Runner decisions on open questions (assistant defaults, 2026-11-23)
 
@@ -116,7 +117,9 @@ Open (need the user; full steps in each item's DONE.md entry):
 
 - #14 worker loop v1 (milestone 1): install the tool, `fman setup`, label 3 small issues on a toy repo, review the PRs, kick one back once, check `fman status` and the trace.
 
-Still to come: #17 and #21 (milestone 2); #40, #41 and #44 (wave 6b).
+- #17 AI reviewer: with review on, 5 real tickets on a toy repo; note whether its kickbacks were fair. Run together with #21's check.
+
+Still to come: #21 (milestone 2); #40, #41 and #44 (wave 6b).
 
 ## Completed items (archived to DONE.md)
 
@@ -444,3 +447,33 @@ Deviations:
 #37 — Classifier router, then a LoRA router only if it beats the classifier on held-out tickets [ ] · Added: 2026-11-23 · Source: spec
 #38 — Homebrew tap [ ] · Added: 2026-11-23 · Source: spec
 #39 — Publish the App for others (each user still runs their own worker) [ ] · Added: 2026-11-23 · Source: spec
+
+### Unscheduled (gap review, 2026-11-23)
+
+Found in the same review as #40–#44 (user: "Yes, add them"). Each has
+its evidence and a first idea; none has decisions or owned files yet, so
+write the full item from the template before scheduling one.
+
+#45 — Install dependencies in a fresh worktree before verify [ ] · Added: 2026-11-23 · Source: assistant (gap review)
+Why: no install step exists anywhere in the code (no `npm ci`, `uv sync` or `swift package resolve`), so a new worktree has no `node_modules` or venv and verify can fail for reasons unrelated to the change.
+Idea: detect an install command next to the verify command, save it per repo like `fman repo set-verify`, run it once per worktree. Needs network, so decide it together with #40's `sandbox_network`.
+
+#46 — Metrics: attempt minutes and review count next to dollars [ ] · Added: 2026-11-23 · Source: assistant (gap review; user asked "why wouldnt local llms be priced at 0")
+Why: local models cost $0 per token (correct), so "cost per accepted ticket" shows a local model that took 3 attempts and 2 reviews as free.
+Idea: metrics page only. `attempts.seconds` is already recorded; add total attempt minutes and the user's review count per accepted ticket, per model.
+
+#47 — Post-merge quality signal [ ] · Added: 2026-11-23 · Source: assistant (gap review)
+Why: a merge counts as success forever. A merged change that is reverted, or fixed by a follow-up ticket a few days later, still counts as accepted for its model and still trains the router.
+Idea: detect a revert of the merge commit, and a later ticket touching the same files within N days; record it against the accepted attempt and show "accepted, then reverted" per model.
+
+#48 — Issue comments as context for the attempt [ ] · Added: 2026-11-23 · Source: assistant (gap review)
+Why: `list_issue_comments` is called only by `pr/summary.py`. Details the user adds in a comment after filing never reach the writer (an edit to the issue body does, through `IssueEdited`).
+Idea: comments from allowed users go into the prompt after the issue body, defused and clipped like it. Overlaps #44's Q&A block; build after #44.
+
+#49 — Per-repo "local only" setting [ ] · Added: 2026-11-23 · Source: assistant (gap review)
+Why: config has one global model list and no per-repo settings, so any repo's code can go to a cloud tier on escalation or AI review (invariant 7c limits cloud by tier and spend, not by repo).
+Idea: `cloud = false` for a repo: escalation stops at tier 2 and flags the user, and AI review uses a local reviewer or is skipped with a note in the PR.
+
+#50 — Split a large issue into smaller tickets [ ] · Added: 2026-11-23 · Source: assistant (gap review)
+Why: an issue classified `large` goes straight to tier 3 as one attempt. Nothing breaks it into pieces a local model could do, which is the work the v1 goal (replace Max usage with local models) most needs.
+Idea: for `large`, a tier 3 model proposes sub-issues in a comment; the user approves by labeling them; each runs as a normal ticket. No sub-issue is created without the user (same consent idea as invariant 7b).
