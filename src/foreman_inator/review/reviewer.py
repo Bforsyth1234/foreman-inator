@@ -441,6 +441,7 @@ def review_change(
     ticket_id: int | None = None,
     store: Store | None = None,
     shadow: bool = False,
+    bucket: str = "live",
     prompt_name: str = REVIEWER_PROMPT_NAME,
     verify_override: str | None = None,
     recordings_dir: Path | str | None = None,
@@ -458,8 +459,10 @@ def review_change(
     gives the reviewer's base URL). With ``store``, the review row (and for
     request_changes, unless ``shadow``, a reviewer kickback) is written; with
     ``recordings_dir`` and ``ticket_id``, the review is recorded next to the attempt.
-    ``prompt_name`` picks a challenger prompt (#26). Raises ``FamilyConflict``, and
-    the store's error if the row cannot be written (one non-shadow review per attempt)."""
+    ``prompt_name`` picks a challenger prompt (#26); ``bucket`` is the spend bucket the
+    model call is costed to (``"experiments"`` for replays and shadow reviews). Raises
+    ``FamilyConflict``, and the store's error if the row cannot be written (one non-shadow
+    review per attempt)."""
     check_independent(reviewer, writer)
     template = load_reviewer_template(prompt_name)
     variant_id = f"{reviewer.name}/{template.name}@{template.sha256[:8]}"
@@ -475,6 +478,7 @@ def review_change(
         attempt_id=attempt_id,
         review_key=provisional,
         role=role,
+        bucket=bucket,
         verify_override=verify_override,
         timeout=timeout,
         check_timeout=check_timeout,
@@ -774,7 +778,7 @@ class _Run:
         with self.proxy.context(
             attempt_id=self.attempt_id,
             review_id=self.review_key,
-            bucket="live",
+            bucket=self.bucket,
             label="review",
             prompt_version=f"{self.template.name}@{self.template.sha256[:12]}",
             recorder_role=self.role,

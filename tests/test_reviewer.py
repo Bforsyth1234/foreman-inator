@@ -297,7 +297,7 @@ def test_reviewer_signature_cannot_take_writer_reasoning():
     assert all(p.kind is inspect.Parameter.KEYWORD_ONLY for p in params.values())
     assert set(params) == {
         "issue", "change", "writer", "reviewer", "proxy", "attempt_id", "ticket_id", "store",
-        "shadow", "prompt_name", "verify_override", "recordings_dir", "timeout",
+        "shadow", "bucket", "prompt_name", "verify_override", "recordings_dir", "timeout",
         "check_timeout", "python", "model_client", "cancel", "clock",
     }  # fmt: skip
     assert [f.name for f in R.dataclasses.fields(ReviewInput)] == [
