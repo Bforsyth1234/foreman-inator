@@ -62,6 +62,7 @@ Each ticket mirrors one GitHub issue, so tickets also store `issue_number` and `
 | model, tier | text, int | e.g. qwen3.6-35b-a3b, tier 1 |
 | variant_id | text | Model + prompt version |
 | trigger | enum | first · escalation · kickback · ai_kickback · explore |
+| writer_mode, review_mode | enum | The repo's profile when the attempt started |
 | worktree, branch | text | One git worktree per attempt |
 | tests_passed, build_passed | bool | From the repo's verify command |
 | diff_files, diff_lines | int | Size of the change |
@@ -146,6 +147,32 @@ A `tier:N` label on the issue overrides the router for that ticket, and the over
 5. Read the diff against the issue: does it do what was asked, miss part of it, or break something nearby?
 
 The reviewer sees only the issue and the diff, not the writer's reasoning. It posts its verdict as a PR review from the bot account, so the exchange stays in the PR history. Two automatic kickbacks escalate the writer one tier.
+
+**Repo profiles:** each repo has two settings. Cost is what speed and correctness are bought with, so there is one setting for each: `writer` spends money to save time, `review` spends money and time to catch bugs. A repo with no setting uses `normal` for both, which is the behaviour described above.
+
+| `writer` | Start tier | Failed checks | Exploration | Cloud writer |
+| --- | --- | --- | --- | --- |
+| `thrifty` | Router's pick | 2 retries on the same tier, then move up | About 25% | Waits for your approval |
+| `normal` | Router's pick | 1 retry, then move up | About 10% | Inside the spend caps |
+| `fast` | One tier above the router's pick | Move up on the first failure | Off | Inside the spend caps |
+
+| `review` | What runs after checks pass |
+| --- | --- |
+| `off` | Nothing. The PR is marked ready for you, as with `review:skip`. |
+| `light` | Review steps 1–3 (tests, coverage, non-vacuous). No model reads the diff, so no cloud call. |
+| `normal` | All five steps |
+| `strict` | All five steps. `review:skip` is ignored, and one automatic kickback escalates the writer. |
+
+Four presets name the common pairs, set with `fman repo set-profile <repo> <preset>`; either setting can also be set by hand.
+
+| Preset | `writer` | `review` | For |
+| --- | --- | --- | --- |
+| `prototype` | `fast` | `off` | Speed first; minor bugs are fine |
+| `personal` | `thrifty` | `light` | Costs little; slow, and some bugs get through |
+| `default` | `normal` | `normal` | |
+| `production` | `fast` | `strict` | Speed and correctness; costs the most |
+
+A `tier:N` label still wins over the start-tier shift. The shift is applied after the router's guess, and both settings are recorded on every attempt, so the metrics and the learning router can tell a profile's effect from a model's. Every profile keeps the loop caps and the spend caps.
 
 ## Metrics view
 
