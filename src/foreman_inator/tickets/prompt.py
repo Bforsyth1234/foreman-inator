@@ -11,7 +11,8 @@ What the writer sees, by situation (SPEC "Ticket lifecycle", "Routing and escala
 * retry after failed checks (history's last attempt ended ``failed_checks`` and the new
   attempt is not an escalation): plus the end of the check output.
 * kickback (trigger ``kickback`` or ``ai_kickback``): plus the latest note, its tag and
-  what the tag means.
+  what the tag means; and when the previous attempt (a kickback-triggered one, retried
+  with its trigger kept) failed its checks, the end of that check output too (#21).
 * escalation (trigger ``escalation``): plus the facts of every earlier attempt, the last
   check output if it failed, and every review note.
 
@@ -257,6 +258,10 @@ def build_writer_prompt(
                 kickback_note=_note_text(note),
             )
         )
+        if last is not None and last.attempt.outcome == "failed_checks":
+            # A same-tier retry of a kickback-triggered attempt keeps the trigger, so it
+            # is still a "kickback" situation, but it must also see why its checks failed.
+            blocks.append(s["escalation_failure"].substitute(failure_output=_failure(last)))
     else:
         blocks.append(s["escalation"].substitute())
         if last is not None and last.attempt.outcome == "failed_checks":

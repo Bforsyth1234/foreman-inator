@@ -15,6 +15,8 @@ Layout (every key optional; missing keys take the defaults below)::
     repos = ["you/project"]
     poll_interval_seconds = 45
     reviewer_models = ["claude-sonnet", "glm"]
+    max_parallel_per_repo = 1   # tickets worked at once per repo (file locks permit)
+    router_timeout_seconds = 30
 
     [spend_caps]
     daily_usd = 5.0
@@ -52,6 +54,7 @@ KEY_REF_PREFIX = f"keychain:{KEYCHAIN_SERVICE}/"
 KEY_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 TIERS = (1, 2, 3)
 MIN_POLL_SECONDS = 5
+MAX_PARALLEL_PER_REPO = 16
 
 Kind = Literal["local", "cloud"]
 
@@ -196,6 +199,12 @@ class Config:
     spend_caps: SpendCaps = field(default_factory=SpendCaps)
     models: tuple[ModelEndpoint, ...] = field(default_factory=default_models)
     reviewer_models: tuple[str, ...] = ("claude-sonnet", "glm")  # preference order
+    #: Tickets of one repo worked at the same time, as far as file locks permit (#21).
+    #: 1 (the default) suits one local GPU.
+    max_parallel_per_repo: int = 1
+    #: Whole-call bound for the router's classification (#15); a cold local model load
+    #: can take longer than the router's own 10 s default.
+    router_timeout_seconds: float = 30.0
 
     def __post_init__(self) -> None:
         _validate(self)
@@ -228,6 +237,10 @@ class Config:
 def _validate(cfg: Config) -> None:
     if cfg.poll_interval_seconds < MIN_POLL_SECONDS:
         raise ConfigError(f"poll_interval_seconds must be >= {MIN_POLL_SECONDS}")
+    if not 1 <= cfg.max_parallel_per_repo <= MAX_PARALLEL_PER_REPO:
+        raise ConfigError(f"max_parallel_per_repo must be between 1 and {MAX_PARALLEL_PER_REPO}")
+    if not 0 < cfg.router_timeout_seconds <= 600:
+        raise ConfigError("router_timeout_seconds must be > 0 and <= 600")
     for cap in fields(SpendCaps):
         if getattr(cfg.spend_caps, cap.name) < 0:
             raise ConfigError(f"spend_caps.{cap.name} must be >= 0")
@@ -357,6 +370,14 @@ def from_dict(data: Mapping[str, Any]) -> Config:
         kw["poll_interval_seconds"] = _typed(
             data["poll_interval_seconds"], int, "poll_interval_seconds"
         )
+    if "max_parallel_per_repo" in data:
+        kw["max_parallel_per_repo"] = _typed(
+            data["max_parallel_per_repo"], int, "max_parallel_per_repo"
+        )
+    if "router_timeout_seconds" in data:
+        kw["router_timeout_seconds"] = float(
+            _typed(data["router_timeout_seconds"], (int, float), "router_timeout_seconds")
+        )
     if "spend_caps" in data:
         caps = _typed(data["spend_caps"], dict, "spend_caps")
         _check_keys(caps, {f.name for f in fields(SpendCaps)}, "spend_caps")
@@ -381,6 +402,8 @@ def to_dict(cfg: Config) -> dict[str, Any]:
     out["repos"] = list(cfg.repos)
     out["poll_interval_seconds"] = cfg.poll_interval_seconds
     out["reviewer_models"] = list(cfg.reviewer_models)
+    out["max_parallel_per_repo"] = cfg.max_parallel_per_repo
+    out["router_timeout_seconds"] = cfg.router_timeout_seconds
     out["spend_caps"] = {f.name: getattr(cfg.spend_caps, f.name) for f in fields(SpendCaps)}
     out["models"] = [
         {

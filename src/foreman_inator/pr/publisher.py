@@ -5,8 +5,17 @@ because a PR's head cannot change; later attempts are force-pushed onto it by th
 This module never pushes and never merges.
 
 Invariant 7a: ``Publisher.open_or_update_draft`` only creates drafts and edits bodies. It
-never marks a PR ready. ``Publisher.mark_ready`` exists for the worker alone, after a
-reviewer approve or a handover (v1: after checks pass, #14), and takes the reason.
+never marks a PR ready. ``Publisher.mark_ready`` exists for the worker alone, after the AI
+reviewer approved (``reviewer_approved``) or the ticket was handed to the user
+(``handover``: the reviewer handed it over, no independent reviewer exists, the escalation
+ladder ran out with a change that passed its checks, or ``review:skip``), and takes the
+reason. Nothing else marks a PR ready (#21 removed v1's "ready when checks pass").
+
+The bot's AI review is posted as a COMMENT review (``post_ai_review``): GitHub refuses
+APPROVE and REQUEST_CHANGES from the PR's own author. The structured verdict lives in the
+``reviews`` row; the body's AI review section is rendered from that row. Each posted
+review carries a hidden per-review marker, so posting again after a crash finds the
+earlier one and does not post twice.
 
 Invariant 7c: the body holds counts, names and costs only. No model reasoning, tool
 output, verify output or file contents; those stay in the local traces.
@@ -28,6 +37,7 @@ from typing import Literal, get_args
 
 from foreman_inator.db import Attempt, Review, Store, Ticket
 from foreman_inator.github import BRANCH_PREFIX, GitHubAPI, PullRequest
+from foreman_inator.github.client import Review as GitHubReview
 from foreman_inator.runner.verify import VerifyResult
 from foreman_inator.runner.worktree import DiffStats, branch_name
 
@@ -42,7 +52,8 @@ _MARKER_RE = re.compile(r"<!-- foreman-inator:pr ticket=(\d+) -->")
 MAX_FILES_LISTED = 50
 MAX_NOTE_CHARS = 2000
 
-ReadyReason = Literal["reviewer_approved", "handover", "v1_checks_passed"]
+ReadyReason = Literal["reviewer_approved", "handover"]
+AI_REVIEW_MARKER = "<!-- foreman-inator:ai-review review={review_id} -->"
 Action = Literal["created", "updated", "unchanged", "closed", "merged"]
 
 _TRIGGERS = {
@@ -334,8 +345,8 @@ class Publisher:
     def mark_ready(self, ticket: Ticket, *, reason: ReadyReason) -> PullRequest:
         """Mark the ticket's PR ready for review. Worker only, never called from this module.
 
-        Allowed reasons (invariant 7a): ``reviewer_approved``, ``handover`` (loop cap), and
-        ``v1_checks_passed`` for #14's v1 flag (removed in #21).
+        Allowed reasons (invariant 7a): ``reviewer_approved`` (an AI approve) and
+        ``handover`` (the ticket was handed to the user).
         """
         if reason not in get_args(ReadyReason):
             raise PublishError(f"not a reason to mark a PR ready: {reason!r}")
@@ -348,6 +359,30 @@ class Publisher:
         if not pr.draft:
             return pr
         return self.gh.mark_ready_for_review(ticket.repo, pr.number)
+
+    def post_ai_review(
+        self, ticket: Ticket, review_id: int, body: str, *, commit_id: str | None = None
+    ) -> tuple[bool, GitHubReview | None]:
+        """Post the AI review as the bot's COMMENT review on the ticket's PR, once.
+
+        The body gets a hidden marker with ``review_id``; when a bot review with that
+        marker already exists (a crash after posting), nothing is posted. Returns
+        ``(posted, github_review)``; a closed or merged PR gets nothing."""
+        ticket = self.store.get_ticket(ticket.id)
+        if ticket.pr_number is None:
+            raise PublishError(f"ticket {ticket.id} has no PR to review")
+        marker = AI_REVIEW_MARKER.format(review_id=int(review_id))
+        bot = self.gh.bot_login()
+        for r in self.gh.list_reviews(ticket.repo, ticket.pr_number):
+            if r.author == bot and marker in (r.body or ""):
+                return False, r
+        pr = self.gh.get_pr(ticket.repo, ticket.pr_number)
+        if pr.state != "open":
+            return False, None
+        posted = self.gh.post_review(
+            ticket.repo, ticket.pr_number, f"{marker}\n{body}", commit_id=commit_id
+        )
+        return True, posted
 
     # -- internals
 

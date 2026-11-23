@@ -1,44 +1,88 @@
-"""The worker loop, v1 (todo #14, SPEC milestone 1): one tier, end to end.
+"""The worker loop, v2 (todo #21, SPEC milestone 2): tiers, escalation, AI review, spend
+caps, file locks, metrics.
 
-``Worker`` joins the pieces built so far. Every collaborator is injected (GitHub API,
-store, config, worktree manager, OpenCode driver, model proxy, publisher, poller, clock),
-and ``run()`` at the bottom builds the real ones from ``config.load()`` and ``paths``.
+``Worker`` joins the pieces. Every collaborator is injected (GitHub API, store, config,
+worktree manager, OpenCode driver, model proxy, spend caps, file locks, publisher,
+poller, clock); ``run()`` at the bottom builds the real ones (``worker_run``).
+
+The flow (SPEC "Ticket lifecycle")
+----------------------------------
+route (#15) → write (OpenCode) → verify → escalation (#16) → draft PR → AI review (#17)
+→ PR marked ready only on an AI approve or a handover → your review → escalation again.
 
 Loop order (``tick``)
 ---------------------
 1. **Poll and handle events** (main thread, quick). ``Poller.process`` turns GitHub state
    into lifecycle events; each is handled inside the poller's store transaction:
    ``lifecycle.apply`` gives the new column and the ``Action`` list, and store-only
-   actions run there. GitHub writes an action needs (flag comment, close issue, clear
-   the kickback label) are deferred until that event's transaction has committed, so a
-   rolled-back event never leaves a comment behind.
-2. **Dispatch work** (one job per repo at a time). The queue is derived from the store
-   every time, never kept in memory: per repo, the oldest ``in_progress`` ticket needing
-   work, then the oldest ``todo`` one; flagged tickets wait for the user. A job is an
-   *attempt* (worktree → writer prompt → OpenCode → commit → verify) or a *publish*
-   (push → draft PR → v1 ready). ``serve_forever`` runs each job on its own thread, so a
-   20-minute attempt never blocks polling or other repos; ``run_once`` runs them inline.
+   actions run there. GitHub writes are deferred until that event's transaction commits.
+   Nothing slow runs there: routing (a model call) is a job, not an action.
+2. **Resume paused tickets** (``worker_pause``): a ticket paused at a spend cap resumes
+   when the cap resets or ``fman approve-spend`` granted an approval.
+3. **Dispatch work.** The queue is derived from the store every time, never kept in
+   memory (``worker_queue``): per repo, up to ``config.max_parallel_per_repo`` tickets
+   at once (default 1: one local GPU), each as far as its file locks (#19) permit; a
+   ticket that wants a file another ticket holds waits, which is not a failure. Job
+   kinds, in the order a ticket meets them:
 
-No long work happens inside a SQLite transaction: transactions only wrap store writes.
+   ``route``     the router's model call (a ``todo`` ticket with no ``routed_tier``)
+   ``attempt``   worktree → writer prompt → OpenCode → commit → verify; or a hand-over
+                 when escalation says the ladder is done
+   ``publish``   push → draft PR → ``testing`` (an attempt that passed but did not publish)
+   ``review``    the AI review of the PR's attempt (``testing``, no review row yet)
+   ``finalize``  the GitHub side of a stored review: the COMMENT review, the PR body,
+                 marking ready, the hand-over (after a crash, or right after the review)
+
+   One job carries a ticket as far as it can go in one pass (route → first attempt →
+   publish → review → finalize); the queue re-derives the next step otherwise.
+   ``serve_forever`` runs each job on its own thread; ``run_once`` runs them inline.
 
 State changes always go through ``lifecycle.apply``; what each ``Action`` does is the
-``self.actions`` table. #21 swaps entries (``NEXT_ATTEMPT`` → escalation, ``AI_REVIEW`` →
-the reviewer, ``ROUTE`` → the router, ``POST_SUMMARY`` → #20) and the ``policy``
-function, not the loop.
+``self.actions`` table (``worker_actions``).
+
+Invariant 7a
+------------
+Only ``worker_review.ReviewSteps._mark_ready`` calls ``Publisher.mark_ready``, and it
+refuses unless the attempt on the PR has a stored AI ``approve`` or the ticket is being
+handed over (AI ``handed_to_user``, no independent reviewer, the ladder ran out with a
+change that passed its checks, or ``review:skip`` by an allowed user). A hand-over always
+posts its reason on the issue and in the PR body's hand-over section before the PR is
+marked ready, and the ticket is flagged last, so a crash in between redoes it.
 
 Crash safety
 ------------
-The worker can die anywhere; launchd restarts it. ``recover()`` (called by ``run()``
-before the first tick) marks every attempt with no ``ended_at`` as ``superseded``; the
-queue then re-runs it with the same trigger, at most ``MAX_INTERRUPTED`` times per
-ticket before flagging. An attempt that passed its checks but whose PR step did not
-finish is re-published: the push is a force-push of the same commit and the publisher
-adopts an existing PR (by stored number or by branch), so no PR is opened twice. The
-column moves to ``testing`` only after the PR is open and marked ready.
+The worker can die anywhere; launchd restarts it. ``recover()`` marks every attempt with
+no ``ended_at`` as ``superseded`` (re-run with the same trigger, capped at three), sweeps
+stale file locks and forgets which reviews were finalized, so every open ticket's latest
+review is finalized once more: the COMMENT review and the issue comments carry hidden
+markers and are looked up before posting, and marking ready is a no-op on a ready PR.
+So after a restart the worker reaches the same state without a second review comment,
+a second PR (the publisher adopts the open one), a double-counted attempt or a lost
+hand-over. Killed during routing: ``routed_tier`` is still NULL, so it routes again.
+Killed during the AI review: no review row, so the review runs again. Killed in a spend
+pause: the flag is stored; it resumes on its own. Killed while waiting on a lock: the
+wait is derived from the lock table each pass.
+
+Seams for wave 6b and later (no behaviour yet)
+----------------------------------------------
+* ``before_route(ticket) -> bool`` (``worker_attempt``): #44 parks a vague ticket as
+  needs-info before routing by returning False.
+* ``ci_gate(ticket, attempt) -> bool`` (``worker_review``): between "local checks passed
+  + draft PR pushed" and the AI review; #41 waits for GitHub CI there (False: not yet,
+  the review job is derived again next pass).
+* The three process launch points, one method each, for #40's sandbox adapter:
+  ``_launch_writer`` (OpenCode), ``_launch_verify`` (the verify command), and
+  ``_launch_review`` (the reviewer's checks) in ``worker_attempt``/``worker_review``.
+* Triggers: nothing here enumerates ``attempts.trigger``; a retry keeps the retried
+  attempt's trigger, and ``uncounted_attempts`` (``worker_pause``) is how an attempt is
+  kept out of escalation's counts, so #43's ``rebase`` trigger needs no change here.
+* #51 (repo profiles): ``policy_for(ticket)`` (here), ``review_skipped(ticket)``
+  (``worker_review``) and ``_route_ticket`` (``worker_attempt``) are its three call sites.
 
 Shutdown: SIGINT/SIGTERM set the stop flag and every running job's cancel event; the
-OpenCode driver aborts its session and kills its process group, verify kills its
-command, the cut-short attempt is stored as ``superseded``, the proxy stops, exit 0.
+OpenCode driver aborts its session and kills its process group, verify and the reviewer
+kill their commands, a cut-short attempt is stored as ``superseded``, a cut-short review
+stores nothing, the proxy stops, exit 0.
 """
 
 from __future__ import annotations
@@ -48,49 +92,33 @@ import logging
 import threading
 import time
 from collections.abc import Callable, Iterator
-from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 from foreman_inator import tracing
 from foreman_inator.config import Config
-from foreman_inator.db.store import OPEN_COLUMNS, Attempt, Store, Ticket
+from foreman_inator.db.store import OPEN_COLUMNS, Store, Ticket
 from foreman_inator.github.client import GitHubAPI
 from foreman_inator.github.poller import Poller
+from foreman_inator.locks import Locks
 from foreman_inator.pr.publisher import Publisher
+from foreman_inator.routing import escalation
 from foreman_inator.runner.worktree import WorktreeManager
+from foreman_inator.spend import Spend
 from foreman_inator.tickets import lifecycle
 from foreman_inator.tickets.lifecycle import Action, IllegalTransition
-from foreman_inator.worker_actions import V1_READY_ON_CHECKS, ActionHandlers, Ctx, flag_comment
+from foreman_inator.worker_actions import ActionHandlers, Ctx, flag_comment
 from foreman_inator.worker_attempt import AttemptSteps
-from foreman_inator.worker_policy import (
-    Step,
-    next_step,
-)
+from foreman_inator.worker_pause import PauseSteps
+from foreman_inator.worker_queue import JOIN_TIMEOUT, Job, QueueSteps
+from foreman_inator.worker_review import ReviewSteps
 
 log = logging.getLogger("foreman_inator.worker")
 
-JOIN_TIMEOUT = 90.0  # shutdown: how long to wait for running jobs to unwind
-BACKOFF_START, BACKOFF_MAX = 30.0, 900.0  # a repo whose job raised waits, doubling
-
-Policy = Callable[[list[Attempt]], Step | None]
+Policy = Callable[[escalation.History], escalation.Step | None]
 
 
-@dataclass(frozen=True)
-class Job:
-    repo: str
-    ticket_id: int
-    kind: Literal["attempt", "publish"]
-
-
-@dataclass
-class _Running:
-    job: Job
-    cancel: threading.Event = field(default_factory=threading.Event)
-    thread: threading.Thread | None = None
-
-
-class Worker(ActionHandlers, AttemptSteps):
+class Worker(ActionHandlers, AttemptSteps, ReviewSteps, PauseSteps, QueueSteps):
     def __init__(
         self,
         *,
@@ -104,11 +132,14 @@ class Worker(ActionHandlers, AttemptSteps):
         traces_dir: Path,
         publisher: Publisher | None = None,
         poller: Poller | None = None,
+        spend: Spend | None = None,
+        locks: Locks | None = None,
         clone_url: Callable[[str], str] | None = None,
-        policy: Policy = next_step,
+        policy: Policy | None = None,
         clock: Callable[[], float] = time.monotonic,
         attempt_timeout: float | None = None,
         verify_timeout: float = 20 * 60,
+        review_timeout: float | None = None,
     ) -> None:
         self.api = api
         self.store = store
@@ -120,18 +151,22 @@ class Worker(ActionHandlers, AttemptSteps):
         self.traces_dir = Path(traces_dir)
         self.publisher = publisher or Publisher(api, store)
         self.poller = poller or Poller(api, store, config)
+        #: Must be the instance whose ``hook`` the proxy calls (``worker_run`` builds both).
+        self.spend = spend or Spend(store, config)
+        self.locks = locks or Locks(store)
         self.repos = self.poller.repos
         self.clone_url = clone_url or (lambda repo: f"https://github.com/{repo}.git")
-        self.policy = policy
+        self.ladder = escalation.build_ladder(config.models)
+        self.policy: Policy = policy or escalation.make_policy(self.ladder)
         self.clock = clock
         self.attempt_timeout = attempt_timeout
         self.verify_timeout = verify_timeout
+        self.review_timeout = review_timeout
+        self.parallel = int(config.max_parallel_per_repo)
         self._stop = threading.Event()
         self._lock = threading.Lock()
-        self._running: dict[str, _Running] = {}
-        self._cooldown: dict[str, float] = {}  # repo -> monotonic time it may work again
-        self._backoff: dict[str, float] = {}  # repo -> last error delay
-        self._sweep: set[str] = set()
+        self._init_queue()
+        self._finalized: set[int] = set()  # review ids whose GitHub side is done here
         self._local = threading.local()
         self.actions: dict[Action, Callable[[Ctx], None]] = {
             Action.CREATE_TICKET: self._a_create_ticket,
@@ -158,7 +193,8 @@ class Worker(ActionHandlers, AttemptSteps):
     # ================================================================== the loop
 
     def recover(self) -> list[int]:
-        """Startup: attempts left running by a dead process become ``superseded``."""
+        """Startup: attempts left running by a dead process become ``superseded``; stale
+        locks are swept; every open ticket's latest review is finalized once more."""
         fixed: list[int] = []
         for t in self.store.list_tickets(column=OPEN_COLUMNS):
             for a in self.store.list_attempts(t.id):
@@ -166,11 +202,16 @@ class Worker(ActionHandlers, AttemptSteps):
                     self.store.finish_attempt(a.id, "superseded")
                     fixed.append(a.id)
                     log.info("ticket %d: attempt %d was interrupted; marked superseded", t.id, a.id)
+        swept = self.locks.sweep()
+        if swept:
+            log.info("swept %d stale file lock(s)", swept)
+        self._finalized.clear()
         self._sweep.update(self.repos)
         return fixed
 
     def run_once(self) -> None:
-        """One pass: poll and handle events, then at most one job per repo, inline."""
+        """One pass: poll and handle events, then up to the parallel cap of jobs per repo,
+        inline (at most one job per ticket)."""
         self.tick(inline=True)
 
     def tick(self, *, inline: bool) -> None:
@@ -178,10 +219,15 @@ class Worker(ActionHandlers, AttemptSteps):
         self.dispatch(inline=inline)
 
     def serve_forever(self) -> None:
-        """Poll every ``poll_interval_seconds``; start jobs as soon as a repo is idle."""
+        """Poll every ``poll_interval_seconds``; start jobs as soon as a slot is free."""
         interval = float(self.config.poll_interval_seconds)
         next_poll = 0.0
-        log.info("worker started: %d repo(s), polling every %.0fs", len(self.repos), interval)
+        log.info(
+            "worker started: %d repo(s), polling every %.0fs, up to %d ticket(s) per repo",
+            len(self.repos),
+            interval,
+            self.parallel,
+        )
         while not self._stop.is_set():
             if self.clock() >= next_poll:
                 self.poll_and_handle()
@@ -212,6 +258,32 @@ class Worker(ActionHandlers, AttemptSteps):
             th.join(max(0.0, deadline - time.monotonic()))
             if th.is_alive():
                 log.warning("job thread %s did not stop in time", th.name)
+
+    # ------------------------------------------------------------------ policy
+
+    def policy_for(self, ticket: Ticket) -> escalation.Step | None:
+        """Escalation's decision for ``ticket`` from its stored rows (crash safe). #51's
+        repo profiles plug their limits in here."""
+        return self.policy(self.history(ticket))
+
+    def history(self, ticket: Ticket) -> escalation.History:
+        """What escalation reads. Attempts paused by a spend cap or a lock yield are left
+        out (``uncounted_attempts``): they never count toward escalation or the
+        interrupted cap. ``routed_tier`` and the explore flag come from the ticket, so a
+        restarted worker decides the same way."""
+        skip = self.uncounted_attempts(ticket)
+        return escalation.History(
+            tuple(a for a in self.store.list_attempts(ticket.id) if a.id not in skip),
+            tuple(self.store.list_kickbacks(ticket_id=ticket.id)),
+            tuple(self.store.list_reviews(ticket_id=ticket.id, shadow=False)),
+            routed_tier=ticket.routed_tier,
+            explore=self.explore(ticket),
+        )
+
+    def explore(self, ticket: Ticket) -> bool:
+        """#23's exploration flag. Nothing explores yet; #23 must store its choice on the
+        ticket (it is read on every decision) and return it here."""
+        return False
 
     # ------------------------------------------------------------------ events
 
@@ -341,93 +413,6 @@ class Worker(ActionHandlers, AttemptSteps):
             return None
         return effect()
 
-    # ================================================================== the queue
-
-    def next_job(self, repo: str) -> Job | None:
-        """The repo's next piece of work, derived from the store (crash safe)."""
-        tickets = self.store.list_tickets(column=("todo", "in_progress"), repo=repo)
-        tickets.sort(key=lambda t: (t.column != "in_progress", t.id))
-        for t in tickets:
-            if t.flag_reason:
-                continue
-            attempts = self.store.list_attempts(t.id)
-            last = attempts[-1] if attempts else None
-            if last is not None and last.ended_at is None:
-                return None  # an attempt is running: one ticket per repo at a time
-            if last is not None and last.outcome is None and last.tests_passed:
-                return Job(repo, t.id, "publish")
-            if self.policy(attempts) is not None:
-                return Job(repo, t.id, "attempt")
-        return None
-
-    def dispatch(self, *, inline: bool) -> None:
-        for repo in self.repos:
-            if self._stop.is_set():
-                return
-            with self._lock:
-                if repo in self._running:
-                    continue
-            if self.clock() < self._cooldown.get(repo, 0.0):
-                continue
-            if repo in self._sweep:
-                self._sweep.discard(repo)
-                self._sweep_worktrees(repo)
-            job = self.next_job(repo)
-            if job is None:
-                continue
-            run = _Running(job)
-            with self._lock:
-                self._running[repo] = run
-            if inline:
-                self._run_job(run)
-            else:
-                run.thread = threading.Thread(
-                    target=self._run_job, args=(run,), name=f"fman-job-{repo}"
-                )
-                run.thread.start()
-
-    def _run_job(self, run: _Running) -> None:
-        job = run.job
-        try:
-            if job.kind == "publish":
-                self.publish_job(job, run.cancel)
-            else:
-                self.attempt_job(job, run.cancel)
-            self._backoff.pop(job.repo, None)
-        except Exception as exc:
-            delay = min(BACKOFF_MAX, max(BACKOFF_START, self._backoff.get(job.repo, 0.0) * 2))
-            self._backoff[job.repo] = delay
-            self._cooldown[job.repo] = self.clock() + delay
-            log.warning(
-                "ticket %d: %s job failed (%s: %s); %s waits %.0fs",
-                job.ticket_id,
-                job.kind,
-                type(exc).__name__,
-                exc,
-                job.repo,
-                delay,
-            )
-        finally:
-            with self._lock:
-                self._running.pop(job.repo, None)
-
-    def hold_repo(self, repo: str, seconds: float | None = None) -> None:
-        """Start no job for ``repo`` for a while (default: one poll interval)."""
-        wait = float(self.config.poll_interval_seconds if seconds is None else seconds)
-        self._cooldown[repo] = self.clock() + wait
-
-    def _sweep_worktrees(self, repo: str) -> None:
-        """Remove worktrees of issues with no open ticket (after merge, drop or a crash)."""
-        mirror = self.worktrees.mirror(repo, self.clone_url(repo))
-        issues: set[int] = set()
-        for p in mirror.repo_dir.glob("issue-*-a*"):
-            with contextlib.suppress(ValueError):
-                issues.add(int(p.name.split("-")[1]))
-        for n in sorted(issues):
-            if self.store.find_open_ticket(repo, n) is None:
-                mirror.cleanup_issue(n)
-                log.info("%s#%d: worktrees removed", repo, n)
-
 
 # ====================================================================== run()
 
@@ -439,11 +424,4 @@ def run(*, once: bool = False) -> int:
     return run_worker(once=once)
 
 
-__all__ = [
-    "V1_READY_ON_CHECKS",
-    "Ctx",
-    "Job",
-    "Worker",
-    "flag_comment",
-    "run",
-]
+__all__ = ["Ctx", "Job", "Policy", "Worker", "flag_comment", "run"]

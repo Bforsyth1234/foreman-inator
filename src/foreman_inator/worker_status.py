@@ -1,7 +1,9 @@
-"""``fman status`` and ``fman repo set-verify`` (todo #14).
+"""``fman status`` and ``fman repo set-verify`` (todo #14, #21).
 
 ``render_status`` reads the store only (open it with ``read_only=True``), so it works
-whether or not the worker is running. ``set_verify_command`` saves a repo's verify
+whether or not the worker is running. Since #21 it also shows which tickets wait on file
+locks held by other tickets (#19) or on a spend approval (#18), and ends with the cloud
+spend line when given the config. ``set_verify_command`` saves a repo's verify
 command and lifts the "no verify command" flag from that repo's open tickets, so the
 running worker picks them up on its next pass.
 """
@@ -10,7 +12,10 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
+from foreman_inator.config import Config
 from foreman_inator.db.store import COLUMNS, Attempt, Store, Ticket
+from foreman_inator.locks import Locks
+from foreman_inator.spend import FLAG_SPEND_CAP, Spend
 from foreman_inator.worker_policy import FLAG_NO_VERIFY
 
 _TITLES = {
@@ -37,7 +42,9 @@ def _attempt_text(attempts: Sequence[Attempt]) -> str:
     return f"attempt {len(attempts)} ({a.trigger}, {a.model}, tier {a.tier}{cost}): {state}"
 
 
-def _line(t: Ticket, attempts: Sequence[Attempt]) -> str:
+def _line(
+    t: Ticket, attempts: Sequence[Attempt], waits: dict[int, tuple[int, ...]] | None = None
+) -> str:
     title = " ".join(t.title.split())
     if len(title) > TITLE_WIDTH:
         title = title[: TITLE_WIDTH - 1] + "…"
@@ -48,14 +55,29 @@ def _line(t: Ticket, attempts: Sequence[Attempt]) -> str:
     if t.pr_number is not None:
         parts.append(f"PR #{t.pr_number}")
     line = "  ".join(parts)
-    if t.flag_reason:
+    if t.flag_reason and t.flag_reason.startswith(FLAG_SPEND_CAP):
+        line += (
+            f"\n         WAITING: spend approval ({t.flag_reason}); run `fman approve-spend {t.id}`"
+        )
+    elif t.flag_reason:
         line += f"\n         FLAGGED: {t.flag_reason}"
+    blockers = (waits or {}).get(t.id)
+    if blockers:
+        held = ", ".join(f"#{b}" for b in blockers)
+        line += f"\n         WAITING: on files held by ticket(s) {held}"
     return line
 
 
-def render_status(store: Store, *, closed_limit: int = 5) -> str:
-    """Tickets by column with their current attempt, flags and PR numbers."""
+def render_status(store: Store, *, closed_limit: int = 5, config: Config | None = None) -> str:
+    """Tickets by column with their current attempt, flags, waits and PR numbers; with
+    ``config``, the cloud spend line last."""
     tickets = store.list_tickets()
+    locks = Locks(store)
+    waits = {
+        w.ticket_id: w.blockers
+        for repo in sorted({t.repo for t in tickets})
+        for w in locks.waiting(repo)
+    }
     by_col: dict[str, list[Ticket]] = {c: [] for c in COLUMNS}
     for t in tickets:
         by_col[t.column].append(t)
@@ -69,12 +91,26 @@ def render_status(store: Store, *, closed_limit: int = 5) -> str:
         if len(shown) < len(items):
             header += f", latest {len(shown)}"
         out.append(header)
-        out.extend(_line(t, store.list_attempts(t.id)) for t in shown)
+        out.extend(_line(t, store.list_attempts(t.id), waits) for t in shown)
         if not items:
             out.append("  (none)")
         out.append("")
-    flagged = sum(1 for t in tickets if t.flag_reason and t.column not in ("done", "dropped"))
-    out.append(f"{len(tickets)} ticket(s), {flagged} flagged for you.")
+    flagged = sum(
+        1
+        for t in tickets
+        if t.flag_reason
+        and t.column not in ("done", "dropped")
+        and not t.flag_reason.startswith(FLAG_SPEND_CAP)
+    )
+    waiting = sum(
+        1
+        for t in tickets
+        if t.column not in ("done", "dropped")
+        and (t.id in waits or (t.flag_reason or "").startswith(FLAG_SPEND_CAP))
+    )
+    out.append(f"{len(tickets)} ticket(s), {flagged} flagged for you, {waiting} waiting.")
+    if config is not None:
+        out.append(Spend(store, config).summary().status_line())
     return "\n".join(out)
 
 
