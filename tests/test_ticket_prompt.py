@@ -329,9 +329,16 @@ def test_huge_inputs_are_bounded_with_visible_markers():
             failure_output="EARLY-OUTPUT " + huge + " LAST-LINE-OF-OUTPUT",
         ),
     )
-    text = build(t, attempt(3, "escalation"), history, conventions="C" * 500_000).text
+    text = build(
+        t,
+        attempt(3, "escalation"),
+        history,
+        conventions="C" * 500_000,
+        clarification="Q" * 500_000,  # #44's Q&A block
+    ).text
     budget = (
-        P.TITLE_BUDGET
+        P.CLARIFICATION_BUDGET
+        + P.TITLE_BUDGET
         + P.ISSUE_BODY_BUDGET
         + P.CONVENTIONS_BUDGET
         + P.FAILURE_OUTPUT_BUDGET

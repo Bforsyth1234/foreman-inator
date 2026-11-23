@@ -8,6 +8,7 @@ The callback below keeps `app` a multi-command group, so adding commands
 never changes how `--version` works.
 """
 
+import contextlib
 from typing import Annotated
 
 import typer
@@ -89,6 +90,12 @@ def status_command(
     db = paths.db_path()
     if not db.exists():
         typer.echo("No tickets yet (the worker has not created its database).")
+        with contextlib.suppress(config_mod.ConfigError):
+            from foreman_inator.runner import sandbox
+
+            c = config_mod.load()
+            line = sandbox.describe(c.sandbox, dict(c.sandbox_network))  # type: ignore[arg-type]
+            typer.echo(f"!!! {line} !!!" if c.sandbox == "off" else line)
         return
     try:
         cfg = config_mod.load()

@@ -13,6 +13,11 @@ from the stored rows); ``AI_REVIEW`` → the reviewer (#17, ``worker_review``);
 ``MARK_READY_FOR_REVIEW`` → only after an AI approve or a hand-over (7a); ``POST_SUMMARY``
 → the summary comment (#20); ``RELEASE_LOCKS`` → file locks (#19). v1's
 ``V1_READY_ON_CHECKS`` flag is gone.
+
+Wave 6b: ``RECORD_CI`` → ``attempts.ci_status`` (#41; a red run's job log is saved for the
+retry prompt and the attempt counts as failed checks); ``START_REBASE`` → a pending
+rebase (#43, ``worker_rebase``); a user kickback stores ``ReviewSubmitted.kickback_note``,
+the review body plus its line comments (#42).
 """
 
 from __future__ import annotations
@@ -167,6 +172,11 @@ class ActionHandlers:
                 ctx.ticket, reviewer_reason(ctx.review), ready=True, attempt=ctx.attempt
             )
         elif isinstance(ev, ChecksPassed) and ev.review_skip:
+            assert ctx.attempt is not None
+            if not self.ci_gate(ctx.ticket, ctx.attempt):  # type: ignore[attr-defined]
+                # #41: the review job does the review:skip hand-over once CI decided.
+                log.info("ticket %d: waiting on GitHub CI before handing over", ctx.ticket.id)
+                return
             self.hand_over(  # type: ignore[attr-defined]
                 ctx.ticket,
                 f"{FLAG_REVIEW_SKIPPED}: the review:skip label was applied by an allowed user",
@@ -187,16 +197,15 @@ class ActionHandlers:
             log.warning("ticket %d: kickback with no published attempt", ctx.ticket.id)
             return
         tag = ev.kickback_tag if ev.kickback_tag in lifecycle.KICKBACK_TAGS else None
-        self.store.record_kickback(att.id, by="user", tag=tag, note=ev.comment or None)
+        note = ev.kickback_note or None  # #42: the body plus the review's line comments
+        self.store.record_kickback(att.id, by="user", tag=tag, note=note)
         self.store.set_attempt_outcome(att.id, "kicked_back")
         if ctx.ticket.flag_reason:
             # The user asked for changes on a handed-over PR: that is new work, not a loop.
             ctx.ticket = self.store.clear_flag(ctx.ticket.id)
         with tracing.github_span("review_received", attempt_id=att.id, pr_number=ev.pr_number) as s:
             s.set_attribute("review.verdict", "request_changes")
-            tracing.add_kickback(
-                s, attempt_id=att.id, by="user", tag=tag or "none", note=ev.comment
-            )
+            tracing.add_kickback(s, attempt_id=att.id, by="user", tag=tag or "none", note=note)
         log.info("ticket %d: changes requested on attempt %d (tag %s)", ctx.ticket.id, att.id, tag)
 
     def _record_ai_kickback(self, ctx: Ctx) -> None:
@@ -220,6 +229,31 @@ class ActionHandlers:
             )
         log.info("ticket %d: the AI reviewer sent attempt %d back", ctx.ticket.id, att.id)
 
+    def _a_record_ci(self, ctx: Ctx) -> None:
+        """``RECORD_CI`` (#41, poll transaction, store only). A red run (``failed``) saves
+        its job log tail where the retry prompt reads failed-check output and stores the
+        attempt as ``failed_checks``; ``NEXT_ATTEMPT`` (escalation) follows."""
+        assert ctx.ticket is not None
+        ev = ctx.event
+        att = self.store.get_attempt(ev.attempt_id)
+        if att.ci_status is not None or att.ticket_id != ctx.ticket.id:
+            return
+        if ev.state == "failed":
+            path = self.traces_dir / str(ctx.ticket.id) / f"attempt-{att.id}-ci.log"  # type: ignore[attr-defined]
+            path.parent.mkdir(parents=True, exist_ok=True)
+            text = ev.failure_output or "GitHub CI failed: " + ", ".join(ev.failed_jobs)
+            path.write_text(text.rstrip("\n") + "\n", encoding="utf-8")
+            self.store.set_ci_result(att.id, "failed", failure_output_path=str(path))
+        else:
+            self.store.set_ci_result(att.id, ev.state)
+        log.info(
+            "ticket %d: GitHub CI on attempt %d: %s%s",
+            ctx.ticket.id,
+            att.id,
+            ev.state.replace("_", " "),
+            f" ({', '.join(ev.failed_jobs)})" if ev.failed_jobs else "",
+        )
+
     def _a_clear_kickback_label(self, ctx: Ctx) -> None:
         assert ctx.ticket is not None
         ev = ctx.event
@@ -235,7 +269,11 @@ class ActionHandlers:
         """Escalation (#16) decides from the stored rows when the queue picks the ticket,
         so a crash here loses nothing; this only logs the decision."""
         assert ctx.ticket is not None
-        step = self.policy_for(self.store.get_ticket(ctx.ticket.id))  # type: ignore[attr-defined]
+        t = self.store.get_ticket(ctx.ticket.id)
+        if self.rebase_pending(t):  # type: ignore[attr-defined]
+            log.info("ticket %d: next, another rebase attempt or the rebase cap", t.id)
+            return
+        step = self.policy_for(t)  # type: ignore[attr-defined]
         if isinstance(step, esc.HandToUser):
             log.info("ticket %d: next, hand to the user (%s)", ctx.ticket.id, step.flag)
         elif step is not None:
@@ -375,6 +413,20 @@ _FLAG_TEXT = {
     ),
     FLAG_REVIEW_SKIPPED: (
         "The `review:skip` label is set, so the change goes to you without an AI review."
+    ),
+    "sandbox_unavailable": (
+        "The sandbox for model-written code could not start on the worker's Mac, so "
+        "foreman-inator did not run anything for this issue (it fails closed). Fix the "
+        'sandbox, or set `sandbox = "off"` in config.toml only if you accept running '
+        "model-written code unsandboxed."
+    ),
+    lifecycle.FLAG_REBASE_CAP: (
+        "The pull request still conflicts with its base branch after the rebase attempts "
+        "foreman-inator makes, so the conflict goes to you."
+    ),
+    "rebase_failed": (
+        "foreman-inator could not replay the change onto the moved base branch, so the "
+        "conflict goes to you."
     ),
 }
 

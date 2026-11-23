@@ -54,7 +54,7 @@ from typing import Literal
 from fde_kit.prompts import PromptRef, load_prompt
 
 from foreman_inator.db.store import KICKBACK_BY, TAGS, Attempt, Kickback, Review, Store, Ticket
-from foreman_inator.tickets.lifecycle import split_kickback_note
+from foreman_inator.tickets.lifecycle import clarify_qa_cursor, split_kickback_note
 
 WRITER_PROMPT_NAME = "writer-v1"
 
@@ -66,6 +66,7 @@ CONVENTIONS_BUDGET = 6_000
 FAILURE_OUTPUT_BUDGET = 4_000  # the tail is kept: the end of a test run says what failed
 NOTE_BUDGET = 2_000  # per note
 NOTES_TOTAL_BUDGET = 6_000  # all notes; the newest are kept
+CLARIFICATION_BUDGET = 5_100  # the Q&A text (#44; ``clarify.QA_BUDGET`` plus room)
 LINE_COMMENTS_BUDGET = 6_000  # a review's line comments (#42), the first ones kept
 OWNED_FILES_MAX = 40  # list entries
 OWNED_FILE_BUDGET = 200  # per path
@@ -215,6 +216,7 @@ def build_writer_prompt(
     conventions_name: str = "AGENTS.md",
     template: PromptRef | None = None,
     conflicted_files: Sequence[str] = (),
+    clarification: str | None = None,
 ) -> WriterPrompt:
     """Render the writer's session prompt for ``attempt`` of ``ticket``.
 
@@ -223,6 +225,8 @@ def build_writer_prompt(
     ``conventions`` is the text of the repo's AGENTS.md / CLAUDE.md (``read_conventions``).
     ``template`` defaults to the packaged ``writer-v1``; replays pass a recorded one.
     ``conflicted_files`` is ``Replay.conflicted`` for a ``rebase`` attempt (#43).
+    ``clarification`` is the Q&A text of the worker's clarifying questions (#44,
+    ``clarify.answered``), shown right after the issue on every attempt.
     """
     if attempt.ticket_id != ticket.id:
         raise ValueError(f"attempt {attempt.id} belongs to ticket {attempt.ticket_id}")
@@ -246,6 +250,12 @@ def build_writer_prompt(
             issue_body=defuse(clip_head(ticket.request, ISSUE_BODY_BUDGET)) or "(no body)",
         )
     )
+    if clarification and clarification.strip():
+        blocks.append(
+            s["clarification"].substitute(
+                clarification=defuse(clip_head(clarification.strip(), CLARIFICATION_BUDGET))
+            )
+        )
     if conventions and conventions.strip():
         blocks.append(
             s["conventions"].substitute(
@@ -459,7 +469,8 @@ def writer_prompt_for(
     conflicted_files: Sequence[str] = (),
 ) -> WriterPrompt:
     """Caller-side convenience for the worker (#14): read everything, then build.
-    ``conflicted_files``: ``Replay.conflicted`` for a ``rebase`` attempt (#43)."""
+    ``conflicted_files``: ``Replay.conflicted`` for a ``rebase`` attempt (#43). The
+    clarification Q&A (#44) is read from the store's ``clarify-qa:<ticket>`` cursor."""
     conv = read_conventions(worktree)
     return build_writer_prompt(
         ticket,
@@ -469,4 +480,5 @@ def writer_prompt_for(
         conventions=conv[1] if conv else None,
         conventions_name=conv[0] if conv else "AGENTS.md",
         conflicted_files=conflicted_files,
+        clarification=store.get_cursor(ticket.repo, clarify_qa_cursor(ticket.id)),
     )

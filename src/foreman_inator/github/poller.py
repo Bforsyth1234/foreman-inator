@@ -73,6 +73,19 @@ whose PR has ``mergeable is False`` gives one ``BaseConflict`` per PR head (curs
 the same poll wins (its attempt starts from the PR anyway); CI is not read for a ticket
 that conflicts.
 
+Clarifying questions (#44)
+--------------------------
+For each ``todo`` ticket whose clarification cursor (``lifecycle.clarify_cursor``) is
+``asked`` (the worker posted its question and the ``needs-info`` label), with ``clarify``
+on: ``+1`` ``list_issue_comments`` every poll, and, when the issue is not in this poll's
+changed set, ``+1`` ``get_issue`` (its labels) and, only once the label is gone, ``+1``
+``list_issue_events`` (who removed it). ``tickets.clarify.status`` decides; ``answered``
+or ``released`` gives one ``NeedsInfoAnswered`` whose cursors move the clarification
+cursor on (and store the Q&A text), so it is emitted once. Reading the waiting ticket's
+comments and labels on every poll, instead of only when the issue's ``updated_at`` moved,
+is deliberate: GitHub's REST docs do not say that a comment or a label removal bumps an
+issue's ``updated_at`` (checked 2026-11-23, rule 12), so the listing alone is not relied on.
+
 Edge cases (decisions, todo #11)
 --------------------------------
 * Only ``allowed_users`` count, for labels *and* reviews (7b); the bot's own reviews and
@@ -115,6 +128,7 @@ from foreman_inator.github.client import (
     MissingPermission,
     PullRequest,
 )
+from foreman_inator.tickets import clarify
 from foreman_inator.tickets.lifecycle import (
     KICKBACK_TAGS,
     AgentLabelRemoved,
@@ -125,9 +139,12 @@ from foreman_inator.tickets.lifecycle import (
     IssueEdited,
     LineComment,
     Merged,
+    NeedsInfoAnswered,
     ReviewSubmitted,
     TicketRequested,
     TierOverride,
+    clarify_cursor,
+    clarify_qa_cursor,
     count_rebase_attempts,
     decide_ci,
 )
@@ -357,6 +374,7 @@ class Poller:
         if pr is not None and pr.state == "closed":
             out.append(ClosedUnmerged(repo, n, ticket_id=t.id, pr_number=pr.number, what="pr"))
             return
+        events: list[IssueEvent] | None = None
         if issue is not None:
             events = api.list_issue_events(repo, n)
             if not _has(issue.labels, self.agent_label):
@@ -378,6 +396,8 @@ class Poller:
                         cursors=((tier_cursor(n), str(tier[1].id)),),
                     )
                 )
+        if t.column == "todo" and getattr(self.config, "clarify", False):
+            self._clarify_event(api, repo, t, issue, events, out)
         if pr is not None and t.column == "testing":
             before = len(out)
             self._review_event(api, repo, t, pr, out)
@@ -385,6 +405,57 @@ class Poller:
                 self._conflict_event(repo, t, pr, out)
             if self.ci and len(out) == before:
                 self._ci_event(api, repo, t, pr, out)
+
+    def _clarify_event(
+        self,
+        api: Any,
+        repo: str,
+        t: Ticket,
+        issue: Issue | None,
+        events: list[IssueEvent] | None,
+        out: list[GitHubEvent],
+    ) -> None:
+        """#44: a ticket waiting on ``needs-info`` that an allowed user answered or
+        released (see the module docstring for the requests)."""
+        if self.store.get_cursor(repo, clarify_cursor(t.id)) != "asked":
+            return
+        n = t.issue_number
+        comments = api.list_issue_comments(repo, n)
+        if issue is None:
+            issue = api.get_issue(repo, n)
+        present = _has(issue.labels, clarify.NEEDS_INFO_LABEL)
+        if events is None:
+            events = [] if present else api.list_issue_events(repo, n)
+        st = clarify.status(
+            enabled=True,
+            ticket_id=t.id,
+            labels=issue.labels,
+            events=events,
+            comments=comments,
+            bot_login=self._bot or "",
+            is_allowed=self._allowed,
+        )
+        if st.state not in ("answered", "released"):
+            return
+        if st.state == "answered" and st.asked is not None:
+            replies = clarify.answers(comments, st.asked, self._allowed)
+            by = (replies[-1].author or "") if replies else ""
+        else:
+            by = st.released_by or ""
+        cursors = [(clarify_cursor(t.id), st.state)]
+        if st.qa:
+            cursors.append((clarify_qa_cursor(t.id), st.qa))
+        out.append(
+            NeedsInfoAnswered(
+                repo,
+                n,
+                ticket_id=t.id,
+                how=st.state,  # type: ignore[arg-type]
+                by=by,
+                qa=st.qa,
+                cursors=tuple(cursors),
+            )
+        )
 
     def _review_event(
         self, api: Any, repo: str, t: Ticket, pr: PullRequest, out: list[GitHubEvent]

@@ -9,6 +9,14 @@ reviewer (``Env.responder``). Nothing touches the network, a real model, the Key
 
 The verify command is a saved override that passes only when the agent wrote ``pass``
 into ``status.txt``, so each test decides per attempt whether the checks pass.
+
+Wave 6b defaults (each test can change them): ``sandbox = "off"`` (the scenarios must run
+on Linux CI, where ``sandbox-exec`` does not exist; ``tests/test_worker_v2b.py`` runs one
+ticket with the sandbox really on, on macOS); the clarify check is on and the fake model
+answers ``clear`` (``Env.clarify_reply``); GitHub CI is not read (``ci=False``: the wave 6
+scenarios keep their one-pass shape) unless a test passes ``ci=True``, and then the
+poller's clock is ``now + Env.ci_offset`` so a test can step past CI's grace period and
+pending limit.
 """
 
 from __future__ import annotations
@@ -19,6 +27,7 @@ import subprocess
 import sys
 import threading
 from collections import deque
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -29,11 +38,13 @@ from fakes.models import FakeModels
 from fakes.opencode import FakeOpenCode, Script, bash, edit, say
 from foreman_inator.config import Config, SpendCaps
 from foreman_inator.db.store import Store
+from foreman_inator.github.poller import Poller
 from foreman_inator.proxy.server import ModelProxy
 from foreman_inator.review.reviewer import MODEL_MAX_TOKENS
 from foreman_inator.routing.rules import MAX_TOKENS as ROUTER_MAX_TOKENS
 from foreman_inator.runner.worktree import GitIdentity, WorktreeManager
 from foreman_inator.spend import Spend
+from foreman_inator.tickets import clarify
 from foreman_inator.worker import Worker
 
 REPO = "acme/widgets"
@@ -82,6 +93,8 @@ class LinkedFakeGitHub(FakeGitHub):
         self.store: Store | None = None
         self.ready_violations: list[str] = []
         self.ready_checks = 0
+        #: #41: when set, a PR marked ready whose attempt has no decided CI is a violation.
+        self.ci_required = False
 
     def _write(self, method: str, **args: Any) -> None:
         cur = otel_trace.get_current_span()
@@ -93,7 +106,15 @@ class LinkedFakeGitHub(FakeGitHub):
         for line in out.splitlines():
             name, sha = line.split()
             if name.startswith("fman/"):
+                if self.repos[repo].branches.get(name) != sha:
+                    for item in self.repos[repo].items.values():
+                        if item.is_pr and item.head == name:
+                            item.mergeable = None  # GitHub recomputes after a push
                 self.repos[repo].branches[name] = sha
+
+    def get_pr(self, repo: str, number: int) -> Any:
+        self.sync(repo)  # the poller reads the PR head (CI #41, conflicts #43) here
+        return super().get_pr(repo, number)
 
     def get_branch_sha(self, repo: str, branch: str) -> str:
         self.sync(repo)
@@ -134,6 +155,11 @@ def ready_violation(gh: FakeGitHub, store: Store, repo: str, number: int) -> str
     marker = f"foreman-inator:note ticket={t.id} key=handover-"
     item = gh._item(repo, t.issue_number)
     handed = any(c.author == bot and marker in c.body for c in item.comments)
+    if current is not None and current.ci_passed is False:
+        return f"PR #{number} marked ready while GitHub CI is red (ticket {t.id})"
+    ci_required = getattr(gh, "ci_required", False)
+    if ci_required and current is not None and current.ci_status is None:
+        return f"PR #{number} marked ready before GitHub CI decided (ticket {t.id})"
     if approved or handed:
         return None
     return f"PR #{number} marked ready with no AI approve and no hand-over (ticket {t.id})"
@@ -212,6 +238,7 @@ class Env:
         parallel: int = 1,
         seed_files: dict[str, str] | None = None,
         approval_usd: float | None = None,
+        ci: bool = False,
         **config_kw: Any,
     ) -> None:
         self.tmp = tmp
@@ -234,6 +261,7 @@ class Env:
         self.gh.store = self.store
         if verify is not None:
             self.store.set_verify_command(REPO, verify)
+        config_kw.setdefault("sandbox", "off")
         self.config = Config(
             app_id=1,
             allowed_users=(USER,),
@@ -242,11 +270,16 @@ class Env:
             max_parallel_per_repo=parallel,
             **config_kw,
         )
+        self.ci = ci
+        self.gh.ci_required = ci
+        self.ci_offset = timedelta(0)  # added to the poller's clock (CI grace / limit)
         self.models = FakeModels()
         self.route_label = "small"
         self.review_replies: deque[str] = deque()
         self.review_calls = 0
         self.route_calls = 0
+        self.clarify_reply = "clear"
+        self.clarify_calls = 0
         self.models.responder = self.responder
         self.spend = Spend(self.store, self.config, approval_usd=approval_usd)
         self.proxy = ModelProxy(
@@ -265,6 +298,9 @@ class Env:
     def responder(self, body: dict[str, Any]) -> str | None:
         """Router calls get ``route_label``; reviewer calls the next queued reply (approve
         when none is queued); the writer's own calls the fake's default."""
+        if body.get("max_tokens") == clarify.MAX_TOKENS:
+            self.clarify_calls += 1
+            return self.clarify_reply
         if body.get("max_tokens") == ROUTER_MAX_TOKENS:
             self.route_calls += 1
             return self.route_label
@@ -287,6 +323,14 @@ class Env:
             traces_dir=self.tmp / "traces",
             clone_url=lambda repo: str(self.remote),
             clock=lambda: self.clock_now,
+            poller=Poller(
+                self.gh,
+                self.store,
+                self.config,
+                ci=self.ci,
+                conflicts=True,
+                clock=lambda: datetime.now(UTC) + self.ci_offset,
+            ),
         )
 
     def restart(self) -> list[int]:

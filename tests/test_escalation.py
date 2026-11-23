@@ -27,8 +27,9 @@ from foreman_inator.routing.escalation import (
 )
 
 T0 = datetime(2026, 11, 23, tzinfo=UTC)
-LADDER = build_ladder(default_models())  # tier 1 inkling, tier 2 qwen, tier 3 glm, tier 3 claude
-Q1, Q2, GLM, CLAUDE = LADDER
+# tier 1 inkling, tier 2 qwen, then tier 3 in order: glm, claude opus, claude fable
+LADDER = build_ladder(default_models())
+Q1, Q2, GLM, CLAUDE, FABLE = LADDER
 
 
 @dataclass
@@ -200,13 +201,21 @@ def test_kicked_back_tagged_wrong_moves_up_at_once():
 
 def test_tier3_fails_hands_to_user():
     """SPEC: "Tier 3 fails → the ticket stays in progress and is flagged for you. No silent
-    loops." Tier 3 is GLM then Claude, so "tier 3 fails" is Claude failing."""
+    loops." Tier 3 is GLM, then Claude Opus, then Claude Fable, so "tier 3 fails" is
+    Fable failing."""
     t = Ticket(routed_tier=3)
     t.add(GLM, "failed_checks")
     t.add(t.step(), "failed_checks")
-    t.add(t.step(), "failed_checks")  # Claude
+    t.add(t.step(), "failed_checks")  # Claude Opus
     step = t.step()
     assert where(step) == (3, CLAUDE.model)
+    t.add(step, "failed_checks")
+    step = t.step()
+    assert isinstance(step, Escalate)
+    assert where(step) == (3, FABLE.model)
+    t.add(step, "failed_checks")  # Claude Fable
+    step = t.step()
+    assert where(step) == (3, FABLE.model)
     t.add(step, "failed_checks")
     step = t.step()
     assert isinstance(step, HandToUser)
@@ -259,7 +268,14 @@ def test_two_ai_kickbacks_on_tier3_hand_the_pr_to_the_user():
     t.kick("reviewer")
     t.add(t.step(), "kicked_back")
     t.kick("reviewer")
-    t.add(t.step(), "kicked_back")  # Claude
+    t.add(t.step(), "kicked_back")  # Claude Opus
+    t.kick("reviewer")
+    t.add(t.step(), "kicked_back")
+    t.kick("reviewer")
+    step = t.step()
+    assert isinstance(step, Escalate)
+    assert where(step) == (3, FABLE.model)
+    t.add(step, "kicked_back")  # Claude Fable
     t.kick("reviewer")
     t.add(t.step(), "kicked_back")
     t.kick("reviewer")
@@ -445,8 +461,8 @@ def test_same_rows_same_decision():
 def test_bound_constants():
     """Worst case: 6 attempts per rung (3 segments × 2) plus 3 interrupted re-runs."""
     assert esc.MAX_ATTEMPTS_PER_RUNG == 6
-    assert esc.attempt_bound(4) == esc.SPEC_LADDER_WORST_CASE == 27
-    assert len(LADDER) == 4
+    assert esc.attempt_bound(5) == esc.SPEC_LADDER_WORST_CASE == 33
+    assert len(LADDER) == 5
 
 
 def run(t: Ticket, ladder, rng: random.Random, *, accept: bool = True) -> esc.Step | None:
@@ -533,7 +549,7 @@ def test_every_history_ends_with_the_user_within_the_bound():
 
 
 def test_worst_case_is_reached_exactly():
-    """The bound is tight: the adversarial history uses all 27 attempts, then the user."""
+    """The bound is tight: the adversarial history uses all 33 attempts, then the user."""
     t = Ticket(routed_tier=1)
     cuts = 0
     for _rung in LADDER:

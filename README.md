@@ -128,9 +128,10 @@ ticket starts on the matching tier.
 | --- | --- | --- | --- |
 | 1 | Inkling 2 Mini | Local, Ollama | Small, mechanical changes |
 | 2 | Qwen3.8 27B | Local, Ollama | Normal features and bug fixes |
-| 3 | GLM first, then Claude Sonnet | Cloud, pay per use | Large refactors, anything that failed locally |
+| 3 | GLM first, then Claude Opus, then Claude Fable | Cloud, pay per use | Large refactors, anything that failed locally |
 
-The models are set in `config.toml`. A ticket moves up only when it has to:
+The models are set in `config.toml`. Tier 3 is tried in the order listed, cheapest
+first. A ticket moves up only when it has to:
 
 - Checks fail: one retry on the same model with the error output, then up.
 - You kick it back once: one retry on the same model with your note.

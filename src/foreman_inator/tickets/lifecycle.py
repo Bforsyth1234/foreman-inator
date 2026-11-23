@@ -49,6 +49,11 @@ Wave 6b:
   on the tier that wrote the change) while ``rebase_allowed`` (at most ``REBASE_CAP`` = 2
   rebase attempts per ticket); after that → ``testing`` with ``FLAG_TICKET`` (7e). Not a
   kickback: nothing is recorded against the attempt.
+* #44, clarifying questions: ``NeedsInfoAnswered`` (an allowed user answered the
+  worker's question on the issue, or removed ``needs-info``) on a ticket in ``todo`` →
+  ``todo`` with no action: its cursors (``clarify_cursor`` = how it resumed,
+  ``clarify_qa_cursor`` = the Q&A text for the writer prompt) are the whole effect, and
+  the worker's route job picks the ticket up on its next pass.
 """
 
 from __future__ import annotations
@@ -288,6 +293,29 @@ class BaseConflict(GitHubEvent):
         )
 
 
+def clarify_cursor(ticket_id: int) -> str:
+    """#44: the ``poll_cursors`` name holding a ticket's clarification state: ``clear`` |
+    ``asked`` | ``answered`` | ``released`` | ``resumed`` (no row: not assessed yet)."""
+    return f"clarify:{int(ticket_id)}"
+
+
+def clarify_qa_cursor(ticket_id: int) -> str:
+    """#44: the ``poll_cursors`` name holding the Q&A text for the writer prompt."""
+    return f"clarify-qa:{int(ticket_id)}"
+
+
+@dataclass(frozen=True)
+class NeedsInfoAnswered(GitHubEvent):
+    """#44: the worker asked on the issue (``needs-info``) and an allowed user answered in
+    a comment (``how="answered"``, ``qa`` = the Q&A text) or removed the label
+    (``how="released"``: go ahead as written). The event's cursors store both."""
+
+    ticket_id: int
+    how: Literal["answered", "released"]
+    by: str
+    qa: str | None = None
+
+
 # Worker events: produced by the worker loop, never by the poller.
 
 
@@ -339,6 +367,7 @@ Event = (
     | HandedToUser
     | CiResult
     | BaseConflict
+    | NeedsInfoAnswered
 )
 
 
@@ -407,6 +436,8 @@ def apply(column: str | None, event: Event) -> Transition:
             if event.charged:
                 return Transition("in_progress", (_A.RECORD_CI, _A.NEXT_ATTEMPT))
             return Transition(col, (_A.RECORD_CI,))
+        case NeedsInfoAnswered() if col == "todo":
+            return Transition(col)
         case BaseConflict() if col == "testing":
             if event.rebases_done < REBASE_CAP:
                 return Transition("in_progress", (_A.START_REBASE,))
@@ -574,11 +605,14 @@ __all__ = [
     "IllegalTransition",
     "IssueEdited",
     "Merged",
+    "NeedsInfoAnswered",
     "ReviewSubmitted",
     "TicketRequested",
     "TierOverride",
     "Transition",
     "apply",
+    "clarify_cursor",
+    "clarify_qa_cursor",
     "compose_kickback_note",
     "count_rebase_attempts",
     "decide_ci",

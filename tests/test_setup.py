@@ -486,3 +486,33 @@ def test_setup_command_is_typer_registrable(tmp_path, monkeypatch):
     help_text = re.sub(r"\x1b\[[0-9;]*m", "", raw_help)
     for flag in ("--uninstall-service", "--org", "--app-name", "--allowed-user", "--no-service"):
         assert flag in help_text
+
+
+def test_setup_prints_the_permissions_upgrade_for_an_old_app(tmp_path, pem):
+    """#41, wired at wave 6b's close: an App created before `checks: read` and
+    `actions: read` were added gets the upgrade text from `fman setup`."""
+    old = {k: v for k, v in manifest.PERMISSIONS.items() if k not in ("checks", "actions")}
+
+    class OldApp(FakeGitHub):
+        def __call__(self, request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/app/installations/77" and request.method == "GET":
+                self.requests.append(request)
+                return httpx.Response(200, json={"id": 77, "permissions": old})
+            return super().__call__(request)
+
+    out: list[str] = []
+    gh = OldApp(pem)
+    run_setup(
+        opener=Browser(),
+        echo=out.append,
+        transport=httpx.MockTransport(gh),
+        api_url="https://api.github.test",
+        install_service=False,
+        which=fake_which(TOOLS),
+        run=fake_run(TOOL_OUT),
+        callback_timeout=10,
+        sleep=lambda s: None,
+    )
+    text = "\n".join(out)
+    assert "missing permissions" in text and "Checks: read" in text and "Actions: read" in text
+    assert "/settings/installations/77" in text

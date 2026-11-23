@@ -3,7 +3,9 @@
 ``render_status`` reads the store only (open it with ``read_only=True``), so it works
 whether or not the worker is running. Since #21 it also shows which tickets wait on file
 locks held by other tickets (#19) or on a spend approval (#18), and ends with the cloud
-spend line when given the config. ``set_verify_command`` saves a repo's verify
+spend line when given the config. Wave 6b: a ticket waiting on ``needs-info`` (#44) or on
+GitHub CI (#41) says so, and with the config the sandbox line (#40) comes last, loudly
+when the sandbox is off. ``set_verify_command`` saves a repo's verify
 command and lifts the "no verify command" flag from that repo's open tickets, so the
 running worker picks them up on its next pass.
 """
@@ -15,7 +17,9 @@ from collections.abc import Sequence
 from foreman_inator.config import Config
 from foreman_inator.db.store import COLUMNS, Attempt, Store, Ticket
 from foreman_inator.locks import Locks
+from foreman_inator.runner import sandbox
 from foreman_inator.spend import FLAG_SPEND_CAP, Spend
+from foreman_inator.tickets.lifecycle import clarify_cursor
 from foreman_inator.worker_policy import FLAG_NO_VERIFY
 
 _TITLES = {
@@ -43,7 +47,10 @@ def _attempt_text(attempts: Sequence[Attempt]) -> str:
 
 
 def _line(
-    t: Ticket, attempts: Sequence[Attempt], waits: dict[int, tuple[int, ...]] | None = None
+    t: Ticket,
+    attempts: Sequence[Attempt],
+    waits: dict[int, tuple[int, ...]] | None = None,
+    store: Store | None = None,
 ) -> str:
     title = " ".join(t.title.split())
     if len(title) > TITLE_WIDTH:
@@ -65,7 +72,28 @@ def _line(
     if blockers:
         held = ", ".join(f"#{b}" for b in blockers)
         line += f"\n         WAITING: on files held by ticket(s) {held}"
+    for why in _waits(t, attempts, store):
+        line += f"\n         WAITING: {why}"
     return line
+
+
+def _waits(t: Ticket, attempts: Sequence[Attempt], store: Store | None) -> list[str]:
+    """#44's needs-info wait and #41's CI wait, from the store alone."""
+    if store is None or t.flag_reason:
+        return []
+    if t.column == "todo" and store.get_cursor(t.repo, clarify_cursor(t.id)) == "asked":
+        return ["needs-info: answer the question on the issue, or remove the label"]
+    last = attempts[-1] if attempts else None
+    if (
+        t.column == "testing"
+        and last is not None
+        and last.tests_passed
+        and last.outcome is None
+        and last.ci_status is None
+        and not store.list_reviews(attempt_id=last.id, shadow=False)
+    ):
+        return ["GitHub CI on the PR head"]
+    return []
 
 
 def render_status(store: Store, *, closed_limit: int = 5, config: Config | None = None) -> str:
@@ -91,7 +119,7 @@ def render_status(store: Store, *, closed_limit: int = 5, config: Config | None 
         if len(shown) < len(items):
             header += f", latest {len(shown)}"
         out.append(header)
-        out.extend(_line(t, store.list_attempts(t.id), waits) for t in shown)
+        out.extend(_line(t, store.list_attempts(t.id), waits, store) for t in shown)
         if not items:
             out.append("  (none)")
         out.append("")
@@ -106,11 +134,17 @@ def render_status(store: Store, *, closed_limit: int = 5, config: Config | None 
         1
         for t in tickets
         if t.column not in ("done", "dropped")
-        and (t.id in waits or (t.flag_reason or "").startswith(FLAG_SPEND_CAP))
+        and (
+            t.id in waits
+            or (t.flag_reason or "").startswith(FLAG_SPEND_CAP)
+            or _waits(t, store.list_attempts(t.id), store)
+        )
     )
     out.append(f"{len(tickets)} ticket(s), {flagged} flagged for you, {waiting} waiting.")
     if config is not None:
         out.append(Spend(store, config).summary().status_line())
+        line = sandbox.describe(config.sandbox, dict(config.sandbox_network))  # type: ignore[arg-type]
+        out.append(f"!!! {line} !!!" if config.sandbox == "off" else line)
     return "\n".join(out)
 
 

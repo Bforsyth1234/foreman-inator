@@ -42,7 +42,7 @@ from foreman_inator.tracing import capture_spans
 from foreman_inator.worker_status import render_status
 
 SNAPSHOTS = Path(__file__).parent / "snapshots" / "ticket_prompt"
-LADDER = ["inkling-2-mini", "qwen3.8-27b", "glm", "claude-sonnet"]
+LADDER = ["inkling-2-mini", "qwen3.8-27b", "glm", "claude-opus", "claude-fable"]
 
 
 @pytest.fixture
@@ -127,7 +127,7 @@ def test_row_checks_pass_ai_review(env: Env, spans) -> None:
     env.once(passing())
     t = env.ticket(n)
     (review,) = env.reviews(n)
-    assert review.reviewer_model == "claude-sonnet" and review.verdict == "approve"
+    assert review.reviewer_model == "claude-opus" and review.verdict == "approve"
     assert review.attempt_id == env.attempts(n)[0].id
     posts = env.gh.writes_named("post_review")
     marker = f"foreman-inator:ai-review review={review.id}"
@@ -181,7 +181,7 @@ def test_row_ai_approved_pr_marked_ready(env: Env) -> None:
     pr = pr_of(env, n)
     assert not pr.draft and env.ticket(n).column == "testing"
     assert env.ticket(n).flag_reason is None
-    assert "## AI review" in pr.body and "**Approved** by `claude-sonnet`" in pr.body
+    assert "## AI review" in pr.body and "**Approved** by `claude-opus`" in pr.body
     assert len(env.gh.writes_named("mark_ready_for_review")) == 1
     assert env.gh.ready_violations == [] and env.gh.ready_checks == 1
 
@@ -225,7 +225,8 @@ def test_row_approve_merge_issue_closed(env: Env) -> None:
 
 def test_row_tier3_failure_handed_to_user(env: Env) -> None:
     """ "Tier 3 fails → the ticket stays in progress and is flagged for you": every rung
-    of the ladder (tier 1, 2, GLM, Claude) fails its checks twice, then the user."""
+    of the ladder (tier 1, 2, GLM, Claude Opus, Claude Fable) fails its checks twice, then
+    the user."""
     n = env.label()
     for _ in range(len(LADDER) * 2 + 1):
         env.once(failing())
@@ -244,23 +245,26 @@ def test_row_tier3_failure_handed_to_user(env: Env) -> None:
 
 def test_ai_kickbacks_on_tier3_hand_the_pr_to_you_with_the_notes(env: Env) -> None:
     """ "If tier 3 is already writing, the PR goes to you with the reviewer's notes": two
-    AI kickbacks on GLM move to Claude, two more there hand over and mark the PR ready."""
-    env.review_replies.extend(request_changes(note=f"Missing case {i}.") for i in range(4))
+    AI kickbacks on GLM move to Claude Opus, two there move to Claude Fable, and two more
+    there hand over and mark the PR ready."""
+    env.review_replies.extend(request_changes(note=f"Missing case {i}.") for i in range(6))
     n = env.label("Big change", "Rework it.", "tier:3")
-    for _ in range(5):
+    for _ in range(7):
         env.once(passing(model_call=False))
     attempts = env.attempts(n)
     assert [(a.model, a.trigger) for a in attempts] == [
         ("glm", "first"),
         ("glm", "ai_kickback"),
-        ("claude-sonnet", "escalation"),
-        ("claude-sonnet", "ai_kickback"),
+        ("claude-opus", "escalation"),
+        ("claude-opus", "ai_kickback"),
+        ("claude-fable", "escalation"),
+        ("claude-fable", "ai_kickback"),
     ]
-    assert [r.reviewer_model for r in env.reviews(n)] == ["claude-sonnet"] * 2 + ["glm"] * 2
+    assert [r.reviewer_model for r in env.reviews(n)] == ["claude-opus"] * 2 + ["glm"] * 4
     t = env.ticket(n)
     assert t.flag_reason.startswith(escalation.FLAG_AI_KICKBACK_CAP)
     pr = pr_of(env, n)
-    assert not pr.draft and "## Handed to you" in pr.body and "Missing case 3." in pr.body
+    assert not pr.draft and "## Handed to you" in pr.body and "Missing case 5." in pr.body
     (comment,) = handover_comments(env, n)
     assert f"Pull request #{pr.number} is marked ready" in comment
     assert env.gh.ready_violations == []
@@ -291,6 +295,24 @@ def test_pr_never_marked_ready_before_an_approve_or_a_handover(tmp_path: Path) -
         e.label("Typo", "Fix it.", "review:skip")
         e.once(passing(model_call=False))
         assert not pr_of(e).draft and e.review_calls == 0
+        assert e.gh.ready_checks == 1 and e.gh.ready_violations == []
+    finally:
+        e.close()
+    # #41: with GitHub CI read, never ready while CI is red or undecided (the checker
+    # also flags a ready PR whose attempt has no CI result, or a red one).
+    e = Env(tmp_path / "c", ci=True)
+    try:
+        e.label()
+        e.once(passing(model_call=False))
+        assert pr_of(e).draft and e.review_calls == 0  # undecided: waits at the CI gate
+        head = pr_of(e).head_sha
+        e.gh.add_check_run(REPO, head, "tests", status="completed", conclusion="failure")
+        e.once(passing("def feature():\n    return 2\n", model_call=False))  # red: retried
+        assert pr_of(e).draft and not e.gh.writes_named("mark_ready_for_review")
+        head = pr_of(e).head_sha
+        e.gh.add_check_run(REPO, head, "tests", status="completed", conclusion="success")
+        e.once()
+        assert not pr_of(e).draft and e.review_calls == 1
         assert e.gh.ready_checks == 1 and e.gh.ready_violations == []
     finally:
         e.close()

@@ -100,7 +100,7 @@ def test_missing_file_gives_spec_defaults() -> None:
     assert [m.tier for m in cfg.models_for_tier(1)] == [1]
     assert cfg.models_for_tier(1)[0].kind == "local"
     assert cfg.models_for_tier(2)[0].kind == "local"
-    assert [m.name for m in cfg.models_for_tier(3)] == ["glm", "claude-sonnet"]
+    assert [m.name for m in cfg.models_for_tier(3)] == ["glm", "claude-opus", "claude-fable"]
     assert all(m.kind == "cloud" and m.api_key_ref for m in cfg.models_for_tier(3))
     assert cfg.allowed_users == ()
     assert cfg.spend_caps.daily_usd > 0
@@ -176,14 +176,16 @@ def test_local_model_must_be_loopback(foreman_home: Path) -> None:
 def test_reviewer_independence_picks_other_family() -> None:
     cfg = Config()
     glm = cfg.model("glm")
-    claude = cfg.model("claude-sonnet")
+    claude = cfg.model("claude-opus")
+    fable = cfg.model("claude-fable")
     tier1, tier2 = cfg.models_for_tier(1)[0], cfg.models_for_tier(2)[0]
     assert cfg.reviewer_for(glm) == claude
     assert cfg.reviewer_for(claude) == glm
+    assert cfg.reviewer_for(fable) == glm  # both Claude writers get the GLM reviewer
     assert cfg.reviewer_for(tier1) == claude
     assert cfg.reviewer_for(tier2) == claude
     assert tier1.family != tier2.family  # an escalation 1 -> 2 changes model family
-    only_claude = Config(reviewer_models=("claude-sonnet",))
+    only_claude = Config(reviewer_models=("claude-opus",))
     assert only_claude.reviewer_for(claude) is None
 
 
@@ -216,7 +218,7 @@ def test_keys_resolve_lazily(fake_keyring: FakeKeyring, foreman_home: Path) -> N
     assert cfg.models_for_tier(1)[0].api_key() is None
     assert fake_keyring.gets == []  # nor does a local tier
     with pytest.raises(ConfigError, match="fman config set-key anthropic"):
-        cfg.model("claude-sonnet").api_key()
+        cfg.model("claude-opus").api_key()
     assert fake_keyring.gets == [("foreman-inator", "anthropic")]
 
 

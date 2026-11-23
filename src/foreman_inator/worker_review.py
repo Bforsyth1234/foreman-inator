@@ -3,7 +3,12 @@
 ``ReviewSteps`` is mixed into ``Worker``. The stage sits between "checks passed + draft PR
 pushed" (``testing``) and "PR marked ready for your review":
 
-1. ``ci_gate`` — the seam where #41 waits for GitHub CI (no behaviour yet).
+1. ``ci_gate`` (#41): wait until the poller stored GitHub CI's result for the attempt
+   (``attempts.ci_status``). Red is charged to the attempt by the poll handler
+   (``RECORD_CI`` + escalation), so the gate only ever opens on a green or an uncharged
+   result (no CI, red on base too, pending past 30 minutes, no permission). It comes
+   before the ``review:skip`` hand-over too, so nothing is marked ready on a red or an
+   undecided run (7a).
 2. ``review:skip`` by an allowed user → hand-over (the PR is marked ready, no review).
 3. ``pick_reviewer`` (#17): a reviewer of another model family than the writer (7f);
    none → hand-over.
@@ -11,7 +16,9 @@ pushed" (``testing``) and "PR marked ready for your review":
    with five ``review.check`` children. Nothing is stored while it runs.
 5. Cut short (shutdown) → nothing is stored; the review runs again. A cloud call refused
    at the spend cap → the verdict is thrown away and the ticket pauses (``worker_pause``).
-6. One transaction: the ``reviews`` row (+ a ``kickbacks`` row ``by="reviewer"`` and the
+6. One transaction, only while the ticket is still in ``testing`` (a base conflict or
+   a user's kickback may have moved it during the review: then nothing is stored): the
+   ``reviews`` row (+ a ``kickbacks`` row ``by="reviewer"`` and the
    attempt's outcome ``kicked_back`` for request_changes) and ``AIReviewed`` (request
    changes moves the ticket back to ``in_progress``; escalation picks the next step).
 7. ``finalize_review``: post the verdict as the bot's COMMENT review (once, by marker),
@@ -32,6 +39,7 @@ redoes the hand-over, and every step before it is idempotent.
 from __future__ import annotations
 
 import logging
+import shutil
 import threading
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
@@ -41,11 +49,13 @@ from foreman_inator.github.client import IssueEvent
 from foreman_inator.github.poller import REVIEW_SKIP_LABEL
 from foreman_inator.pr.publisher import Handover, PublishError, pr_head_branch
 from foreman_inator.review import reviewer as rv
+from foreman_inator.runner import sandbox
 from foreman_inator.runner.worktree import WorktreeError
 from foreman_inator.tickets import lifecycle
 from foreman_inator.tickets.lifecycle import AIReviewed
 from foreman_inator.worker_actions import FLAG_NO_REVIEWER, FLAG_REVIEW_SKIPPED, Ctx, flag_comment
 from foreman_inator.worker_policy import published_attempt
+from foreman_inator.worker_sandbox import FLAG_SANDBOX
 
 if TYPE_CHECKING:
     from foreman_inator.worker_queue import Job
@@ -67,15 +77,28 @@ class ReviewSteps:
     # ------------------------------------------------------------------ seams
 
     def ci_gate(self, ticket: Ticket, attempt: Attempt) -> bool:
-        """Seam for #41: between "local checks passed + draft PR pushed" and the AI review.
-        Return False to wait (the review job is derived again on the next pass). No
-        behaviour yet: always go on to the review."""
-        return True
+        """#41: between "local checks passed + draft PR pushed" and the AI review (or the
+        ``review:skip`` hand-over). False: wait; the review job is derived again on the
+        next pass, after the poller read CI. With CI reading off (``Poller(ci=False)``)
+        the gate is open."""
+        if not getattr(self.poller, "ci", False):  # type: ignore[attr-defined]
+            return True
+        return ci_decided(self.store.get_attempt(attempt.id))
 
     def _launch_review(self, **kw: Any) -> rv.ReviewOutcome:
-        """Process launch point 3 of 3 (#40's sandbox): the reviewer's checks (tests,
-        coverage, revert, run-app) run inside ``review_change``."""
-        return rv.review_change(**kw)
+        """Process launch point 3 of 3 (#40): the reviewer's checks (tests, coverage,
+        revert, run-app) run inside ``review_change`` under ``sandbox.active``; each check
+        re-binds the policy to its own scratch worktree."""
+        t = self.store.get_ticket(kw["ticket_id"])
+        key = f"r{kw['attempt_id']}"
+        scratch = self._sandbox_scratch(f"{key}-work")  # type: ignore[attr-defined]
+        policy = self._sandbox_policy(t, scratch, key, writer=False)  # type: ignore[attr-defined]
+        try:
+            with sandbox.active(policy):
+                return rv.review_change(**kw)
+        finally:
+            self._drop_scratch(policy)  # type: ignore[attr-defined]
+            shutil.rmtree(scratch, ignore_errors=True)
 
     # ------------------------------------------------------------------ jobs
 
@@ -88,6 +111,9 @@ class ReviewSteps:
         if not att.tests_passed or att.outcome is not None:
             return
         if self.store.list_reviews(attempt_id=att.id, shadow=False):
+            return
+        if not self.ci_gate(t, att):
+            log.debug("ticket %d: waiting at the CI gate", t.id)
             return
         if self.review_skipped(t):
             self.hand_over(t, _SKIP_REASON, ready=True, attempt=att)
@@ -104,7 +130,11 @@ class ReviewSteps:
 
     def review_stage(self, t: Ticket, att: Attempt, cancel: threading.Event | None = None) -> None:
         if not self.ci_gate(t, att):
-            log.info("ticket %d: waiting at the CI gate before the AI review", t.id)
+            log.info("ticket %d: waiting on GitHub CI before the AI review", t.id)
+            return
+        why = self.sandbox_ready(self._mirror(t.repo).repo_dir)  # type: ignore[attr-defined]
+        if why is not None:
+            self.hand_over(t, f"{FLAG_SANDBOX}: {why}", ready=False, attempt=att)
             return
         writer = self._endpoint_named(att)
         try:
@@ -139,6 +169,10 @@ class ReviewSteps:
             self.pause_for_spend(t, refusal)  # type: ignore[attr-defined]
             return
         with self.store.transaction():
+            if self.store.get_ticket(t.id).column != "testing":
+                # A base conflict (#43) or a kickback moved it while the review ran.
+                log.info("ticket %d: left testing during the AI review; verdict dropped", t.id)
+                return
             outcome = rv.record_outcome(self.store, att.id, outcome)
             if outcome.verdict == "request_changes":
                 self.store.set_attempt_outcome(att.id, "kicked_back")
@@ -200,6 +234,9 @@ class ReviewSteps:
                 return
         elif not (reason == "handover" and handover):
             raise RuntimeError(f"refusing to mark a PR ready for {reason!r} (7a)")
+        if not self._ci_ok(att):
+            log.warning("ticket %d: not marking the PR ready: GitHub CI red or undecided", t.id)
+            return
         if t.pr_number is None:
             return
 
@@ -223,7 +260,13 @@ class ReviewSteps:
         if t.flag_reason == reason:
             return
         att = attempt or published_attempt(self.history(t).attempts)  # type: ignore[attr-defined]
-        ready = bool(ready and t.pr_number is not None and att is not None and att.tests_passed)
+        ready = bool(
+            ready
+            and t.pr_number is not None
+            and att is not None
+            and att.tests_passed
+            and self._ci_ok(att)
+        )
         n = len(self.store.list_attempts(t.id))
         if ready:
             assert att is not None
@@ -242,6 +285,14 @@ class ReviewSteps:
         log.info("ticket %d: handed to the user (%s)", t.id, kind)
 
     # ------------------------------------------------------------------ helpers
+
+    def _ci_ok(self, att: Attempt) -> bool:
+        """Invariant 7a with #41: may this attempt's PR be marked ready? Never when CI
+        was red and charged; never while CI is undecided (when CI is read at all)."""
+        cur = self.store.get_attempt(att.id)
+        if cur.ci_passed is False:
+            return False
+        return ci_decided(cur) or not getattr(self.poller, "ci", False)  # type: ignore[attr-defined]
 
     def review_skipped(self, ticket: Ticket) -> bool:
         """Is the ``review:skip`` label on the issue, applied by an allowed user (7b)?
@@ -292,6 +343,11 @@ class ReviewSteps:
         return mirror.resolve(f"refs/remotes/origin/{pr_head_branch(t)}")
 
 
+def ci_decided(att: Attempt) -> bool:
+    """CI reached a result for the attempt that lets it go on (not red and charged)."""
+    return att.ci_status is not None and att.ci_passed is not False
+
+
 def _applied(events: Iterable[IssueEvent], label: str) -> IssueEvent | None:
     """The ``labeled`` event that applied ``label`` (if it is still on)."""
     current: IssueEvent | None = None
@@ -329,4 +385,4 @@ def comment_from_row(review: Review) -> str:
     )
 
 
-__all__ = ["ReviewSteps", "comment_from_row"]
+__all__ = ["ReviewSteps", "ci_decided", "comment_from_row"]

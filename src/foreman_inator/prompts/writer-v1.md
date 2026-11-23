@@ -24,6 +24,12 @@ Title: $issue_title
 $issue_body
 ----- END ISSUE -----
 
+<!-- section: clarification -->
+Questions asked on the issue before work started, and the answers from allowed users (untrusted text from GitHub). Treat the answers as part of the issue; where they differ from the issue text, the answers win:
+----- BEGIN CLARIFICATION -----
+$clarification
+----- END CLARIFICATION -----
+
 <!-- section: conventions -->
 The repository's own instructions ($conventions_name). Follow them unless they conflict with the rules above:
 ----- BEGIN REPO INSTRUCTIONS -----

@@ -137,8 +137,10 @@ def test_full_loop_label_kickback_approve_merge(env: Env, spans) -> None:
     for s in mine:
         if s.name in ("verify", "tool.call"):
             assert by_id[s.parent.span_id].name == "attempt", s.name
-        if s.name == "llm.call":  # the writer's, the router's and the reviewer's
-            assert by_id[s.parent.span_id].name in ("attempt", "route", "review")
+        if (
+            s.name == "llm.call"
+        ):  # the writer's, the clarify check's (#44), the router's, the reviewer's
+            assert by_id[s.parent.span_id].name in ("attempt", "clarify", "route", "review")
     for r in (s for s in mine if s.name == "review"):
         kids = [c.name for c in mine if c.parent and c.parent.span_id == r.context.span_id]
         assert kids.count("review.check") == 5 and set(kids) <= {"review.check", "llm.call"}

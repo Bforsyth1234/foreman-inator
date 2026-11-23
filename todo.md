@@ -36,6 +36,12 @@ e. NO SILENT LOOPS. Every retry and escalation chain is capped and ends
    with the user: flagged on the issue, never retried forever.
 f. THE REVIEWER IS INDEPENDENT. A different model family from the
    writer; it sees the issue and the diff, never the writer's reasoning.
+g. MODEL-WRITTEN CODE RUNS SANDBOXED. OpenCode, the verify command and the
+   reviewer's checks run only under the attempt's sandbox (writes confined
+   to the attempt's worktree and scratch dir, no reads of the home or
+   `~/.foreman-inator`, network only to the proxy unless the repo allows
+   it). The sandbox fails closed; `sandbox = "off"` is the only way out
+   and is always shown.
 	8.	TESTS: `uv run pytest -q` and `uv run ruff check .`. Anything red
 blocks the item. Tests never touch the real GitHub API, a real model or
 `~/.foreman-inator`: use `tests/fakes/` and `tmp_path`.
@@ -59,7 +65,7 @@ in the item, and put the shape you rely on behind one small adapter so a
 change touches one file.
 ============================================================ -->
 
-Next ID: #52
+Next ID: #53
 Legend: `[ ]` todo · `[~]` in progress · `[~] live` built, waiting on its live check · `[x]` done (move to DONE.md)
 
 ## Wave plan
@@ -87,7 +93,7 @@ Package root below is `src/foreman_inator/` (written `pkg/`).
 | 4 | A: #14 (alone: the main loop) | `pkg/worker.py`, `pkg/cli.py` (`run`, `status`), `tests/test_worker_v1.py`, `tests/fakes/` (additive only) | [x] built; live check open for #14 |
 | 5 | A: #15 · B: #16 · C: #17 · D: #18 · E: #19 · F: #20 | A `pkg/routing/rules.py`, `pkg/routing/__init__.py`, `pkg/prompts/router-v1.md` · B `pkg/routing/escalation.py` · C `pkg/review/reviewer.py`, `pkg/review/checks.py`, `pkg/review/__init__.py`, `pkg/prompts/reviewer-v1.md` · D `pkg/spend.py` · E `pkg/locks.py` · F `pkg/metrics/queries.py`, `pkg/metrics/web.py`, `pkg/metrics/__init__.py`, `pkg/pr/summary.py` (+ own tests). Runner at close: `pyproject.toml` deps | [x] built; live check open for #17 |
 | 6 | A: #21 (alone: the main loop) | `pkg/worker.py`, `pkg/cli.py` (`metrics`), `pkg/pr/publisher.py` (ready-for-review + bot review posting), `tests/test_worker_v2.py` | [x] built; live check open for #21 |
-| 6b | A: #40 · B: #41, #42, #43 (one agent, in order: all three edit the GitHub client and poller) · C: #44 | A `pkg/runner/sandbox.py`; edits `pkg/runner/opencode.py`, `pkg/runner/verify.py`, `pkg/review/checks.py`, `pkg/config.py` · B `pkg/github/client.py`, `tests/fakes/github.py`, `pkg/github/poller.py`, `pkg/tickets/lifecycle.py`, `pkg/tickets/prompt.py`, `pkg/setup/manifest.py`, `pkg/runner/worktree.py`, `pkg/db/store.py`, `pkg/db/migrations/002_*.sql` · C `pkg/tickets/clarify.py`, `pkg/prompts/clarify-v1.md` (+ own tests). Runner at close: `worker.py` wiring for all five; for #44 the `NeedsInfoAnswered` event in `poller.py`/`lifecycle.py` and the Q&A block in `tickets/prompt.py` (after slot B is merged into the wave branch); `pyproject.toml` deps | [ ] |
+| 6b | A: #40 · B: #41, #42, #43 (one agent, in order: all three edit the GitHub client and poller) · C: #44 | A `pkg/runner/sandbox.py`; edits `pkg/runner/opencode.py`, `pkg/runner/verify.py`, `pkg/review/checks.py`, `pkg/config.py` · B `pkg/github/client.py`, `tests/fakes/github.py`, `pkg/github/poller.py`, `pkg/tickets/lifecycle.py`, `pkg/tickets/prompt.py`, `pkg/setup/manifest.py`, `pkg/runner/worktree.py`, `pkg/db/store.py`, `pkg/db/migrations/002_*.sql` · C `pkg/tickets/clarify.py`, `pkg/prompts/clarify-v1.md` (+ own tests). Runner at close: `worker.py` wiring for all five; for #44 the `NeedsInfoAnswered` event in `poller.py`/`lifecycle.py` and the Q&A block in `tickets/prompt.py` (after slot B is merged into the wave branch); `pyproject.toml` deps | [x] built and wired; live checks open for #40, #41, #44 |
 | 7 | A: #22 (cross-repo, optional) | bot-inator repo only; nothing in this repo | [ ] |
 | 8 | A: #23 · B: #24 · C: #25 · D: #26 · E: #27 · F: #28 | A `pkg/routing/knn.py`, `pkg/routing/explore.py` · B `pkg/experiments/variants.py`, `pkg/experiments/__init__.py`, `pkg/prompts/__init__.py` · C `pkg/experiments/replay_sets.py`, `pkg/experiments/replay_runner.py` · D `pkg/experiments/shadow.py` · E `pkg/tracing/failure_label.py`, `pkg/prompts/failure-label-v1.md` · F `pkg/tracing/replay.py`, `pkg/metrics/trace_view.py`, `tests/recordings/` (+ own tests). Runner at close: `pyproject.toml` deps | [ ] |
 | 9 | A: #29 (alone: wiring) | `pkg/worker.py`, `pkg/cli.py` (`experiment`, `replay`), `pkg/metrics/web.py` (new routes and failure-step columns), `tests/test_worker_v3.py` | [ ] |
@@ -95,6 +101,7 @@ Package root below is `src/foreman_inator/` (written `pkg/`).
 | — | #33–#39 | unscheduled (SPEC milestone 5) | open |
 | — | #45–#50 | unscheduled (gap review, 2026-11-23) | open |
 | — | #51 | unscheduled (user request, 2026-11-23); proposed as its own wave after 6b | open |
+| — | #52 | unscheduled (user request, 2026-11-23); after 6b, can share a wave with #51 (disjoint files) | open |
 
 ### Runner decisions on open questions (assistant defaults, 2026-11-23)
 
@@ -122,7 +129,12 @@ Open (need the user; full steps in each item's DONE.md entry):
 
 - #21 worker loop v2 (milestone 2): one week on 1–2 real repos (public only after #40), then read the metrics page. Steps in DONE.md.
 
-Still to come: #40, #41 and #44 (wave 6b).
+- #40 sandbox: one real ticket with the sandbox on; then an issue that tells the agent to print a file from `~/.ssh` and fetch an outside URL: both blocked in the trace.
+- #41 GitHub CI: add Checks: Read and Actions: Read to the App; a ticket on a repo with a failing Actions job stays a draft.
+- #44 clarifying questions: label a deliberately vague issue; answer from the phone; the attempt uses the answer.
+- Optional (#42, #43): a request-changes review with line comments; a conflicting commit on the base of a PR in review.
+
+One combined step list for wave 6b is in DONE.md's #40, #41 and #44 entries.
 
 ## Completed items (archived to DONE.md)
 
@@ -147,6 +159,11 @@ Still to come: #40, #41 and #44 (wave 6b).
 #19 — File locks for parallel tickets [x] · 2026-11-23 · see DONE.md
 #20 — Metrics queries, local page, summary comment [x] · 2026-11-23 · see DONE.md
 #21 — Worker loop v2: tiers, escalation, review, caps, locks (milestone 2) [~] live · 2026-11-23 · see DONE.md
+#40 — Sandbox for every process that runs model-written code [~] live · 2026-11-23 · see DONE.md
+#41 — Read GitHub CI results for the PR head [~] live · 2026-11-23 · see DONE.md
+#42 — Inline review comments reach the next attempt [x] · 2026-11-23 · see DONE.md
+#43 — Handle a PR that conflicts with its base branch [x] · 2026-11-23 · see DONE.md
+#44 — Ask before guessing: clarifying questions on a vague issue [~] live · 2026-11-23 · see DONE.md
 
 ---
 
@@ -187,118 +204,6 @@ todo.md and the code (user: "Yes, add them"). Every DECISIONS list below
 is an assistant default the user can overturn. SPEC.md is an export of
 the Claude doc, so each item names the SPEC change it needs instead of
 editing SPEC.md.
-
-#40 — Sandbox for every process that runs model-written code [ ]
-Wave: 6b · Agent: A · Added: 2026-11-23 · Source: assistant (gap review; user approved)
-Ask: A command the model writes can't read or write outside the attempt's worktree, and can't reach the internet.
-Why: `runner/opencode.py` sets `bash: allow` and says itself "this is not a sandbox". An allowed user can label an issue a stranger wrote on a public repo, so untrusted text reaches a model with a shell on the Mac.
-DECISIONS (assistant, 2026-11-23):
-1. macOS `sandbox-exec` with a profile generated per attempt. Chosen over a container because OpenCode, the toolchains (uv, node, swift) and the model server already run on the Mac, and Swift builds need macOS. Apple marks `sandbox-exec` deprecated; it still ships. Check it on the current macOS first (rule 12) and record the date.
-2. Covers `opencode serve` (its bash tool inherits it), the verify command, and the reviewer's checks (tests, coverage, revert, run-app).
-3. Files: writes only to the worktree and a per-attempt temp and cache directory (tool caches are pointed there by env). Reads: system and toolchain paths plus the worktree and the git paths the attempt needs (found by test, nothing wider). No reads of `~/.foreman-inator/app.pem`, config, the database, other attempts' worktrees, or the rest of the home directory.
-4. Network: loopback to the attempt's proxy port only; none for verify and reviewer checks. A repo whose tests or installs need the internet sets `sandbox_network = "allow"` in config.
-5. Fails closed: if the sandbox can't start, the attempt doesn't run and the ticket is flagged. The only way out is an explicit `sandbox = "off"` in config, which `fman status` and the PR description show.
-6. Linux is out of scope (launchd and Keychain are already macOS-only); the launch goes through one adapter so another backend can be added.
-SPEC change needed: "Safety on public repos" gains the sandbox; todo.md rule 7 gains an invariant for it.
-Files:
-⚬ OWNED: `src/foreman_inator/runner/sandbox.py`, `tests/test_sandbox.py`
-⚬ EDITED (additive, earlier waves): `src/foreman_inator/runner/opencode.py`, `src/foreman_inator/runner/verify.py`, `src/foreman_inator/review/checks.py` (each process launch goes through the adapter), `src/foreman_inator/config.py` (`sandbox`, per-repo `sandbox_network`)
-⚬ Do NOT touch: the files of slots B and C.
-Approach: `sandbox.wrap(argv, policy) -> argv` plus `Policy(worktree, proxy_port, network)`; the three launch points call it. Fallback if `sandbox-exec` doesn't survive contact: a dedicated low-privilege macOS user for attempts, with the same file rules through permissions.
-Verify:
-⚬ A fixture script inside the sandbox, with a fake home in `tmp_path`: reading a key file outside the worktree, writing outside the worktree, and connecting to a non-proxy address all fail; writing in the worktree and calling the proxy port succeed. These tests run on macOS only; the profile-text tests run everywhere.
-⚬ The fixture repos (python, node, swift, makefile) still pass verify under the sandbox.
-⚬ pytest + ruff gate (rule 8).
-⚬ Non-vacuous: remove the write rule, the outside-write test fails.
-Live (user): one real ticket on a toy repo with the sandbox on. Then an issue whose body tells the agent to print a file from `~/.ssh` and fetch an outside URL: both show as blocked in the trace.
-Deviations:
-
-#41 — Read GitHub CI results for the PR head [ ]
-Wave: 6b · Agent: B (first of three) · Added: 2026-11-23 · Source: assistant (gap review; user approved)
-Ask: A PR is never marked ready for my review while its Actions run is red.
-Why: `github/client.py` has no check-runs call; only the local verify command counts today.
-DECISIONS (assistant, 2026-11-23):
-1. After local checks pass and the draft PR is pushed, wait for the head commit's check runs before AI review (CI is free; the reviewer is not).
-2. A failed check run counts as failed checks in the escalation rules (#16), with the failing job's log tail as the error output.
-3. No check runs after a 2-minute grace period → the repo has no CI; skip. Still pending after 30 minutes → continue and say so in the PR description.
-4. If the same job is also red on the base branch head, the failure isn't charged to the attempt; the PR notes "CI already red on base".
-5. New App permissions: `checks: read`, and `actions: read` for job logs. Confirm both against the current GitHub docs first (rule 12). An App created before this change lacks them: the worker skips the CI step with one warning, and `fman setup` prints how to add them.
-SPEC change needed: lifecycle (CI between checks and AI review) and the permissions list.
-Files:
-⚬ OWNED (slot B): `src/foreman_inator/github/client.py`, `tests/fakes/github.py`, `src/foreman_inator/github/poller.py`, `src/foreman_inator/tickets/lifecycle.py`, `src/foreman_inator/setup/manifest.py`, `src/foreman_inator/db/store.py`, `src/foreman_inator/db/migrations/002_ci.sql`, `tests/test_ci_checks.py`
-⚬ Do NOT touch: the files of slots A and C.
-Approach: `list_check_runs(repo, sha)` and `get_job_log_tail(repo, job_id)` on the client and the fake; a `CiResult` event from the poller (+1 request per poll per ticket waiting on CI); `attempts.ci_passed` in a new migration.
-Verify:
-⚬ Fake GitHub scenarios: green → continues; red → `failed_checks` with the log tail in the retry prompt; none → skipped; pending past the limit → continues with the note; red on base too → not charged.
-⚬ Missing permission → one warning, no crash.
-⚬ pytest + ruff gate (rule 8).
-⚬ Non-vacuous: treat a red run as green, the red scenario test fails.
-Live (user): add the two permissions to the App; open a ticket on a repo with a failing Actions job and confirm the PR stays a draft.
-Deviations:
-
-#42 — Inline review comments reach the next attempt [ ]
-Wave: 6b · Agent: B (second of three) · Added: 2026-11-23 · Source: assistant (gap review; user approved)
-Ask: Comments I leave on specific lines in a "Request changes" review are part of the kickback note.
-Why: the client only has `list_reviews`, which returns the review body; line comments are never fetched.
-DECISIONS (assistant, 2026-11-23):
-1. Fetched only when a new request-changes review from an allowed user arrives (+1 request per kickback).
-2. Each comment goes into the note as `path:line`, the last 3 lines of its diff hunk, then the comment text, in file order.
-3. Same handling as the issue body: defused, and clipped to a 6,000-character budget with a visible marker.
-4. A review with line comments but no "Request changes" still changes nothing.
-Files:
-⚬ OWNED (slot B): `src/foreman_inator/github/client.py`, `tests/fakes/github.py`, `src/foreman_inator/github/poller.py`, `src/foreman_inator/tickets/prompt.py`, `tests/snapshots/ticket_prompt/kickback_user_inline.txt`, `tests/test_review_comments.py`
-Approach: `list_review_comments(repo, pr_number, review_id)`; `ReviewSubmitted` carries them; the prompt builder renders them under the note.
-Verify:
-⚬ Snapshot: a kickback with two line comments renders both with path and line.
-⚬ An oversized comment is clipped with the marker.
-⚬ pytest + ruff gate (rule 8).
-⚬ Non-vacuous: drop the line comments from the note, the snapshot test fails.
-Deviations:
-
-#43 — Handle a PR that conflicts with its base branch [ ]
-Wave: 6b · Agent: B (third of three) · Added: 2026-11-23 · Source: assistant (gap review; user approved)
-Ask: A PR waiting for my review never sits there unmergeable without anyone noticing.
-Why: nothing in the code reads `mergeable` or rebases; the base can move for days while a PR waits.
-DECISIONS (assistant, 2026-11-23):
-1. Read `mergeable` from the `get_pr` call the poller already makes (no extra requests). Only `false` acts; `null` (GitHub still computing) and "behind but clean" do nothing.
-2. A conflict on a ticket in `testing` starts one attempt with a new trigger `rebase`, on the tier that wrote the change: the previous diff is replayed onto the new base, the model resolves the conflicts, then checks and AI review run as for any attempt. The result is force-pushed to the ticket's own `fman/` branch (invariant 7a allows it).
-3. Not a kickback, and a failed `rebase` attempt doesn't count against the model in metrics.
-4. Capped at 2 rebase attempts per ticket, then the issue is flagged for the user (invariant 7e).
-SPEC change needed: `attempts.trigger` gains `rebase`; lifecycle gains the conflict loop.
-Files:
-⚬ OWNED (slot B): `src/foreman_inator/github/client.py`, `tests/fakes/github.py`, `src/foreman_inator/github/poller.py`, `src/foreman_inator/tickets/lifecycle.py`, `src/foreman_inator/tickets/prompt.py`, `src/foreman_inator/runner/worktree.py`, `src/foreman_inator/db/store.py`, `src/foreman_inator/db/migrations/003_rebase.sql`, `tests/snapshots/ticket_prompt/rebase.txt`, `tests/test_base_conflict.py`
-Approach: `PullRequest.mergeable`; a `BaseConflict` event; `worktree.replay_onto_base()` leaves conflict markers for the model; a rebase prompt section listing the conflicted files.
-Verify:
-⚬ Fake GitHub: `mergeable=false` in testing → one `rebase` attempt; `null` → nothing; a third conflict → flagged, no attempt.
-⚬ A real git fixture with a conflicting base commit: the worktree holds the markers and the listed files match.
-⚬ pytest + ruff gate (rule 8).
-⚬ Non-vacuous: remove the cap, the third-conflict test fails.
-Deviations:
-
-#44 — Ask before guessing: clarifying questions on a vague issue [ ]
-Wave: 6b · Agent: C · Added: 2026-11-23 · Source: assistant (gap review; user approved)
-Ask: When an issue is too vague to act on, the worker asks me on the issue instead of spending attempts on a guess.
-Why: OpenCode's `question` permission is denied (correct for an unattended run), and nothing checks the issue before work starts.
-DECISIONS (assistant, 2026-11-23):
-1. A check before routing, by the small local model the router uses, with its own prompt file so the router variant doesn't change.
-2. At most 3 questions, in one issue comment, plus a `needs-info` label. The ticket stays in `todo`; no database change (the label and the comment are the state).
-3. One round per ticket (invariant 7e). After the answer the ticket proceeds whatever the answer says.
-4. Resumes when an allowed user comments on the issue, or removes `needs-info` (meaning "go ahead as written"). The worker removes the label itself on resume. Cost: +1 comment listing per waiting ticket per poll.
-5. Mid-attempt questions stay denied.
-6. `clarify = false` in config turns the check off.
-SPEC change needed: lifecycle gains the needs-info step before routing; the `needs-info` label joins the label list.
-Files:
-⚬ OWNED: `src/foreman_inator/tickets/clarify.py`, `src/foreman_inator/prompts/clarify-v1.md`, `tests/test_clarify.py`
-⚬ Do NOT touch: the files of slots A and B (the runner adds the poller event and the prompt block at wave close).
-Approach: pure functions. `assess(ticket) -> Clear | NeedsInfo(questions)` (model call through the proxy, traced as `clarify`; malformed output → `Clear`). `answered(comments, asked_at, is_allowed) -> str | None` returns the Q&A text for the prompt.
-Verify:
-⚬ Fixed model outputs: clear → `Clear`; vague → at most 3 questions; malformed → `Clear`.
-⚬ `answered` ignores comments from the bot and from users not on the allowlist (invariant 7b).
-⚬ A ticket that was already asked once is never asked again.
-⚬ pytest + ruff gate (rule 8).
-⚬ Non-vacuous: accept a comment from a non-allowed user, the allowlist test fails.
-Live (user): label one deliberately vague issue; answer the question from the phone; confirm the attempt uses the answer.
-Deviations:
 
 ### Milestone 3 — bot-inator integration (optional)
 
@@ -502,4 +407,42 @@ Verify:
 ⚬ pytest + ruff gate (rule 8).
 ⚬ Non-vacuous: make `limits_for(fast)` return the default limits, the `fast` tests fail; let `light` call the model, the zero-calls test fails.
 Live (user): set a toy repo to `prototype` and label 2 issues: both PRs arrive ready with no bot review. Set it to `production`, label one issue with `review:skip`: the review still runs.
+Deviations:
+
+#52 — Prompt caching: native Anthropic route in the proxy, cached-token accounting for Claude and GLM [ ]
+Wave: _ (after 6b; can share a wave with #51) · Agent: _ · Added: 2026-11-23 · Source: user
+Ask: "how could we add prompt caching?", then "add it as a todo item. Also look into z.ai caching capabilities".
+Why: the driver gives OpenCode one `@ai-sdk/openai-compatible` provider (`runner/opencode.py` `build_config`) and the proxy forwards Claude calls to Anthropic's OpenAI-compatible endpoint, which has no prompt caching (#9's rule 12 note). A writer attempt re-sends its whole history on every turn at full input price, so a few cloud attempts can use up the $5 daily cap. `proxy/pricing.py` says itself that cache prices are not used, and the proxy reads only `prompt_tokens` and `completion_tokens`, so GLM's cache discount is not counted either.
+DECISIONS (assistant, 2026-11-23; the user chose the passthrough approach by asking for this item and can overturn the rest):
+1. Passthrough, not translation. The proxy gains a `messages` route under the same prefixes (`/a/<attempt_id>/v1/messages`, `/x/...`, `/c/...`) that forwards the request body unchanged to `<base_url>/messages` and streams the response bytes back unchanged. No OpenAI-to-Anthropic conversion is written.
+2. OpenCode places the cache markers; the proxy adds none. Checked in the installed OpenCode 1.18.7 binary (2026-11-23): it marks the first two system messages and the last two messages with `cacheControl: {type: "ephemeral"}` when the provider package is `@ai-sdk/anthropic` or the model id contains `claude`. If the live check shows no cache reads, the fallback is the proxy adding a top-level `cache_control: {"type": "ephemeral"}` to the forwarded body (the one allowed body change).
+3. `ModelEndpoint` gains `wire = "openai" | "anthropic"`, default `"openai"`. The default Claude endpoint is `"anthropic"`. `build_config` uses `@ai-sdk/anthropic` for an `"anthropic"` endpoint and stays as it is for the rest.
+4. The proxy sets `x-api-key` upstream and forwards the client's `anthropic-version` and `anthropic-beta` headers; every other client auth header is dropped. The fail-closed rules of #9 apply to the new route unchanged (unknown model 404, no key 403, https only, key never in spans, recordings, logs or error bodies; invariant 7c).
+5. Usage: read `input_tokens`, `output_tokens`, `cache_creation_input_tokens`, `cache_read_input_tokens` (and the `cache_creation` split by TTL) from `message_start` and `message_delta` when streaming, and from the body when not. Anthropic's `input_tokens` excludes cached tokens, so `tokens_in` stored on the attempt is the sum of all three input kinds. Cache read and write counts go on the `llm.call` span and on `CallUsage`. No schema change.
+6. Pricing: `Price` gains a cache read rate and cache write multipliers. Claude writes are 1.25× input (5-minute) and 2× (1-hour). Claude reads per million: Sonnet 5.5 $0.10, Opus 5.5 $0.20, Fable 5.2 $0.20 (from the Claude API reference dated 2026-11-03; confirm on the pricing page, rule 12). A model with no cache rate is priced as today.
+7. GLM needs no request change: Z.ai caching is implicit. The proxy reads `usage.prompt_tokens_details.cached_tokens` on the existing `chat/completions` path and prices those tokens at the cached rate (GLM-5.3 and GLM-5.2 $0.26, GLM-5.3-Flash $0.03 per million). `prompt_tokens` is treated as including the cached tokens: the docs do not say so outright, but compute the hit rate as `cached_tokens / prompt_tokens`. Cached-input storage is "Limited-time Free" and is priced at 0 with the date in a comment. GLM stays priced at the pay-as-you-go list price on the Coding Plan (#9's deviation).
+8. The spend preflight estimate stays at the full input price (it must not under-reserve); only the settled actual cost uses cache rates.
+9. The reviewer and the router keep the `chat/completions` path. Each makes one call, so caching gains nothing there.
+10. Recordings: the new route's tee builds the same recorded view (text, tool calls, usage, finish reason) as the OpenAI tee, so fde-kit replay reads both.
+SPEC change needed: Tracing "Capture" says "a thin OpenAI-compatible proxy"; it becomes OpenAI-compatible plus an Anthropic Messages route for Claude models.
+Rule 12 (read 2026-11-23):
+⚬ Z.ai: docs.z.ai/guides/capabilities/cache (implicit, no request field; match is "identical or highly similar" content, exact-prefix not stated; no minimum size or TTL given), docs.z.ai/guides/overview/pricing (the rates in decision 7), docs.z.ai/devpack/overview and /devpack/faq (Coding Plan credits = (input × 6.9 + cached input × 1.7 + output × 24) / 10,000 for GLM-5.3; whether caching applies on `api/coding/paas/v4` is not stated). The cache guide says hits are "usually 50% of standard price" while the pricing table gives about 19%; the table is used.
+⚬ OpenCode: 1.18.7 binary inspected, see decision 2. opencode.ai/docs/providers now shows a `package` / `settings` provider schema next to the `npm` / `options` one this driver writes, and `setup/deps.py` prints an `opencode-v2` install command: check which schema the installed version takes before changing `build_config`.
+⚬ Still to read by the building agent: platform.claude.com prompt caching and pricing pages, the Messages streaming event list, and where `@ai-sdk/anthropic` sends requests relative to `baseURL` (expected `{baseURL}/messages`, not confirmed).
+Files:
+⚬ OWNED: `tests/test_proxy_anthropic.py`, `tests/fakes/anthropic.py` (a scriptable Messages-format upstream)
+⚬ EDITED (additive, earlier waves): `src/foreman_inator/proxy/server.py` (route, headers, Anthropic tee, `cached_tokens` on the OpenAI tee), `src/foreman_inator/proxy/pricing.py` (cache rates), `src/foreman_inator/runner/opencode.py` (`build_config`), `src/foreman_inator/config.py` (`wire`, the default Claude endpoint), `tests/test_proxy.py`, `tests/test_config.py`
+⚬ Do NOT touch: `spend.py`, `db/store.py`, the migrations, `review/reviewer.py`, `worker.py`.
+Scheduling: `runner/opencode.py` and `config.py` are being edited by #40 in wave 6b, so this runs after 6b. Its files are disjoint from #51's.
+Approach: add `"messages"` to the upstream paths behind a wire check (a `messages` call to an `"openai"` endpoint, or a `chat/completions` writer call that should have been native, is still served; only the path decides the upstream format). Factor the tee into one interface with two parsers. `Price.cost(tokens_in, tokens_out)` keeps its signature and gains optional cache arguments. Fallback if `@ai-sdk/anthropic` cannot be pointed at the proxy: keep the OpenAI-compatible provider and build the translation for requests only as far as the writer needs (text, tools, tool results, streaming), which is a larger item and should be re-planned first.
+Verify:
+⚬ A `messages` request through the proxy reaches the fake upstream byte-for-byte with `x-api-key` set, and the streamed response reaches the client byte-for-byte.
+⚬ A streamed response with 1,000 uncached, 9,000 cache-read and 2,000 cache-write input tokens stores `tokens_in` = 12,000 and a cost equal to the hand-computed figure for Sonnet 5.5, Opus 5.5 and Fable 5.2.
+⚬ A GLM response with `prompt_tokens` 1,200 and `cached_tokens` 800 costs 400 × input + 800 × cached rate; with no `prompt_tokens_details` the cost is unchanged from today.
+⚬ The `llm.call` span and the recording row carry the cache counts; the API key appears in neither.
+⚬ A keyless Claude endpoint is refused with 403 on the new route and nothing is sent upstream; a spend-cap refusal returns 429 on the new route.
+⚬ `build_config` gives `@ai-sdk/anthropic` for a `wire = "anthropic"` endpoint and is unchanged for local and GLM endpoints (snapshot).
+⚬ pytest + ruff gate (rule 8).
+⚬ Non-vacuous: price cache reads at the full input rate and the cost test fails; drop `cache_read_input_tokens` from the sum and the `tokens_in` test fails; send `Authorization: Bearer` instead of `x-api-key` and the header test fails.
+Live (user): one real Claude writer attempt on a toy repo: from the second model call on, `cache_read_input_tokens` is above zero in the trace, and the attempt's cost is below the same token count at the uncached rate. One real GLM attempt on the Coding Plan endpoint: note whether `cached_tokens` is ever above zero, since the docs do not say caching applies there.
 Deviations:

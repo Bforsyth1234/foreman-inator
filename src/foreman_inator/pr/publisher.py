@@ -40,6 +40,7 @@ from foreman_inator.github import BRANCH_PREFIX, GitHubAPI, PullRequest
 from foreman_inator.github.client import Review as GitHubReview
 from foreman_inator.runner.verify import VerifyResult
 from foreman_inator.runner.worktree import DiffStats, branch_name
+from foreman_inator.tickets.lifecycle import CI_STATUS_NOTES
 
 # Stable markers. #21 replaces only what sits between a START/END pair.
 BODY_MARKER = "<!-- foreman-inator:pr ticket={ticket_id} -->"
@@ -62,6 +63,7 @@ _TRIGGERS = {
     "kickback": "kickback",
     "ai_kickback": "AI kickback",
     "explore": "explore",
+    "rebase": "rebase",
 }
 _VERDICTS = {
     "approve": "Approved",
@@ -174,6 +176,21 @@ def _verify(current: Attempt, verify: VerifyResult | None) -> list[str]:
     return out
 
 
+def _ci_and_sandbox(current: Attempt, sandbox: str | None) -> list[str]:
+    """#41's CI line (once CI decided for this attempt) and #40's sandbox line (loud
+    when the sandbox is off). Nothing for either when unknown, so older bodies are
+    unchanged."""
+    out: list[str] = []
+    status = current.ci_status
+    if status in ("passed", "failed"):
+        out.append(f"GitHub CI: {status}.")
+    elif status in CI_STATUS_NOTES:
+        out.append(f"GitHub CI: {_text(CI_STATUS_NOTES[status])}.")
+    if sandbox:
+        out.append(f"**{_text(sandbox)}**" if "OFF" in sandbox else _text(sandbox))
+    return out
+
+
 def _review(review: Review | None) -> list[str]:
     out = [REVIEW_START, "## AI review", ""]
     if review is None:
@@ -242,12 +259,15 @@ def render_body(
     diff: DiffStats | None = None,
     review: Review | None = None,
     handover: Handover | None = None,
+    sandbox: str | None = None,
 ) -> str:
     """The full PR body. Pure: same inputs, same text.
 
     ``attempts`` is every attempt of the ticket in order (``Store.list_attempts``) and must
     contain ``current``. ``review`` (the AI verdict) and ``handover`` are #21's inputs; their
     sections sit between ``REVIEW_START``/``REVIEW_END`` and ``HANDOVER_START``/``HANDOVER_END``.
+    ``sandbox`` is ``runner.sandbox.describe(...)`` (#40); the attempt's ``ci_status``
+    gives the CI line (#41). Both go at the end of the Verify section.
     """
     ids = [a.id for a in attempts]
     if current.id not in ids:
@@ -266,6 +286,7 @@ def render_body(
         *_this_attempt(current, ordinal, attempts),
         "",
         *_verify(current, verify),
+        *_ci_and_sandbox(current, sandbox),
         "",
         *_review(review),
         "",
@@ -289,9 +310,11 @@ def body_ticket_id(body: str) -> int | None:
 class Publisher:
     """Opens and updates a ticket's draft PR as the App's bot. Never merges or pushes."""
 
-    def __init__(self, gh: GitHubAPI, store: Store) -> None:
+    def __init__(self, gh: GitHubAPI, store: Store, *, sandbox_line: str | None = None) -> None:
         self.gh = gh
         self.store = store
+        #: #40: the sandbox line every body shows (``runner.sandbox.describe``).
+        self.sandbox_line = sandbox_line
 
     def open_or_update_draft(
         self,
@@ -319,7 +342,14 @@ class Publisher:
             raise PublishError(f"head branch {head!r} is not a worker branch")
         attempts = self.store.list_attempts(ticket.id)
         body = render_body(
-            ticket, attempts, attempt, verify=verify, diff=diff, review=review, handover=handover
+            ticket,
+            attempts,
+            attempt,
+            verify=verify,
+            diff=diff,
+            review=review,
+            handover=handover,
+            sandbox=self.sandbox_line,
         )
 
         pr = self._existing_pr(ticket, head)

@@ -14,10 +14,11 @@ Layout (every key optional; missing keys take the defaults below)::
     allowed_users = ["you"]
     repos = ["you/project"]
     poll_interval_seconds = 45
-    reviewer_models = ["claude-sonnet", "glm"]
+    reviewer_models = ["claude-opus", "glm"]
     max_parallel_per_repo = 1   # tickets worked at once per repo (file locks permit)
     router_timeout_seconds = 30
     sandbox = "on"       # on | off: model-written code runs under sandbox-exec (#40)
+    clarify = true       # ask on a vague issue before working on it (#44)
 
     [sandbox_network]    # per repo: "allow" opens outbound network for its verify + checks
     "you/project" = "none"
@@ -167,7 +168,7 @@ OLLAMA_URL = "http://127.0.0.1:11434/v1"
 
 
 def default_models() -> tuple[ModelEndpoint, ...]:
-    """SPEC.md's initial tier picks. Cloud ids/URLs are placeholders until tier 3 lands."""
+    """The default tier picks. Tier 3 is tried in this order: GLM, Claude Opus, Claude Fable."""
     return (
         ModelEndpoint("inkling-2-mini", 1, "local", "inkling-2-mini", OLLAMA_URL, "inkling"),
         ModelEndpoint("qwen3.8-27b", 2, "local", "qwen3.8:27b", OLLAMA_URL, "qwen"),
@@ -181,10 +182,19 @@ def default_models() -> tuple[ModelEndpoint, ...]:
             key_ref("glm"),
         ),
         ModelEndpoint(
-            "claude-sonnet",
+            "claude-opus",
             3,
             "cloud",
-            "claude-sonnet-5-5",
+            "claude-opus-5-5",
+            "https://api.anthropic.com/v1",
+            "claude",
+            key_ref("anthropic"),
+        ),
+        ModelEndpoint(
+            "claude-fable",
+            3,
+            "cloud",
+            "claude-fable-5-2",
             "https://api.anthropic.com/v1",
             "claude",
             key_ref("anthropic"),
@@ -204,7 +214,7 @@ class Config:
     poll_interval_seconds: int = 45
     spend_caps: SpendCaps = field(default_factory=SpendCaps)
     models: tuple[ModelEndpoint, ...] = field(default_factory=default_models)
-    reviewer_models: tuple[str, ...] = ("claude-sonnet", "glm")  # preference order
+    reviewer_models: tuple[str, ...] = ("claude-opus", "glm")  # preference order
     #: Tickets of one repo worked at the same time, as far as file locks permit (#21).
     #: 1 (the default) suits one local GPU.
     max_parallel_per_repo: int = 1
@@ -221,6 +231,10 @@ class Config:
     #: Stored as sorted ``(repo, network)`` pairs so Config stays hashable; a dict is
     #: accepted and converted.
     sandbox_network: tuple[tuple[str, str], ...] = ()
+    #: #44: before a ticket is routed, a small local model checks the issue can be worked
+    #: on as written; if not, the worker asks on the issue (``needs-info``) and waits for
+    #: an allowed user. False turns the check off.
+    clarify: bool = True
 
     def __post_init__(self) -> None:
         if isinstance(self.sandbox_network, Mapping):
@@ -271,6 +285,8 @@ def _validate(cfg: Config) -> None:
     for repo in cfg.repos:
         if not re.match(r"^[\w.-]+/[\w.-]+$", repo):
             raise ConfigError(f"repo {repo!r} must look like 'owner/name'")
+    if not isinstance(cfg.clarify, bool):
+        raise ConfigError("clarify must be true or false")
     if cfg.sandbox not in SANDBOX_MODES:
         raise ConfigError(f"sandbox must be one of {', '.join(SANDBOX_MODES)}")
     for repo, net in cfg.sandbox_network:
@@ -413,6 +429,8 @@ def from_dict(data: Mapping[str, Any]) -> Config:
         )
     if "sandbox" in data:
         kw["sandbox"] = _typed(data["sandbox"], str, "sandbox")
+    if "clarify" in data:
+        kw["clarify"] = _typed(data["clarify"], bool, "clarify")
     if "sandbox_network" in data:
         nets = _typed(data["sandbox_network"], dict, "sandbox_network")
         kw["sandbox_network"] = {
@@ -446,6 +464,7 @@ def to_dict(cfg: Config) -> dict[str, Any]:
     out["max_parallel_per_repo"] = cfg.max_parallel_per_repo
     out["router_timeout_seconds"] = cfg.router_timeout_seconds
     out["sandbox"] = cfg.sandbox
+    out["clarify"] = cfg.clarify
     if cfg.sandbox_network:
         out["sandbox_network"] = dict(cfg.sandbox_network)
     out["spend_caps"] = {f.name: getattr(cfg.spend_caps, f.name) for f in fields(SpendCaps)}

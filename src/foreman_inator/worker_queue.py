@@ -13,10 +13,12 @@ State                                              Job         Lock gate (#19)
 =================================================  ==========  =========================
 latest review not finalized in this process        finalize    no
 flagged (handed over, spend pause, no verify...)   (none)      —
-``todo`` with no ``routed_tier``                   route       no
+``todo`` waiting on ``needs-info`` (#44)           (none)      —
+``todo``, no ``routed_tier`` or clarify not done   route       no
 last attempt still running                         (none)      —
+``in_progress`` with a rebase pending (#43)        rebase      no
 ``in_progress``, last attempt passed, no outcome   publish     ``may_start``
-``testing``, last attempt passed, no review row    review      no
+``testing``, last attempt passed, no review row    review      no (waits at the CI gate)
 ``testing`` otherwise                              (none)      — (waits for you)
 escalation gives a step (#16)                      attempt     ``may_start``, except a
                                                                hand-over
@@ -45,7 +47,7 @@ log = logging.getLogger("foreman_inator.worker")
 JOIN_TIMEOUT = 90.0  # shutdown: how long to wait for running jobs to unwind
 BACKOFF_START, BACKOFF_MAX = 30.0, 900.0  # a repo whose job raised waits, doubling
 
-JobKind = Literal["route", "attempt", "publish", "review", "finalize"]
+JobKind = Literal["route", "attempt", "publish", "review", "finalize", "rebase"]
 _ORDER = {"in_progress": 0, "testing": 1, "todo": 2}
 
 
@@ -172,12 +174,17 @@ class QueueSteps:
             return "finalize"
         if t.flag_reason:
             return None
-        if t.column == "todo" and t.routed_tier is None:
-            return "route"
+        if t.column == "todo":
+            if self.clarify_parked(t):  # type: ignore[attr-defined]
+                return None
+            if t.routed_tier is None or self.clarify_due(t):  # type: ignore[attr-defined]
+                return "route"
         attempts = self.store.list_attempts(t.id)
         last = attempts[-1] if attempts else None
         if last is not None and last.ended_at is None:
             return None
+        if t.column == "in_progress" and self.rebase_pending(t, attempts):  # type: ignore[attr-defined]
+            return "rebase"
         if last is not None and last.outcome is None and last.tests_passed:
             if t.column == "in_progress":
                 return "publish" if self._lock_gate(t) else None
@@ -254,6 +261,7 @@ class QueueSteps:
             "publish": self.publish_job,  # type: ignore[attr-defined]
             "review": self.review_job,  # type: ignore[attr-defined]
             "finalize": self.finalize_job,  # type: ignore[attr-defined]
+            "rebase": self.rebase_job,  # type: ignore[attr-defined]
         }[job.kind]
         try:
             handler(job, run.cancel)
