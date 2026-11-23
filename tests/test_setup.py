@@ -476,6 +476,9 @@ def test_setup_command_is_typer_registrable(tmp_path, monkeypatch):
     result = CliRunner().invoke(app, ["setup", "--uninstall-service"])
     assert result.exit_code == 0, result.output
     assert len(calls) == 1
-    help_text = CliRunner().invoke(app, ["setup", "--help"]).output
+    # CI terminals make rich colour and wrap the help, which splits the flag names.
+    plain_env = {"NO_COLOR": "1", "TERM": "dumb", "COLUMNS": "200"}
+    raw_help = CliRunner().invoke(app, ["setup", "--help"], env=plain_env).output
+    help_text = re.sub(r"\x1b\[[0-9;]*m", "", raw_help)
     for flag in ("--uninstall-service", "--org", "--app-name", "--allowed-user", "--no-service"):
         assert flag in help_text

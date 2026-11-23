@@ -30,6 +30,7 @@ from __future__ import annotations
 import html
 import json
 import secrets
+import socketserver
 import threading
 import time
 from collections.abc import Callable, Sequence
@@ -137,6 +138,20 @@ _DONE_PAGE = (
 )
 
 
+class _LoopbackHTTPServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer without the reverse-DNS lookup.
+
+    ``HTTPServer.server_bind`` calls ``socket.getfqdn(host)``, which can block for many
+    seconds on macOS (seen on GitHub's macOS runners). A loopback server has no use for it.
+    """
+
+    def server_bind(self) -> None:
+        socketserver.TCPServer.server_bind(self)
+        host, port = self.server_address[:2]
+        self.server_name = str(host)
+        self.server_port = port
+
+
 class CallbackServer:
     """One-shot server on 127.0.0.1: serves the start page, then waits for ``?code=``."""
 
@@ -144,7 +159,7 @@ class CallbackServer:
         self.state = secrets.token_urlsafe(24)
         self._code: str | None = None
         self._event = threading.Event()
-        self._server = ThreadingHTTPServer(("127.0.0.1", 0), self._handler())
+        self._server = _LoopbackHTTPServer(("127.0.0.1", 0), self._handler())
         host, port = self._server.server_address[:2]
         self.base_url = f"http://127.0.0.1:{port}"
         self.manifest = build_manifest(self.base_url + CALLBACK_PATH, app_name)

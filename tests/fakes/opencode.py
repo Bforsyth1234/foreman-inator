@@ -45,6 +45,7 @@ import json
 import os
 import queue
 import secrets
+import socketserver
 import subprocess
 import sys
 import threading
@@ -154,6 +155,20 @@ class _Session:
         self.busy = False
 
 
+class _LoopbackHTTPServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer without the reverse-DNS lookup.
+
+    ``HTTPServer.server_bind`` calls ``socket.getfqdn(host)``, which can block for many
+    seconds on macOS (seen on GitHub's macOS runners). A loopback server has no use for it.
+    """
+
+    def server_bind(self) -> None:
+        socketserver.TCPServer.server_bind(self)
+        host, port = self.server_address[:2]
+        self.server_name = str(host)
+        self.server_port = port
+
+
 class FakeOpenCodeServer:
     """The HTTP server. `calls` lists every request as {method, path, query, body}."""
 
@@ -194,7 +209,7 @@ class FakeOpenCodeServer:
 
     def start(self) -> str:
         handler = _make_handler(self)
-        self._httpd = ThreadingHTTPServer((self.host, self.port), handler)
+        self._httpd = _LoopbackHTTPServer((self.host, self.port), handler)
         self._httpd.daemon_threads = True
         host, port = self._httpd.server_address[:2]
         self.url = f"http://{host}:{port}"
