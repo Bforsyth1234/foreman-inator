@@ -294,7 +294,7 @@ def test_request_is_local_fenced_bounded_and_versioned(fake, proxy):
     (req,) = chat_requests(fake)
     assert req.url == f"{TIER1.base_url}/chat/completions"
     assert req.json["model"] == TIER1.model
-    assert (req.json["temperature"], req.json["max_tokens"], req.json["stream"]) == (0, 16, False)
+    assert (req.json["temperature"], req.json["max_tokens"], req.json["stream"]) == (0, 512, False)
     assert req.json["reasoning_effort"] == "none"
     system, user = req.json["messages"]
     assert system["role"] == "system" and "small, normal or large" in system["content"]

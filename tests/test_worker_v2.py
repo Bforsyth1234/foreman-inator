@@ -42,7 +42,7 @@ from foreman_inator.tracing import capture_spans
 from foreman_inator.worker_status import render_status
 
 SNAPSHOTS = Path(__file__).parent / "snapshots" / "ticket_prompt"
-LADDER = ["qwen3.6-35b-a3b", "qwen3.8-27b", "glm", "claude-sonnet"]
+LADDER = ["inkling-2-mini", "qwen3.8-27b", "glm", "claude-sonnet"]
 
 
 @pytest.fixture
@@ -166,7 +166,7 @@ def test_row_ai_kickback_max_two_then_writer_escalates(env: Env) -> None:
         ("reviewer", attempts[1].id),
     ]
     assert "Handle zero." in env.driver.prompts[1]
-    assert env.driver.endpoints == ["qwen3.6-35b-a3b", "qwen3.6-35b-a3b", "qwen3.8-27b"]
+    assert env.driver.endpoints == ["inkling-2-mini", "inkling-2-mini", "qwen3.8-27b"]
     assert [r.verdict for r in env.reviews(n)] == ["request_changes"] * 2 + ["approve"]
     assert env.ticket(n).column == "testing" and not pr_of(env, n).draft
     assert len(env.gh.writes_named("post_review")) == 3

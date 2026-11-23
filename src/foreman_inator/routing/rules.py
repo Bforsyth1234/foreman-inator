@@ -70,7 +70,10 @@ TITLE_BUDGET = 300
 ISSUE_BODY_BUDGET = 4_000
 MAX_ANSWER_CHARS = 200  # a longer answer is not one of the labels, whatever it says
 MAX_RESPONSE_BYTES = 64 * 1024
-MAX_TOKENS = 16
+# Room for hidden thinking, not for a long answer (MAX_ANSWER_CHARS bounds that). Inkling 2
+# Mini on Ollama thinks even with reasoning_effort "none" and only hides it: measured
+# 64-162 completion tokens for a one-word label, and an empty answer at 16 (2026-11-23).
+MAX_TOKENS = 512
 ERROR_DETAIL_BUDGET = 200
 
 PROMPT_VERSION_HEADER = "x-fman-prompt-version"
