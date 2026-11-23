@@ -22,8 +22,9 @@ def test_version_flag() -> None:
     assert __version__ != "0.0.0"
 
 
-def test_worker_run_is_a_noop() -> None:
-    assert run() is None
+def test_worker_run_without_setup_exits_1() -> None:
+    # #14 replaced the skeleton no-op: with no App configured, `fman run` stops at once.
+    assert run() == 1
 
 
 def test_config_set_key_stores_in_keychain(monkeypatch):

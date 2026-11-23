@@ -84,7 +84,7 @@ Package root below is `src/foreman_inator/` (written `pkg/`).
 | 1 | A: #1 (alone) | `pyproject.toml`, `uv.lock`, `.gitignore`, `LICENSE`, `README.md`, `.pre-commit-config.yaml`, `.github/workflows/ci.yml`, `pkg/__init__.py`, `pkg/cli.py` (skeleton), `pkg/worker.py` (skeleton), `tests/conftest.py`, `tests/fakes/__init__.py` | [x] |
 | 2 | A: #2 · B: #3 · C: #4 · D: #5 · E: #6 · F: #7 | A `pkg/paths.py`, `pkg/config.py` · B `pkg/db/schema.sql`, `pkg/db/store.py`, `pkg/db/__init__.py` · C `pkg/github/app_auth.py`, `pkg/github/client.py`, `pkg/github/__init__.py`, `tests/fakes/github.py` · D `pkg/tracing/otel.py`, `pkg/tracing/recorder.py`, `pkg/tracing/__init__.py` · E `pkg/runner/verify.py`, `tests/fixtures/repos/` · F `pkg/runner/worktree.py`, `pkg/runner/__init__.py` (+ each slot's own `tests/test_<module>.py`). Runner at close: `pyproject.toml` deps | [x] |
 | 3 | A: #8 · B: #9 · C: #10 · D: #11 · E: #12 · F: #13 | A `pkg/setup/manifest.py`, `pkg/setup/deps.py`, `pkg/setup/launchd.py`, `pkg/setup/__init__.py` · B `pkg/proxy/server.py`, `pkg/proxy/pricing.py`, `pkg/proxy/__init__.py`, `tests/fakes/models.py` · C `pkg/runner/opencode.py`, `tests/fakes/opencode.py` · D `pkg/github/poller.py`, `pkg/tickets/lifecycle.py`, `pkg/tickets/__init__.py` · E `pkg/pr/publisher.py`, `pkg/pr/__init__.py` · F `pkg/prompts/writer-v1.md`, `pkg/tickets/prompt.py` (+ own tests). Runner at close: `cli.py` (`setup`), `pyproject.toml` deps | [x] built; live checks open for #8, #10 |
-| 4 | A: #14 (alone: the main loop) | `pkg/worker.py`, `pkg/cli.py` (`run`, `status`), `tests/test_worker_v1.py`, `tests/fakes/` (additive only) | [ ] |
+| 4 | A: #14 (alone: the main loop) | `pkg/worker.py`, `pkg/cli.py` (`run`, `status`), `tests/test_worker_v1.py`, `tests/fakes/` (additive only) | [x] built; live check open for #14 |
 | 5 | A: #15 · B: #16 · C: #17 · D: #18 · E: #19 · F: #20 | A `pkg/routing/rules.py`, `pkg/routing/__init__.py`, `pkg/prompts/router-v1.md` · B `pkg/routing/escalation.py` · C `pkg/review/reviewer.py`, `pkg/review/checks.py`, `pkg/review/__init__.py`, `pkg/prompts/reviewer-v1.md` · D `pkg/spend.py` · E `pkg/locks.py` · F `pkg/metrics/queries.py`, `pkg/metrics/web.py`, `pkg/metrics/__init__.py`, `pkg/pr/summary.py` (+ own tests). Runner at close: `pyproject.toml` deps | [ ] |
 | 6 | A: #21 (alone: the main loop) | `pkg/worker.py`, `pkg/cli.py` (`metrics`), `pkg/pr/publisher.py` (ready-for-review + bot review posting), `tests/test_worker_v2.py` | [ ] |
 | 7 | A: #22 (cross-repo, optional) | bot-inator repo only; nothing in this repo | [ ] |
@@ -113,7 +113,9 @@ Open (need the user; full steps in each item's DONE.md entry):
 - #8 `fman setup`: run it on your Mac, create and install the App on one test repo, confirm the four permissions and no active webhook. Also shows whether GitHub accepts a manifest with no `hook_attributes`.
 - #10 OpenCode driver: one real tier 1 attempt on a toy repo through the proxy. Covered by #14's live check.
 
-Still to come: #14 (milestone 1), #17 and #21 (milestone 2).
+- #14 worker loop v1 (milestone 1): install the tool, `fman setup`, label 3 small issues on a toy repo, review the PRs, kick one back once, check `fman status` and the trace.
+
+Still to come: #17 and #21 (milestone 2).
 
 ## Completed items (archived to DONE.md)
 
@@ -130,6 +132,7 @@ Still to come: #14 (milestone 1), #17 and #21 (milestone 2).
 #11 — Poller and ticket lifecycle [x] · 2026-11-23 · see DONE.md
 #12 — PR publisher [x] · 2026-11-23 · see DONE.md
 #13 — Writer prompt v1 and ticket prompt builder [x] · 2026-11-23 · see DONE.md
+#14 — Worker loop v1: one tier, end to end (milestone 1) [~] live · 2026-11-23 · see DONE.md
 
 ---
 
@@ -160,21 +163,6 @@ All items below were written 2026-11-23 from SPEC.md (user: "write
 todos organized in waves to build this app"). Section = SPEC milestone.
 
 ### Milestone 1 — GitHub App plus a polling worker on one tier
-
-#14 — Worker loop v1: one tier, end to end (milestone 1) [ ]
-Wave: 4 · Agent: A (alone) · Added: 2026-11-23 · Source: spec
-Ask: Label an issue, get a draft PR from the local model, review it on GitHub.
-DECISIONS (runner, 2026-11-23, from wave 3): a same-tier retry after failed checks stores the same `trigger` as the attempt it retries (the store's enum has no `retry`; the prompt builder reads the retry from history). One PR per ticket on `pr_head_branch(ticket)`; later attempts force-push onto it. The driver writes the recorder's `user` row.
-DECISIONS (assistant, 2026-11-23): tier 1 only; no AI review yet (PR is marked ready as soon as checks pass, behind a `v1` flag removed in #21); one ticket per repo at a time.
-Files:
-⚬ OWNED: `src/foreman_inator/worker.py`, `src/foreman_inator/cli.py` (`run`, `status`, register `setup`), `tests/test_worker_v1.py`
-⚬ EDITED (additive): `tests/fakes/*` only if a fake lacks a method.
-Approach: loop: poll → for each new ticket: trace span → worktree → proxy route → OpenCode attempt → verify → retry once on failure with the output → publish draft → mark ready. Reviews → kickback (new attempt with the note) or accept (record, close issue, clean worktree). Ctrl-C finishes the current step and exits cleanly.
-Verify:
-⚬ Full loop against fakes: label → draft PR → "request changes" → second attempt → approve + merge → ticket done, attempts and kickback rows correct, one trace with the expected spans.
-⚬ Two failed checks end with the issue flagged, no third attempt (invariant 7e); non-vacuous: raise the cap, test fails.
-Live (user): on a toy repo, label 3 small issues, review the PRs, kick one back once. Check `fman status` and the trace.
-Deviations:
 
 ### Milestone 2 — Tiers, escalation, AI review, caps, metrics
 
@@ -256,6 +244,7 @@ Wave: 6 · Agent: A (alone) · Added: 2026-11-23 · Source: spec
 Ask: The full flow in SPEC "Ticket lifecycle".
 Files:
 ⚬ OWNED: `src/foreman_inator/worker.py`, `src/foreman_inator/cli.py` (`metrics`, `approve-spend`), `src/foreman_inator/pr/publisher.py` (ready-for-review after review approval, bot review posting), `tests/test_worker_v2.py`
+⚬ EDITED (additive, from wave 4): `src/foreman_inator/tickets/prompt.py`: a kickback-triggered attempt that fails checks must get a retry prompt with both the note and the check output.
 Approach: replace v1's straight line with: route (#15) → write → verify → escalation (#16) → AI review (#17) → PR ready only on approval or handover → your review → escalation again. Wire spend (#18) into the proxy, locks (#19), metrics page + summary (#20). Remove the v1 "ready immediately" flag.
 Verify:
 ⚬ Scenario tests against fakes for every row of the lifecycle diagram, including two AI kickbacks → writer escalates, tier 3 failure → handed to user.

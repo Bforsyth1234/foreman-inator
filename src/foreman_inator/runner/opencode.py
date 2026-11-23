@@ -117,6 +117,7 @@ class AttemptResult:
     cost_usd: float = 0.0  # as OpenCode reports it; the proxy's numbers are authoritative
     seconds: float = 0.0
     files_edited: tuple[str, ...] = ()
+    cancelled: bool = False  # the caller's `cancel` event stopped the run (#14)
 
     @property
     def finished(self) -> bool:
@@ -135,6 +136,7 @@ class Driver(Protocol):
         endpoint: ModelEndpoint,
         proxy_base_url: str,
         timeout: float | None = None,
+        cancel: threading.Event | None = None,
     ) -> AttemptResult: ...
 
 
@@ -316,7 +318,9 @@ class OpenCodeServer:
                     f"opencode serve exited with {self.proc.returncode}: {self.log_tail()}"
                 )
             time.sleep(0.05)
-        raise OpenCodeError(f"opencode serve did not start in {self.startup_timeout:.0f}s")
+        raise OpenCodeError(
+            f"opencode serve did not start in {self.startup_timeout:.0f}s: {self.log_tail(500)}"
+        )
 
     def _log_text(self) -> str:
         try:
@@ -736,6 +740,7 @@ class _Run:
     rejections: int = 0
     error: str | None = None
     aborted_error: bool = False
+    cancelled: bool = False
 
 
 class OpenCodeDriver:
@@ -780,9 +785,13 @@ class OpenCodeDriver:
         endpoint: ModelEndpoint,
         proxy_base_url: str,
         timeout: float | None = None,
+        cancel: threading.Event | None = None,
     ) -> AttemptResult:
         """Run one attempt to the end. `worktree` is a `Worktree` or a path. Never leaves
-        the server running: the process group is killed on return, error or Ctrl-C."""
+        the server running: the process group is killed on return, error or Ctrl-C.
+
+        `cancel` (worker shutdown, ticket dropped): once set, the session is aborted as on
+        a timeout, and the result has `cancelled=True` and status "errored"."""
         wt_path = Path(getattr(worktree, "path", worktree)).resolve()
         limit = self.timeout if timeout is None else timeout
         t0 = time.monotonic()
@@ -804,7 +813,9 @@ class OpenCodeDriver:
             try:
                 url = server.start()
                 api = OpenCodeSession(url, directory=wt_path, auth=server.auth)
-                return self._drive(api, server, attempt_id, prompt, endpoint, limit, t0)
+                return self._drive(
+                    api, server, attempt_id, prompt, endpoint, limit, t0, cancel=cancel
+                )
             except OpenCodeError as exc:
                 return AttemptResult(
                     status="errored",
@@ -832,6 +843,8 @@ class OpenCodeDriver:
         endpoint: ModelEndpoint,
         limit: float,
         t0: float,
+        *,
+        cancel: threading.Event | None = None,
     ) -> AttemptResult:
         stop = threading.Event()
         q: queue.Queue[DriverEvent] = queue.Queue()
@@ -858,6 +871,13 @@ class OpenCodeDriver:
             deadline = t0 + limit
             while True:
                 now = time.monotonic()
+                if not aborted and cancel is not None and cancel.is_set():
+                    aborted = run.cancelled = True
+                    log.info("opencode attempt %s cancelled", attempt_id)
+                    with contextlib.suppress(httpx.HTTPError):
+                        api.abort()
+                    deadline = now + min(self.abort_grace, 5.0)
+                    continue
                 if not aborted and now >= deadline:
                     aborted = True
                     log.warning("opencode attempt %s timed out after %.0fs", attempt_id, limit)
@@ -907,8 +927,11 @@ class OpenCodeDriver:
         tokens_in = sum(m.tokens_in for m in run.assistant.values())
         tokens_out = sum(m.tokens_out for m in run.assistant.values())
         cost = sum(m.cost_usd for m in run.assistant.values())
-        if aborted:
-            status: Status = "timed_out"
+        if run.cancelled:
+            status: Status = "errored"
+            error = "cancelled by the worker"
+        elif aborted:
+            status = "timed_out"
             error = f"timed out after {limit:.0f}s"
         elif run.error:
             status, error = "errored", run.error
@@ -930,6 +953,7 @@ class OpenCodeDriver:
             cost_usd=cost,
             seconds=time.monotonic() - t0,
             files_edited=tuple(sorted(run.files)),
+            cancelled=run.cancelled,
         )
 
     def _handle(self, ev: DriverEvent, run: _Run, api: OpenCodeSession, attempt_id: int) -> bool:
