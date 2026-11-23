@@ -25,7 +25,7 @@ Layout (every key optional; missing keys take the defaults below)::
     name = "glm"
     tier = 3
     kind = "cloud"       # local | cloud
-    model = "glm-4.6"
+    model = "glm-5.3"
     base_url = "https://api.z.ai/api/coding/paas/v4"
     family = "glm"       # reviewer must be a different family from the writer
     api_key_ref = "keychain:foreman-inator/glm"
@@ -166,7 +166,7 @@ def default_models() -> tuple[ModelEndpoint, ...]:
             "glm",
             3,
             "cloud",
-            "glm-4.6",
+            "glm-5.3",
             "https://api.z.ai/api/coding/paas/v4",
             "glm",
             key_ref("glm"),
@@ -175,7 +175,7 @@ def default_models() -> tuple[ModelEndpoint, ...]:
             "claude-sonnet",
             3,
             "cloud",
-            "claude-sonnet-4-5",
+            "claude-sonnet-5-5",
             "https://api.anthropic.com/v1",
             "claude",
             key_ref("anthropic"),

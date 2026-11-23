@@ -61,3 +61,12 @@ def config_set_key(
     except cfg.ConfigError as exc:
         raise typer.BadParameter(str(exc)) from exc
     typer.echo(f'Stored. In config.toml use: api_key_ref = "{ref}"')
+
+
+def _register_setup() -> None:
+    from foreman_inator.setup import setup_command
+
+    app.command("setup")(setup_command)
+
+
+_register_setup()

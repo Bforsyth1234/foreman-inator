@@ -83,7 +83,7 @@ Package root below is `src/foreman_inator/` (written `pkg/`).
 | :--- | :--- | :--- | :--- |
 | 1 | A: #1 (alone) | `pyproject.toml`, `uv.lock`, `.gitignore`, `LICENSE`, `README.md`, `.pre-commit-config.yaml`, `.github/workflows/ci.yml`, `pkg/__init__.py`, `pkg/cli.py` (skeleton), `pkg/worker.py` (skeleton), `tests/conftest.py`, `tests/fakes/__init__.py` | [x] |
 | 2 | A: #2 · B: #3 · C: #4 · D: #5 · E: #6 · F: #7 | A `pkg/paths.py`, `pkg/config.py` · B `pkg/db/schema.sql`, `pkg/db/store.py`, `pkg/db/__init__.py` · C `pkg/github/app_auth.py`, `pkg/github/client.py`, `pkg/github/__init__.py`, `tests/fakes/github.py` · D `pkg/tracing/otel.py`, `pkg/tracing/recorder.py`, `pkg/tracing/__init__.py` · E `pkg/runner/verify.py`, `tests/fixtures/repos/` · F `pkg/runner/worktree.py`, `pkg/runner/__init__.py` (+ each slot's own `tests/test_<module>.py`). Runner at close: `pyproject.toml` deps | [x] |
-| 3 | A: #8 · B: #9 · C: #10 · D: #11 · E: #12 · F: #13 | A `pkg/setup/manifest.py`, `pkg/setup/deps.py`, `pkg/setup/launchd.py`, `pkg/setup/__init__.py` · B `pkg/proxy/server.py`, `pkg/proxy/pricing.py`, `pkg/proxy/__init__.py`, `tests/fakes/models.py` · C `pkg/runner/opencode.py`, `tests/fakes/opencode.py` · D `pkg/github/poller.py`, `pkg/tickets/lifecycle.py`, `pkg/tickets/__init__.py` · E `pkg/pr/publisher.py`, `pkg/pr/__init__.py` · F `pkg/prompts/writer-v1.md`, `pkg/tickets/prompt.py` (+ own tests). Runner at close: `cli.py` (`setup`), `pyproject.toml` deps | [ ] |
+| 3 | A: #8 · B: #9 · C: #10 · D: #11 · E: #12 · F: #13 | A `pkg/setup/manifest.py`, `pkg/setup/deps.py`, `pkg/setup/launchd.py`, `pkg/setup/__init__.py` · B `pkg/proxy/server.py`, `pkg/proxy/pricing.py`, `pkg/proxy/__init__.py`, `tests/fakes/models.py` · C `pkg/runner/opencode.py`, `tests/fakes/opencode.py` · D `pkg/github/poller.py`, `pkg/tickets/lifecycle.py`, `pkg/tickets/__init__.py` · E `pkg/pr/publisher.py`, `pkg/pr/__init__.py` · F `pkg/prompts/writer-v1.md`, `pkg/tickets/prompt.py` (+ own tests). Runner at close: `cli.py` (`setup`), `pyproject.toml` deps | [x] built; live checks open for #8, #10 |
 | 4 | A: #14 (alone: the main loop) | `pkg/worker.py`, `pkg/cli.py` (`run`, `status`), `tests/test_worker_v1.py`, `tests/fakes/` (additive only) | [ ] |
 | 5 | A: #15 · B: #16 · C: #17 · D: #18 · E: #19 · F: #20 | A `pkg/routing/rules.py`, `pkg/routing/__init__.py`, `pkg/prompts/router-v1.md` · B `pkg/routing/escalation.py` · C `pkg/review/reviewer.py`, `pkg/review/checks.py`, `pkg/review/__init__.py`, `pkg/prompts/reviewer-v1.md` · D `pkg/spend.py` · E `pkg/locks.py` · F `pkg/metrics/queries.py`, `pkg/metrics/web.py`, `pkg/metrics/__init__.py`, `pkg/pr/summary.py` (+ own tests). Runner at close: `pyproject.toml` deps | [ ] |
 | 6 | A: #21 (alone: the main loop) | `pkg/worker.py`, `pkg/cli.py` (`metrics`), `pkg/pr/publisher.py` (ready-for-review + bot review posting), `tests/test_worker_v2.py` | [ ] |
@@ -109,8 +109,11 @@ one ticket per repo at a time until #19 (file locks) lands.
 
 ## Live checks
 
-None open yet. Milestone 1's checks are listed in #8 and #14;
-milestone 2's in #17 and #21.
+Open (need the user; full steps in each item's DONE.md entry):
+- #8 `fman setup`: run it on your Mac, create and install the App on one test repo, confirm the four permissions and no active webhook. Also shows whether GitHub accepts a manifest with no `hook_attributes`.
+- #10 OpenCode driver: one real tier 1 attempt on a toy repo through the proxy. Covered by #14's live check.
+
+Still to come: #14 (milestone 1), #17 and #21 (milestone 2).
 
 ## Completed items (archived to DONE.md)
 
@@ -121,6 +124,12 @@ milestone 2's in #17 and #21.
 #5 — Tracing core and run recorder (fde-kit) [x] · 2026-11-23 · see DONE.md
 #6 — Verify command detection and runner [x] · 2026-11-23 · see DONE.md
 #7 — Worktree manager [x] · 2026-11-23 · see DONE.md
+#8 — `fman setup`: App via manifest flow, dependency check, launchd [~] live · 2026-11-23 · see DONE.md
+#9 — Model proxy: OpenAI-compatible, traced, recorded, priced [x] · 2026-11-23 · see DONE.md
+#10 — OpenCode driver [~] live · 2026-11-23 · see DONE.md
+#11 — Poller and ticket lifecycle [x] · 2026-11-23 · see DONE.md
+#12 — PR publisher [x] · 2026-11-23 · see DONE.md
+#13 — Writer prompt v1 and ticket prompt builder [x] · 2026-11-23 · see DONE.md
 
 ---
 
@@ -152,93 +161,10 @@ todos organized in waves to build this app"). Section = SPEC milestone.
 
 ### Milestone 1 — GitHub App plus a polling worker on one tier
 
-#8 — `fman setup`: App via manifest flow, dependency check, launchd [ ]
-Wave: 3 · Agent: A · Added: 2026-11-23 · Source: spec
-Ask: One command turns a fresh Mac into a working install, with the user's own private App.
-DECISIONS (spec/user, 2026-11-23): each user registers their own App through GitHub's app-manifest flow; no shared App; launchd agent so the worker survives reboots.
-DECISIONS (assistant, 2026-11-23): the manifest asks for exactly the permissions in SPEC (Issues RW, Pull requests RW, Contents RW, Metadata R), no webhook URL (polling). Setup checks for `git`, `opencode`, `ollama` and the tier 1/2 models, and offers the install command instead of running installers itself.
-Files:
-⚬ OWNED: `src/foreman_inator/setup/manifest.py`, `src/foreman_inator/setup/deps.py`, `src/foreman_inator/setup/launchd.py`, `src/foreman_inator/setup/__init__.py`, `tests/test_setup.py`
-⚬ Do NOT touch: `cli.py` (runner registers `setup`), `config.py` (use its API)
-Approach: Rule 12 first (manifest flow URL, the code-exchange endpoint, what it returns). Start a one-shot localhost callback server, open the browser to GitHub's create-from-manifest page, exchange the code, write `app.pem` + App ID, then open the install page and record the installation. launchd: write `~/Library/LaunchAgents/com.foreman-inator.worker.plist`, `launchctl bootstrap`; `fman setup --uninstall-service` reverses it.
-Verify:
-⚬ Manifest JSON matches SPEC permissions exactly (snapshot test).
-⚬ Code exchange tested against a fake endpoint; key saved with mode 600.
-⚬ Generated plist validates with `plutil -lint` (macOS CI job).
-Live (user): run `fman setup` on your Mac, confirm the App appears under your GitHub settings with only those permissions, install it on one test repo.
-Deviations:
-
-#9 — Model proxy: OpenAI-compatible, traced, recorded, priced [ ]
-Wave: 3 · Agent: B · Added: 2026-11-23 · Source: spec ("Capture")
-Ask: Every model call from any coding agent is a span and a recording row, with cost.
-DECISIONS (assistant, 2026-11-23):
-1. One local server on 127.0.0.1 exposing `/v1/chat/completions` (streaming and not) and `/v1/models`; routes by model name to Ollama (local) or the configured cloud endpoint.
-2. Each request carries the ticket/attempt via a header or a per-attempt port/path prefix (`/a/<attempt_id>/v1/...`), so spans attach to the right attempt. Path prefix is the default because OpenCode lets you set a base URL per provider (confirm, rule 12).
-3. Cost from a pricing table (`pricing.py`); local models cost 0.
-Files:
-⚬ OWNED: `src/foreman_inator/proxy/server.py`, `src/foreman_inator/proxy/pricing.py`, `src/foreman_inator/proxy/__init__.py`, `tests/fakes/models.py`, `tests/test_proxy.py`
-⚬ EDITED: uses #5's `tracing` API, no changes to it.
-Approach: `starlette` app, `httpx` upstream with streaming passthrough; on completion write an `llm.call` span (tokens, latency, cost, prompt hash) and a recorder `llm` row. Spend caps hook point left as a no-op callable for #18.
-Verify:
-⚬ Streaming and non-streaming calls pass through byte-for-byte against `fake_models`.
-⚬ A call under `/a/42/` produces a span tagged attempt 42 and a recording row.
-⚬ A cloud model with no key configured fails closed (invariant 7c); non-vacuous: let it fall through, test fails.
-Deviations:
-
-#10 — OpenCode driver [ ]
-Wave: 3 · Agent: C · Added: 2026-11-23 · Source: spec
-Ask: Run one coding attempt with OpenCode in a worktree and get back what it did.
-DECISIONS (assistant, 2026-11-23): drive `opencode serve` over HTTP (one server per attempt, cwd = worktree), provider base URL pointed at the proxy's `/a/<attempt>/v1`; tool calls mapped to `tool.call` spans and recorder `tool` rows from its event stream.
-Files:
-⚬ OWNED: `src/foreman_inator/runner/opencode.py`, `tests/fakes/opencode.py`, `tests/test_opencode_driver.py`
-Approach: Rule 12 is critical here: read OpenCode's current server/SDK docs and record the endpoints used (create session, send prompt, event stream, abort). Wrap them in one `OpenCodeSession` adapter. Timeout per attempt (default 20 min) with abort. Fallback if the server API doesn't fit: `opencode run` non-interactive with JSON output, same adapter interface.
-Verify:
-⚬ Against `fake_opencode`: a scripted session that edits a file yields the right tool spans and a non-empty diff.
-⚬ Timeout aborts the session and marks the attempt `failed_checks`; non-vacuous: remove the abort, test hangs → fails on pytest timeout.
-Live (user): one real attempt on a toy repo with the tier 1 model, watch the spans appear.
-Deviations:
-
-#11 — Poller and ticket lifecycle [ ]
-Wave: 3 · Agent: D · Added: 2026-11-23 · Source: spec ("GitHub mapping")
-Ask: Turn GitHub state into ticket state, safely.
-DECISIONS (spec, 2026-11-23): the event → action table in SPEC "Architecture and GitHub mapping"; only labels applied by `allowed_users` count (invariant 7b).
-Files:
-⚬ OWNED: `src/foreman_inator/github/poller.py`, `src/foreman_inator/tickets/lifecycle.py`, `src/foreman_inator/tickets/__init__.py`, `tests/test_lifecycle.py`
-⚬ Do NOT touch: `github/client.py` (report any missing method to the runner)
-Approach: `poll_once()` returns typed events (`TicketRequested`, `TierOverride`, `ReviewSubmitted(approve|changes, comment, kickback_tag)`, `Merged`, `ClosedUnmerged`). `lifecycle.apply(event)` is a pure state machine over the columns in SPEC; illegal transitions raise. Idempotent: polling the same state twice emits nothing new (store a cursor per repo).
-Verify:
-⚬ Table-driven tests: one row per SPEC mapping row.
-⚬ A label applied by a non-allowed user creates no ticket; non-vacuous: skip the actor check, test fails.
-⚬ Re-polling is idempotent.
-Deviations:
-
-#12 — PR publisher [ ]
-Wave: 3 · Agent: E · Added: 2026-11-23 · Source: spec
-Ask: Draft PRs that say what happened, linked to the issue.
-DECISIONS (spec, 2026-11-23): PR stays draft through AI review; description shows model, tier and cost; posts from the App's bot account.
-Files:
-⚬ OWNED: `src/foreman_inator/pr/publisher.py`, `src/foreman_inator/pr/__init__.py`, `tests/test_publisher.py`
-Approach: `open_or_update_draft(ticket, attempt)` → PR body from a template: "Closes #n", what changed (diff stats), model/tier/cost, verify result, attempt history table. Later attempts update the same PR (force-push to its `fman/` branch). `mark_ready(pr)` exists but is only called by the worker after review (wired in #21).
-Verify:
-⚬ Against `fake_github`: first attempt opens a draft; second updates it; body contains model, tier, cost.
-⚬ `mark_ready` is never called by publisher code paths on its own; non-vacuous: call it in `open_or_update_draft`, test fails.
-Deviations:
-
-#13 — Writer prompt v1 and ticket prompt builder [ ]
-Wave: 3 · Agent: F · Added: 2026-11-23 · Source: spec
-Ask: What the coding agent is told for each attempt.
-DECISIONS (spec, 2026-11-23): the agent gets the request, owned files and kickback notes in the session prompt; prompts are versioned files.
-Files:
-⚬ OWNED: `src/foreman_inator/prompts/writer-v1.md`, `src/foreman_inator/tickets/prompt.py`, `tests/test_ticket_prompt.py`
-Approach: `build_writer_prompt(ticket, attempt, history)` fills `writer-v1.md` with: the issue title/body, repo conventions file if present (`AGENTS.md`/`CLAUDE.md`), owned files, verify command, previous attempt's failure output or kickback note + tag. Loaded with `fde_kit.prompts.load_prompt`; the prompt hash goes on the attempt.
-Verify:
-⚬ Snapshot tests for first attempt, after failed checks, after a kickback.
-⚬ The reviewer's notes are included; the writer's own previous reasoning is not (keeps invariant 7f symmetric); non-vacuous: include it, test fails.
-Deviations:
-
 #14 — Worker loop v1: one tier, end to end (milestone 1) [ ]
 Wave: 4 · Agent: A (alone) · Added: 2026-11-23 · Source: spec
 Ask: Label an issue, get a draft PR from the local model, review it on GitHub.
+DECISIONS (runner, 2026-11-23, from wave 3): a same-tier retry after failed checks stores the same `trigger` as the attempt it retries (the store's enum has no `retry`; the prompt builder reads the retry from history). One PR per ticket on `pr_head_branch(ticket)`; later attempts force-push onto it. The driver writes the recorder's `user` row.
 DECISIONS (assistant, 2026-11-23): tier 1 only; no AI review yet (PR is marked ready as soon as checks pass, behind a `v1` flag removed in #21); one ticket per repo at a time.
 Files:
 ⚬ OWNED: `src/foreman_inator/worker.py`, `src/foreman_inator/cli.py` (`run`, `status`, register `setup`), `tests/test_worker_v1.py`
