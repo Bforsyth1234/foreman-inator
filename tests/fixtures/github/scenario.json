@@ -1,0 +1,925 @@
+{
+ "_comment": "Hand-written from docs.github.com REST reference (API 2026-03-10), read 2026-11-23. Served in order by tests/test_github_client.py.",
+ "exchanges": [
+  {
+   "method": "POST",
+   "path": "/app/installations/42/access_tokens",
+   "status": 201,
+   "body": {
+    "token": "ghs_recorded_token_1",
+    "expires_at": "2026-11-23T10:00:00Z",
+    "permissions": {
+     "issues": "write",
+     "pull_requests": "write",
+     "contents": "write",
+     "metadata": "read"
+    },
+    "repository_selection": "selected"
+   }
+  },
+  {
+   "method": "GET",
+   "path": "/repos/octo/widgets",
+   "status": 200,
+   "body": {
+    "id": 300,
+    "node_id": "R_x",
+    "name": "widgets",
+    "full_name": "octo/widgets",
+    "private": false,
+    "owner": {
+     "login": "octo",
+     "id": 50,
+     "node_id": "U_octo",
+     "type": "Organization",
+     "url": "https://api.github.com/users/octo",
+     "html_url": "https://github.com/octo",
+     "site_admin": false
+    },
+    "default_branch": "main",
+    "visibility": "public"
+   }
+  },
+  {
+   "method": "GET",
+   "path": "/repos/octo/widgets/issues",
+   "status": 200,
+   "body": [
+    {
+     "id": 5001,
+     "node_id": "I_kwDOfake1",
+     "url": "https://api.github.com/repos/octo/widgets/issues/1",
+     "html_url": "https://github.com/octo/widgets/issues/1",
+     "number": 1,
+     "state": "open",
+     "state_reason": null,
+     "title": "Add a --verbose flag",
+     "body": "Print each step.",
+     "user": {
+      "login": "brooks",
+      "id": 101,
+      "node_id": "U_brooks",
+      "type": "User",
+      "url": "https://api.github.com/users/brooks",
+      "html_url": "https://github.com/brooks",
+      "site_admin": false
+     },
+     "labels": [
+      {
+       "id": 11,
+       "node_id": "LA_11",
+       "url": "https://api.github.com/repos/octo/widgets/labels/agent",
+       "name": "agent",
+       "color": "0e8a16",
+       "default": false,
+       "description": null
+      }
+     ],
+     "assignees": [],
+     "locked": false,
+     "comments": 0,
+     "created_at": "2026-11-23T09:00:00Z",
+     "updated_at": "2026-11-23T09:00:04Z",
+     "closed_at": null,
+     "author_association": "OWNER",
+     "timeline_url": "https://api.github.com/repos/octo/widgets/issues/1/timeline"
+    },
+    {
+     "id": 5005,
+     "node_id": "I_kwDOfake1",
+     "url": "https://api.github.com/repos/octo/widgets/issues/1",
+     "html_url": "https://github.com/octo/widgets/issues/1",
+     "number": 5,
+     "state": "open",
+     "state_reason": null,
+     "title": "a PR carrying the label",
+     "body": "Print each step.",
+     "user": {
+      "login": "brooks",
+      "id": 101,
+      "node_id": "U_brooks",
+      "type": "User",
+      "url": "https://api.github.com/users/brooks",
+      "html_url": "https://github.com/brooks",
+      "site_admin": false
+     },
+     "labels": [
+      {
+       "id": 11,
+       "node_id": "LA_11",
+       "url": "https://api.github.com/repos/octo/widgets/labels/agent",
+       "name": "agent",
+       "color": "0e8a16",
+       "default": false,
+       "description": null
+      }
+     ],
+     "assignees": [],
+     "locked": false,
+     "comments": 0,
+     "created_at": "2026-11-23T09:00:00Z",
+     "updated_at": "2026-11-23T09:00:04Z",
+     "closed_at": null,
+     "author_association": "OWNER",
+     "timeline_url": "https://api.github.com/repos/octo/widgets/issues/1/timeline",
+     "pull_request": {
+      "url": "https://api.github.com/repos/octo/widgets/pulls/5",
+      "merged_at": null
+     }
+    }
+   ],
+   "query": {
+    "labels": "agent",
+    "state": "open",
+    "per_page": "100"
+   }
+  },
+  {
+   "method": "GET",
+   "path": "/repos/octo/widgets/issues/1/events",
+   "status": 200,
+   "body": [
+    {
+     "id": 9001,
+     "node_id": "LE_9001",
+     "url": "https://api.github.com/repos/octo/widgets/issues/events/9001",
+     "actor": {
+      "login": "mallory",
+      "id": 666,
+      "node_id": "U_mallory",
+      "type": "User",
+      "url": "https://api.github.com/users/mallory",
+      "html_url": "https://github.com/mallory",
+      "site_admin": false
+     },
+     "event": "labeled",
+     "commit_id": null,
+     "commit_url": null,
+     "created_at": "2026-11-23T09:00:01Z",
+     "performed_via_github_app": null,
+     "label": {
+      "name": "agent",
+      "color": "0e8a16"
+     },
+     "intent": null
+    },
+    {
+     "id": 9002,
+     "node_id": "LE_9002",
+     "url": "https://api.github.com/repos/octo/widgets/issues/events/9002",
+     "actor": {
+      "login": "brooks",
+      "id": 101,
+      "node_id": "U_brooks",
+      "type": "User",
+      "url": "https://api.github.com/users/brooks",
+      "html_url": "https://github.com/brooks",
+      "site_admin": false
+     },
+     "event": "unlabeled",
+     "commit_id": null,
+     "commit_url": null,
+     "created_at": "2026-11-23T09:00:02Z",
+     "performed_via_github_app": null,
+     "label": {
+      "name": "agent",
+      "color": "0e8a16"
+     },
+     "intent": null
+    },
+    {
+     "id": 9003,
+     "node_id": "LE_9003",
+     "url": "https://api.github.com/repos/octo/widgets/issues/events/9003",
+     "actor": {
+      "login": "brooks",
+      "id": 101,
+      "node_id": "U_brooks",
+      "type": "User",
+      "url": "https://api.github.com/users/brooks",
+      "html_url": "https://github.com/brooks",
+      "site_admin": false
+     },
+     "event": "labeled",
+     "commit_id": null,
+     "commit_url": null,
+     "created_at": "2026-11-23T09:00:03Z",
+     "performed_via_github_app": null,
+     "label": {
+      "name": "agent",
+      "color": "0e8a16"
+     },
+     "intent": null
+    }
+   ],
+   "query": {
+    "per_page": "100"
+   }
+  },
+  {
+   "method": "GET",
+   "path": "/repos/octo/widgets/git/ref/heads/main",
+   "status": 200,
+   "body": {
+    "ref": "refs/heads/main",
+    "node_id": "REF_x",
+    "url": "https://api.github.com/repos/octo/widgets/git/refs/heads/main",
+    "object": {
+     "type": "commit",
+     "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+     "url": "https://api.github.com/repos/octo/widgets/git/commits/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    }
+   }
+  },
+  {
+   "method": "POST",
+   "path": "/repos/octo/widgets/git/refs",
+   "status": 201,
+   "body": {
+    "ref": "refs/heads/fman/issue-1/a1",
+    "node_id": "REF_x",
+    "url": "https://api.github.com/repos/octo/widgets/git/refs/heads/fman/issue-1/a1",
+    "object": {
+     "type": "commit",
+     "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+     "url": "https://api.github.com/repos/octo/widgets/git/commits/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    }
+   },
+   "request_json": {
+    "ref": "refs/heads/fman/issue-1/a1",
+    "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+   }
+  },
+  {
+   "method": "POST",
+   "path": "/repos/octo/widgets/pulls",
+   "status": 201,
+   "body": {
+    "id": 7002,
+    "node_id": "PR_kwDOfake2",
+    "url": "https://api.github.com/repos/octo/widgets/pulls/2",
+    "html_url": "https://github.com/octo/widgets/pull/2",
+    "number": 2,
+    "state": "open",
+    "locked": false,
+    "title": "Add a --verbose flag (#1)",
+    "body": "Closes #1",
+    "user": {
+     "login": "foreman-inator[bot]",
+     "id": 9001,
+     "node_id": "U_foreman-inator[bot]",
+     "type": "Bot",
+     "url": "https://api.github.com/users/foreman-inator[bot]",
+     "html_url": "https://github.com/foreman-inator[bot]",
+     "site_admin": false
+    },
+    "labels": [],
+    "draft": true,
+    "created_at": "2026-11-23T09:01:00Z",
+    "updated_at": "2026-11-23T09:02:00Z",
+    "closed_at": null,
+    "merged_at": null,
+    "head": {
+     "label": "octo:fman/issue-1/a1",
+     "ref": "fman/issue-1/a1",
+     "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+     "user": {
+      "login": "octo",
+      "id": 50,
+      "node_id": "U_octo",
+      "type": "Organization",
+      "url": "https://api.github.com/users/octo",
+      "html_url": "https://github.com/octo",
+      "site_admin": false
+     }
+    },
+    "base": {
+     "label": "octo:main",
+     "ref": "main",
+     "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+     "user": {
+      "login": "octo",
+      "id": 50,
+      "node_id": "U_octo",
+      "type": "Organization",
+      "url": "https://api.github.com/users/octo",
+      "html_url": "https://github.com/octo",
+      "site_admin": false
+     }
+    },
+    "author_association": "NONE",
+    "merged": false,
+    "mergeable_state": "clean"
+   },
+   "request_json": {
+    "title": "Add a --verbose flag (#1)",
+    "head": "fman/issue-1/a1",
+    "base": "main",
+    "body": "Closes #1",
+    "draft": true
+   }
+  },
+  {
+   "method": "PATCH",
+   "path": "/repos/octo/widgets/pulls/2",
+   "status": 200,
+   "body": {
+    "id": 7002,
+    "node_id": "PR_kwDOfake2",
+    "url": "https://api.github.com/repos/octo/widgets/pulls/2",
+    "html_url": "https://github.com/octo/widgets/pull/2",
+    "number": 2,
+    "state": "open",
+    "locked": false,
+    "title": "Add a --verbose flag (#1)",
+    "body": "Closes #1\n\nAttempt 1",
+    "user": {
+     "login": "foreman-inator[bot]",
+     "id": 9001,
+     "node_id": "U_foreman-inator[bot]",
+     "type": "Bot",
+     "url": "https://api.github.com/users/foreman-inator[bot]",
+     "html_url": "https://github.com/foreman-inator[bot]",
+     "site_admin": false
+    },
+    "labels": [],
+    "draft": true,
+    "created_at": "2026-11-23T09:01:00Z",
+    "updated_at": "2026-11-23T09:02:00Z",
+    "closed_at": null,
+    "merged_at": null,
+    "head": {
+     "label": "octo:fman/issue-1/a1",
+     "ref": "fman/issue-1/a1",
+     "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+     "user": {
+      "login": "octo",
+      "id": 50,
+      "node_id": "U_octo",
+      "type": "Organization",
+      "url": "https://api.github.com/users/octo",
+      "html_url": "https://github.com/octo",
+      "site_admin": false
+     }
+    },
+    "base": {
+     "label": "octo:main",
+     "ref": "main",
+     "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+     "user": {
+      "login": "octo",
+      "id": 50,
+      "node_id": "U_octo",
+      "type": "Organization",
+      "url": "https://api.github.com/users/octo",
+      "html_url": "https://github.com/octo",
+      "site_admin": false
+     }
+    },
+    "author_association": "NONE",
+    "merged": false,
+    "mergeable_state": "clean"
+   },
+   "request_json": {
+    "body": "Closes #1\n\nAttempt 1"
+   }
+  },
+  {
+   "method": "POST",
+   "path": "/repos/octo/widgets/pulls/2/reviews",
+   "status": 200,
+   "body": {
+    "id": 8001,
+    "node_id": "PRR_8001",
+    "user": {
+     "login": "foreman-inator[bot]",
+     "id": 9001,
+     "node_id": "U_foreman-inator[bot]",
+     "type": "Bot",
+     "url": "https://api.github.com/users/foreman-inator[bot]",
+     "html_url": "https://github.com/foreman-inator[bot]",
+     "site_admin": false
+    },
+    "body": "AI review: approve\n\nAll five checks passed.",
+    "state": "COMMENTED",
+    "html_url": "https://github.com/octo/widgets/pull/2#pullrequestreview-8001",
+    "pull_request_url": "https://api.github.com/repos/octo/widgets/pulls/2",
+    "submitted_at": "2026-11-23T09:03:00Z",
+    "commit_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "author_association": "NONE"
+   },
+   "request_json": {
+    "event": "COMMENT",
+    "body": "AI review: approve\n\nAll five checks passed."
+   }
+  },
+  {
+   "method": "GET",
+   "path": "/repos/octo/widgets/pulls/2",
+   "status": 200,
+   "body": {
+    "id": 7002,
+    "node_id": "PR_kwDOfake2",
+    "url": "https://api.github.com/repos/octo/widgets/pulls/2",
+    "html_url": "https://github.com/octo/widgets/pull/2",
+    "number": 2,
+    "state": "open",
+    "locked": false,
+    "title": "Add a --verbose flag (#1)",
+    "body": "Closes #1\n\nAttempt 1",
+    "user": {
+     "login": "foreman-inator[bot]",
+     "id": 9001,
+     "node_id": "U_foreman-inator[bot]",
+     "type": "Bot",
+     "url": "https://api.github.com/users/foreman-inator[bot]",
+     "html_url": "https://github.com/foreman-inator[bot]",
+     "site_admin": false
+    },
+    "labels": [],
+    "draft": true,
+    "created_at": "2026-11-23T09:01:00Z",
+    "updated_at": "2026-11-23T09:02:00Z",
+    "closed_at": null,
+    "merged_at": null,
+    "head": {
+     "label": "octo:fman/issue-1/a1",
+     "ref": "fman/issue-1/a1",
+     "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+     "user": {
+      "login": "octo",
+      "id": 50,
+      "node_id": "U_octo",
+      "type": "Organization",
+      "url": "https://api.github.com/users/octo",
+      "html_url": "https://github.com/octo",
+      "site_admin": false
+     }
+    },
+    "base": {
+     "label": "octo:main",
+     "ref": "main",
+     "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+     "user": {
+      "login": "octo",
+      "id": 50,
+      "node_id": "U_octo",
+      "type": "Organization",
+      "url": "https://api.github.com/users/octo",
+      "html_url": "https://github.com/octo",
+      "site_admin": false
+     }
+    },
+    "author_association": "NONE",
+    "merged": false,
+    "mergeable_state": "clean"
+   }
+  },
+  {
+   "method": "POST",
+   "path": "/graphql",
+   "status": 200,
+   "body": {
+    "data": {
+     "markPullRequestReadyForReview": {
+      "pullRequest": {
+       "number": 2,
+       "isDraft": false
+      }
+     }
+    }
+   }
+  },
+  {
+   "method": "GET",
+   "path": "/repos/octo/widgets/pulls/2/reviews",
+   "status": 200,
+   "body": [
+    {
+     "id": 8001,
+     "node_id": "PRR_8001",
+     "user": {
+      "login": "foreman-inator[bot]",
+      "id": 9001,
+      "node_id": "U_foreman-inator[bot]",
+      "type": "Bot",
+      "url": "https://api.github.com/users/foreman-inator[bot]",
+      "html_url": "https://github.com/foreman-inator[bot]",
+      "site_admin": false
+     },
+     "body": "AI review: approve\n\nAll five checks passed.",
+     "state": "COMMENTED",
+     "html_url": "https://github.com/octo/widgets/pull/2#pullrequestreview-8001",
+     "pull_request_url": "https://api.github.com/repos/octo/widgets/pulls/2",
+     "submitted_at": "2026-11-23T09:03:00Z",
+     "commit_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+     "author_association": "NONE"
+    },
+    {
+     "id": 8002,
+     "node_id": "PRR_8002",
+     "user": {
+      "login": "brooks",
+      "id": 101,
+      "node_id": "U_brooks",
+      "type": "User",
+      "url": "https://api.github.com/users/brooks",
+      "html_url": "https://github.com/brooks",
+      "site_admin": false
+     },
+     "body": "LGTM",
+     "state": "APPROVED",
+     "html_url": "https://github.com/octo/widgets/pull/2#pullrequestreview-8002",
+     "pull_request_url": "https://api.github.com/repos/octo/widgets/pulls/2",
+     "submitted_at": "2026-11-23T09:04:00Z",
+     "commit_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+     "author_association": "NONE"
+    }
+   ],
+   "query": {
+    "per_page": "100"
+   }
+  },
+  {
+   "method": "POST",
+   "path": "/repos/octo/widgets/issues/1/labels",
+   "status": 200,
+   "body": [
+    {
+     "id": 11,
+     "node_id": "LA_11",
+     "url": "https://api.github.com/repos/octo/widgets/labels/agent",
+     "name": "agent",
+     "color": "0e8a16",
+     "default": false,
+     "description": null
+    },
+    {
+     "id": 12,
+     "node_id": "LA_12",
+     "url": "https://api.github.com/repos/octo/widgets/labels/fman:working",
+     "name": "fman:working",
+     "color": "fbca04",
+     "default": false,
+     "description": null
+    }
+   ],
+   "request_json": {
+    "labels": [
+     "fman:working"
+    ]
+   }
+  },
+  {
+   "method": "DELETE",
+   "path": "/repos/octo/widgets/issues/1/labels/fman:working",
+   "status": 200,
+   "body": [
+    {
+     "id": 11,
+     "node_id": "LA_11",
+     "url": "https://api.github.com/repos/octo/widgets/labels/agent",
+     "name": "agent",
+     "color": "0e8a16",
+     "default": false,
+     "description": null
+    }
+   ]
+  },
+  {
+   "method": "DELETE",
+   "path": "/repos/octo/widgets/issues/1/labels/fman:working",
+   "status": 404,
+   "body": {
+    "message": "Label does not exist",
+    "documentation_url": "https://docs.github.com/rest/issues/labels#remove-a-label-from-an-issue",
+    "status": "404"
+   }
+  },
+  {
+   "method": "GET",
+   "path": "/repos/octo/widgets/issues/1",
+   "status": 200,
+   "body": {
+    "id": 5001,
+    "node_id": "I_kwDOfake1",
+    "url": "https://api.github.com/repos/octo/widgets/issues/1",
+    "html_url": "https://github.com/octo/widgets/issues/1",
+    "number": 1,
+    "state": "open",
+    "state_reason": null,
+    "title": "Add a --verbose flag",
+    "body": "Print each step.",
+    "user": {
+     "login": "brooks",
+     "id": 101,
+     "node_id": "U_brooks",
+     "type": "User",
+     "url": "https://api.github.com/users/brooks",
+     "html_url": "https://github.com/brooks",
+     "site_admin": false
+    },
+    "labels": [
+     {
+      "id": 11,
+      "node_id": "LA_11",
+      "url": "https://api.github.com/repos/octo/widgets/labels/agent",
+      "name": "agent",
+      "color": "0e8a16",
+      "default": false,
+      "description": null
+     }
+    ],
+    "assignees": [],
+    "locked": false,
+    "comments": 0,
+    "created_at": "2026-11-23T09:00:00Z",
+    "updated_at": "2026-11-23T09:00:04Z",
+    "closed_at": null,
+    "author_association": "OWNER",
+    "timeline_url": "https://api.github.com/repos/octo/widgets/issues/1/timeline"
+   }
+  },
+  {
+   "method": "POST",
+   "path": "/repos/octo/widgets/issues/1/comments",
+   "status": 201,
+   "body": {
+    "id": 6001,
+    "node_id": "IC_6001",
+    "url": "https://api.github.com/repos/octo/widgets/issues/comments/6001",
+    "html_url": "https://github.com/octo/widgets/issues/1#issuecomment-6001",
+    "body": "Started on tier 1.",
+    "user": {
+     "login": "foreman-inator[bot]",
+     "id": 9001,
+     "node_id": "U_foreman-inator[bot]",
+     "type": "Bot",
+     "url": "https://api.github.com/users/foreman-inator[bot]",
+     "html_url": "https://github.com/foreman-inator[bot]",
+     "site_admin": false
+    },
+    "created_at": "2026-11-23T09:05:00Z",
+    "updated_at": "2026-11-23T09:05:00Z",
+    "issue_url": "https://api.github.com/repos/octo/widgets/issues/1",
+    "author_association": "NONE",
+    "performed_via_github_app": null
+   },
+   "request_json": {
+    "body": "Started on tier 1."
+   }
+  },
+  {
+   "method": "GET",
+   "path": "/repos/octo/widgets/issues/1/comments",
+   "status": 200,
+   "body": [
+    {
+     "id": 6001,
+     "node_id": "IC_6001",
+     "url": "https://api.github.com/repos/octo/widgets/issues/comments/6001",
+     "html_url": "https://github.com/octo/widgets/issues/1#issuecomment-6001",
+     "body": "Started on tier 1.",
+     "user": {
+      "login": "foreman-inator[bot]",
+      "id": 9001,
+      "node_id": "U_foreman-inator[bot]",
+      "type": "Bot",
+      "url": "https://api.github.com/users/foreman-inator[bot]",
+      "html_url": "https://github.com/foreman-inator[bot]",
+      "site_admin": false
+     },
+     "created_at": "2026-11-23T09:05:00Z",
+     "updated_at": "2026-11-23T09:05:00Z",
+     "issue_url": "https://api.github.com/repos/octo/widgets/issues/1",
+     "author_association": "NONE",
+     "performed_via_github_app": null
+    }
+   ],
+   "query": {
+    "per_page": "100"
+   }
+  },
+  {
+   "method": "GET",
+   "path": "/repos/octo/widgets/pulls",
+   "status": 200,
+   "body": [
+    {
+     "id": 7002,
+     "node_id": "PR_kwDOfake2",
+     "url": "https://api.github.com/repos/octo/widgets/pulls/2",
+     "html_url": "https://github.com/octo/widgets/pull/2",
+     "number": 2,
+     "state": "open",
+     "locked": false,
+     "title": "Add a --verbose flag (#1)",
+     "body": "Closes #1\n\nAttempt 1",
+     "user": {
+      "login": "foreman-inator[bot]",
+      "id": 9001,
+      "node_id": "U_foreman-inator[bot]",
+      "type": "Bot",
+      "url": "https://api.github.com/users/foreman-inator[bot]",
+      "html_url": "https://github.com/foreman-inator[bot]",
+      "site_admin": false
+     },
+     "labels": [],
+     "draft": false,
+     "created_at": "2026-11-23T09:01:00Z",
+     "updated_at": "2026-11-23T09:02:00Z",
+     "closed_at": null,
+     "merged_at": null,
+     "head": {
+      "label": "octo:fman/issue-1/a1",
+      "ref": "fman/issue-1/a1",
+      "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "user": {
+       "login": "octo",
+       "id": 50,
+       "node_id": "U_octo",
+       "type": "Organization",
+       "url": "https://api.github.com/users/octo",
+       "html_url": "https://github.com/octo",
+       "site_admin": false
+      }
+     },
+     "base": {
+      "label": "octo:main",
+      "ref": "main",
+      "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "user": {
+       "login": "octo",
+       "id": 50,
+       "node_id": "U_octo",
+       "type": "Organization",
+       "url": "https://api.github.com/users/octo",
+       "html_url": "https://github.com/octo",
+       "site_admin": false
+      }
+     },
+     "author_association": "NONE"
+    }
+   ],
+   "query": {
+    "head": "octo:fman/issue-1/a1",
+    "state": "all",
+    "per_page": "100"
+   }
+  },
+  {
+   "method": "GET",
+   "path": "/repos/octo/widgets/pulls/2",
+   "status": 200,
+   "body": {
+    "id": 7002,
+    "node_id": "PR_kwDOfake2",
+    "url": "https://api.github.com/repos/octo/widgets/pulls/2",
+    "html_url": "https://github.com/octo/widgets/pull/2",
+    "number": 2,
+    "state": "closed",
+    "locked": false,
+    "title": "Add a --verbose flag (#1)",
+    "body": "Closes #1\n\nAttempt 1",
+    "user": {
+     "login": "foreman-inator[bot]",
+     "id": 9001,
+     "node_id": "U_foreman-inator[bot]",
+     "type": "Bot",
+     "url": "https://api.github.com/users/foreman-inator[bot]",
+     "html_url": "https://github.com/foreman-inator[bot]",
+     "site_admin": false
+    },
+    "labels": [],
+    "draft": false,
+    "created_at": "2026-11-23T09:01:00Z",
+    "updated_at": "2026-11-23T09:02:00Z",
+    "closed_at": "2026-11-23T10:00:00Z",
+    "merged_at": "2026-11-23T10:00:00Z",
+    "head": {
+     "label": "octo:fman/issue-1/a1",
+     "ref": "fman/issue-1/a1",
+     "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+     "user": {
+      "login": "octo",
+      "id": 50,
+      "node_id": "U_octo",
+      "type": "Organization",
+      "url": "https://api.github.com/users/octo",
+      "html_url": "https://github.com/octo",
+      "site_admin": false
+     }
+    },
+    "base": {
+     "label": "octo:main",
+     "ref": "main",
+     "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+     "user": {
+      "login": "octo",
+      "id": 50,
+      "node_id": "U_octo",
+      "type": "Organization",
+      "url": "https://api.github.com/users/octo",
+      "html_url": "https://github.com/octo",
+      "site_admin": false
+     }
+    },
+    "author_association": "NONE",
+    "merged": true,
+    "mergeable_state": "clean"
+   }
+  },
+  {
+   "method": "GET",
+   "path": "/repos/octo/widgets/issues/1",
+   "status": 200,
+   "body": {
+    "id": 5001,
+    "node_id": "I_kwDOfake1",
+    "url": "https://api.github.com/repos/octo/widgets/issues/1",
+    "html_url": "https://github.com/octo/widgets/issues/1",
+    "number": 1,
+    "state": "closed",
+    "state_reason": "completed",
+    "title": "Add a --verbose flag",
+    "body": "Print each step.",
+    "user": {
+     "login": "brooks",
+     "id": 101,
+     "node_id": "U_brooks",
+     "type": "User",
+     "url": "https://api.github.com/users/brooks",
+     "html_url": "https://github.com/brooks",
+     "site_admin": false
+    },
+    "labels": [
+     {
+      "id": 11,
+      "node_id": "LA_11",
+      "url": "https://api.github.com/repos/octo/widgets/labels/agent",
+      "name": "agent",
+      "color": "0e8a16",
+      "default": false,
+      "description": null
+     }
+    ],
+    "assignees": [],
+    "locked": false,
+    "comments": 0,
+    "created_at": "2026-11-23T09:00:00Z",
+    "updated_at": "2026-11-23T09:00:04Z",
+    "closed_at": "2026-11-23T10:00:00Z",
+    "author_association": "OWNER",
+    "timeline_url": "https://api.github.com/repos/octo/widgets/issues/1/timeline"
+   }
+  },
+  {
+   "method": "PATCH",
+   "path": "/repos/octo/widgets/issues/1",
+   "status": 200,
+   "body": {
+    "id": 5001,
+    "node_id": "I_kwDOfake1",
+    "url": "https://api.github.com/repos/octo/widgets/issues/1",
+    "html_url": "https://github.com/octo/widgets/issues/1",
+    "number": 1,
+    "state": "closed",
+    "state_reason": "completed",
+    "title": "Add a --verbose flag",
+    "body": "Print each step.",
+    "user": {
+     "login": "brooks",
+     "id": 101,
+     "node_id": "U_brooks",
+     "type": "User",
+     "url": "https://api.github.com/users/brooks",
+     "html_url": "https://github.com/brooks",
+     "site_admin": false
+    },
+    "labels": [
+     {
+      "id": 11,
+      "node_id": "LA_11",
+      "url": "https://api.github.com/repos/octo/widgets/labels/agent",
+      "name": "agent",
+      "color": "0e8a16",
+      "default": false,
+      "description": null
+     }
+    ],
+    "assignees": [],
+    "locked": false,
+    "comments": 0,
+    "created_at": "2026-11-23T09:00:00Z",
+    "updated_at": "2026-11-23T09:00:04Z",
+    "closed_at": "2026-11-23T10:00:00Z",
+    "author_association": "OWNER",
+    "timeline_url": "https://api.github.com/repos/octo/widgets/issues/1/timeline"
+   },
+   "request_json": {
+    "state": "closed",
+    "state_reason": "completed"
+   }
+  }
+ ]
+}

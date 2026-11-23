@@ -42,3 +42,22 @@ def main(
     ] = False,
 ) -> None:
     """foreman-inator: a GitHub App plus a polling worker on your Mac."""
+
+
+config_app = typer.Typer(help="Manage ~/.foreman-inator/config.toml and Keychain keys.")
+app.add_typer(config_app, name="config")
+
+
+@config_app.command("set-key")
+def config_set_key(
+    name: Annotated[str, typer.Argument(help="Keychain item name, e.g. glm or anthropic.")],
+) -> None:
+    """Store an API key in the macOS Keychain (service foreman-inator)."""
+    from foreman_inator import config as cfg
+
+    value = typer.prompt(f"API key for {name}", hide_input=True)
+    try:
+        ref = cfg.set_key(name, value)
+    except cfg.ConfigError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    typer.echo(f'Stored. In config.toml use: api_key_ref = "{ref}"')
