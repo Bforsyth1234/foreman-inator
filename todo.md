@@ -65,7 +65,7 @@ in the item, and put the shape you rely on behind one small adapter so a
 change touches one file.
 ============================================================ -->
 
-Next ID: #68
+Next ID: #69
 Legend: `[ ]` todo · `[~]` in progress · `[~] live` built, waiting on its live check · `[x]` done (move to DONE.md)
 
 ## Wave plan
@@ -97,7 +97,7 @@ Package root below is `src/foreman_inator/` (written `pkg/`).
 | 7 | A: #22 (cross-repo, optional) | bot-inator repo only; nothing in this repo | [ ] |
 | 8 | A: #23 · B: #24 · C: #25 · D: #26 · E: #27 · F: #28 | A `pkg/routing/knn.py`, `pkg/routing/explore.py` · B `pkg/experiments/variants.py`, `pkg/experiments/__init__.py`, `pkg/prompts/__init__.py` · C `pkg/experiments/replay_sets.py`, `pkg/experiments/replay_runner.py` · D `pkg/experiments/shadow.py` · E `pkg/tracing/failure_label.py`, `pkg/prompts/failure-label-v1.md` · F `pkg/tracing/replay.py`, `pkg/metrics/trace_view.py`, `tests/recordings/` (+ own tests). Runner at close: `pyproject.toml` deps | [x] |
 | 9 | A: #29 (alone: wiring) | `pkg/worker.py`, `pkg/cli.py` (`experiment`, `replay`), `pkg/metrics/web.py` (new routes and failure-step columns), `tests/test_worker_v3.py` | [x] built; live check open for #29 |
-| 10 | A: #30 · B: #31 · C: #32 | A `pkg/export.py` · B `pyproject.toml` (metadata, entry points), `.github/workflows/release.yml`, `docs/releasing.md` · C `README.md`, `docs/setup.md`, `docs/how-it-works.md`, `docs/demo.gif` (+ own tests). Runner at close: `cli.py` (`export`) | [ ] |
+| 10 | A: #30 · B: #31 · C: #32 | A `pkg/export.py` · B `pyproject.toml` (metadata, entry points), `.github/workflows/release.yml`, `docs/releasing.md` · C `README.md`, `docs/setup.md`, `docs/how-it-works.md`, `docs/demo.gif` (+ own tests). Runner at close: `cli.py` (`export`) | [x] built; live checks open for #31, #32 |
 | — | #33–#39 | unscheduled (SPEC milestone 5) | open |
 | — | #45–#50 | unscheduled (gap review, 2026-11-23) | open |
 | — | #51 | unscheduled (user request, 2026-11-23); proposed as its own wave after 6b | open |
@@ -137,6 +137,8 @@ Open (need the user; full steps in each item's DONE.md entry):
 
 One combined step list for wave 6b is in DONE.md's #40, #41 and #44 entries.
 - #29 milestone 4: one overnight replay of a prompt change (a new prompt file), then read the comparison. Steps in DONE.md.
+- #31 packaging: decide how fde-kit reaches strangers (it is not on PyPI, so `uv tool install foreman-inator` cannot work yet; the release workflow's publish jobs are switched off). Then TestPyPI, then PyPI. Steps in `docs/releasing.md`.
+- #32 docs: follow `docs/setup.md` on a second Mac account from scratch; record `docs/demo.gif` from a real run.
 
 ## Completed items (archived to DONE.md)
 
@@ -173,6 +175,9 @@ One combined step list for wave 6b is in DONE.md's #40, #41 and #44 entries.
 #27 — Failure-step labeling [x] · 2026-11-23 · see DONE.md
 #28 — Replay viewer and recorded tickets as worker regression tests [x] · 2026-11-23 · see DONE.md
 #29 — Wiring for milestone 4 [~] live · 2026-11-23 · see DONE.md
+#30 — `fman export --redact` [x] · 2026-11-23 · see DONE.md
+#31 — Packaging, release workflow, name check [~] live · 2026-11-23 · see DONE.md
+#32 — README, docs and demo [~] live · 2026-11-23 · see DONE.md
 
 ---
 
@@ -229,38 +234,6 @@ Deviations:
 ### Milestone 4 — Learning router, experiments, trace analysis
 
 ### Release
-
-#30 — `fman export --redact` [ ]
-Wave: 10 · Agent: A · Added: 2026-11-23 · Source: spec
-Ask: Share a trace in a bug report without leaking code.
-Files:
-⚬ OWNED: `src/foreman_inator/export.py`, `tests/test_export.py`
-Approach: export a ticket's spans and recording with code, file contents, prompts and tool output replaced by hashes + lengths; keep structure, timings, models, verdicts.
-Verify:
-⚬ A fixture recording with secret-looking strings exports with none of them present (grep test); non-vacuous: skip tool output redaction, test fails.
-Deviations:
-
-#31 — Packaging, release workflow, name check [ ]
-Wave: 10 · Agent: B · Added: 2026-11-23 · Source: user ("will this app be distributed on github?")
-Ask: `uv tool install foreman-inator` works for anyone.
-DECISIONS (user, 2026-11-23): name foreman-inator, command alias `fman`, MIT.
-Files:
-⚬ OWNED: `pyproject.toml` (metadata, classifiers, entry points), `.github/workflows/release.yml`, `docs/releasing.md`
-Approach: confirm `foreman-inator` is free on PyPI and as a GitHub App name before the first publish (record the date); release on tag via PyPI trusted publishing; GitHub release with changelog.
-Verify:
-⚬ `uv build` produces a wheel; installing it in a clean venv gives working `foreman-inator` and `fman`.
-Live (user): first release to TestPyPI, then PyPI.
-Deviations:
-
-#32 — README, docs and demo [ ]
-Wave: 10 · Agent: C · Added: 2026-11-23 · Source: spec
-Ask: A stranger understands it in 30 seconds and can set it up in 10 minutes.
-Files:
-⚬ OWNED: `README.md`, `docs/setup.md`, `docs/how-it-works.md`, `docs/demo.gif`
-Approach: README top: one-sentence pitch, the demo gif (label → draft PR → AI review → merge), install in 3 commands, "personal project, no promised support". How it works: lifecycle + architecture diagrams from SPEC. Note the comparison: what it adds over "assign an issue to an agent" tools (local models, learning router, per-model metrics, experiments).
-Verify:
-⚬ Follow `docs/setup.md` on a second Mac account from scratch; every step works as written.
-Deviations:
 
 ### Unscheduled (SPEC milestone 5)
 
@@ -454,3 +427,15 @@ Idea: on `/experiments`: a "new experiment" form (role, challenger model and pro
 Safety: the page binds to loopback only (`metrics/web.py`, `DEFAULT_HOST`) and has no login, so any website open in the browser can send a POST to it. Every POST needs a CSRF token (per-process random, in the form) and an `Origin` / `Host` check that rejects anything but the page's own loopback origin; GETs stay side-effect free. A started run is a background job (the page does not block on a replay), and the cloud spend caps apply as on the CLI path.
 Verify: a POST without the token, or with a foreign `Origin`, is refused with 403 and changes nothing; promote without the confirm step changes nothing; a form-started run gives the same `experiments` row as the CLI with the same arguments. Non-vacuous: drop the Origin check and the foreign-origin test fails.
 Estimate: about 2–3 hours with tests.
+
+### Unscheduled (plugins, 2026-11-23)
+
+Asked by the user: "add the plugin hooks as a todo". Nothing in this repo loads plugins today (no entry-point lookup anywhere in `src/`).
+
+#68 — Plugin hooks, so a separately installed package can extend the worker [ ] · Added: 2026-11-23 · Source: user
+Why: some features do not belong in every install (the metrics page on the network with a login, per-person numbers and spend caps, several boxes on one queue). They need named places to attach to, or each one ends up as a fork of this repo.
+Idea: a small loader (`plugins.py`) reads Python entry points in one group (`foreman_inator.plugins`) at startup and hands each plugin a registry. A hook is a narrow interface whose default is today's behaviour. Add hooks one at a time, each when a real feature needs it; first candidates: who may view the metrics page and which host it binds to (`metrics/web.py`, loopback today), how the spend caps are split (`spend.py`, one shared cap today), extra migrations, extra CLI commands. The dependency runs one way: this repo never imports a plugin and runs unchanged without one. Build the loader together with the first hook, not ahead of it.
+Safety: a plugin is code running inside the worker with its keys. Load only installed packages (never a path from config or from a repo), list every loaded plugin and its version in `fman status` and at startup, and log and skip a plugin that fails to load (never fatal). No hook can relax an invariant (7a–7g): hooks take and return data; they do not replace the merge, allowed-users, sandbox or reviewer-independence checks. Hooks become a public API once a plugin depends on them, so version them, and a plugin states which versions it works with.
+Verify: with no plugin installed every existing test passes unchanged; a fake plugin registered in a test is loaded, listed in status and its hook is called; a plugin that raises on load is skipped and the worker still starts; each hook's default gives today's behaviour. Non-vacuous: make the loader ignore the entry-point group and the fake-plugin test fails.
+SPEC change needed: a short "Plugins" section naming the group, the hooks and the one-way dependency.
+Estimate: about half a day with the first hook and tests.

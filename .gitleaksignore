@@ -1,0 +1,3 @@
+# False positive: a made-up, key-shaped string in a redaction test (not a secret).
+# The literal was removed in the next commit; this entry covers the old commit in history.
+16a5efe64f74855c1bff40ae159d127848c63343:tests/test_export.py:stripe-access-token:755
