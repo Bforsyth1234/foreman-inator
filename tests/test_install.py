@@ -439,7 +439,11 @@ def test_install_then_writer_then_verify_twice_second_from_the_cache(tmp_path, i
     # nothing the install wrote is committed by the worker's `git add -A`
     status = subprocess.run(["git", "status", "--porcelain"], cwd=wt2.path, capture_output=True,
                             text=True)  # fmt: skip
-    assert status.stdout.strip() == ""
+    # The install must leave nothing untracked (.venv/ is excluded). Python's own
+    # __pycache__/ from running the tests is excluded by the worker (worker_attempt.EXCLUDES),
+    # which this test does not set up, so it is not the install's to answer for.
+    left = [ln for ln in status.stdout.splitlines() if not ln.rstrip("/").endswith("__pycache__")]
+    assert left == []
 
 
 @macos
