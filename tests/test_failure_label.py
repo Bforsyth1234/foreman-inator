@@ -462,7 +462,7 @@ def test_http_error_stores_nothing(store, rec_dir, fake, proxy):
 
 def test_timeout_stores_nothing_quickly(store, rec_dir, fake):
     async def slow(request: httpx.Request) -> httpx.Response:
-        await asyncio.sleep(1.5)
+        await asyncio.sleep(3.0)  # the reply would come long after the 0.3 s timeout
         return await fake.handle(request)
 
     fake.responder = oracle
@@ -477,7 +477,7 @@ def test_timeout_stores_nothing_quickly(store, rec_dir, fake):
     finally:
         p.stop()
     assert res.label is None and "timed out" in res.reason
-    assert elapsed < 1.5
+    assert elapsed < 2.5  # gave up at the timeout; margin for a loaded (parallel) run
     assert store.get_kickback(k.id).failure_step is None
 
 

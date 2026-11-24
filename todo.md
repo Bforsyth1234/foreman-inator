@@ -65,7 +65,7 @@ in the item, and put the shape you rely on behind one small adapter so a
 change touches one file.
 ============================================================ -->
 
-Next ID: #61
+Next ID: #68
 Legend: `[ ]` todo · `[~]` in progress · `[~] live` built, waiting on its live check · `[x]` done (move to DONE.md)
 
 ## Wave plan
@@ -415,3 +415,42 @@ Idea: at attempt start (and optionally at end), store the loaded models from #58
 #60 — Resource panel on the metrics page [ ] · Added: 2026-11-23 · Source: user
 Why: makes #57–#59 visible: current loaded models and their memory, system memory used, and local inference slots in use vs. the cap.
 Idea: a panel in `metrics/web.py` fed by #58's poller and the #57 semaphore; per-attempt memory from #59 shown on the attempt view. Depends on #57–#59. Estimate: about 2 hours.
+
+### Unscheduled (agent instructions and global rules, 2026-11-23)
+
+Asked by the user: "what about agent md files? do we need to tell the agents to read those? Should we add the ability to add them? maybe the users want some global rules etc?", then "ok add these as todos to todo.md should we add the ability to test these rules?". Today `tickets/prompt.py` reads the first of `AGENTS.md` / `CLAUDE.md` in the worktree (`CONVENTIONS_FILES`, 6,000-char budget) into the writer prompt's `conventions` section. Nothing else sees it, and there is no user-level rules file.
+
+#61 — Global rules file for every repo [ ] · Added: 2026-11-23 · Source: user
+Why: users want rules that apply to every repo the worker touches (commit style, "never add dependencies", language preferences). There is nowhere to put them: OpenCode's own `~/.config/opencode/AGENTS.md` is never read because `XDG_CONFIG_HOME` points at foreman-inator's dirs, on purpose (`runner/opencode.py`).
+Idea: `~/.foreman-inator/AGENTS.md` (mode 600, invariant d) plus an optional per-repo `rules_file` in config. Shown in the prompt before the repo's own file, under its own heading; the prompt says the repo's file wins on a conflict. Shares `CONVENTIONS_BUDGET` with the repo file (global clipped first) or gets its own budget: decide and record. Replays record which global text was used so a later edit doesn't change old results. Estimate: about 1 hour with tests.
+
+#62 — The reviewer sees the repo's conventions [ ] · Added: 2026-11-23 · Source: assistant (gap review)
+Why: `reviewer-v1.md` defines the `style` tag as "ignores the repository's conventions", but `review/` never calls `read_conventions`, so the reviewer judges style with no conventions to compare against. Style kickbacks are guesses.
+Idea: pass the same conventions text (repo + #61 global) into the reviewer prompt, same budget and `defuse`. Invariant f is unaffected: conventions are repo input, not the writer's reasoning. Needs a reviewer prompt bump (`reviewer-v2`) so replays can compare it to v1. Estimate: about 45 minutes.
+
+#63 — Read both AGENTS.md and CLAUDE.md, not the first one found [ ] · Added: 2026-11-23 · Source: assistant (gap review)
+Why: `CONVENTIONS_FILES` is "first one found wins". A repo with both files loses every `CLAUDE.md` rule without a warning. Nested files (`pkg/AGENTS.md`) are also ignored.
+Idea: read both root files, skip one that is identical to or a symlink of the other, and label each in the prompt. Nested files: include those on the path of the ticket's `owned_files` when there are any, within the budget. Log a warning when the budget clips the text. Estimate: about 45 minutes.
+
+#64 — Check whether OpenCode loads AGENTS.md on its own [ ] · Added: 2026-11-23 · Source: assistant (gap review)
+Why: OpenCode reads `AGENTS.md` from the project dir by default (not confirmed for 1.18.7). If it does, the writer gets the file twice: once from OpenCode, once from our prompt (clipped). That doubles its token cost and makes replays depend on OpenCode's behaviour too.
+Idea: read the current OpenCode docs (rule 12) and check one live attempt's first `llm.call` for the file text. If it is there, turn it off in `build_config` (or the instructions setting) so our prompt is the only source. Estimate: about 15 minutes plus the live check.
+
+#65 — `fman rules show`: preview the rules an agent will get [ ] · Added: 2026-11-23 · Source: user (asked how to test rules)
+Why: there is no way to see what a rules file turns into before a real ticket runs: which files were found, which order, and whether the budget clipped them.
+Idea: `fman rules show <repo>` prints the assembled conventions block for the writer and the reviewer exactly as the prompt builder renders it, with each source file, its character count and a clear "CLIPPED at N chars" line. No model call. Estimate: about 30 minutes. Depends on #61–#63.
+
+#66 — Replay a rules change before it goes live [ ] · Added: 2026-11-23 · Source: user (asked how to test rules)
+Why: a rules edit changes every future attempt, and there is no way to measure whether it helped. Replays already compare champion vs challenger, but `replay_runner` reads `AGENTS.md` from the worktree at the case's base commit, so both sides always get the same rules.
+Idea: a conventions override on the challenger side (`fman experiment run --rules <file>`), keeping model and prompt fixed, so the comparison isolates the rules. Writer side: pass rate, cost, tokens. Reviewer side: catch / false-kickback rates, `style` tag rate in particular. Record the override's text hash on the experiment. Estimate: about 2 hours. Depends on #61.
+
+### Unscheduled (experiments GUI, 2026-11-23)
+
+Asked by the user: "are they setup in the command line or do we set them up with a gui", then "yes add it as a todo". Today experiments are started and promoted only from the CLI (`fman experiment run | status | promote`, `[experiments]` in config.toml, the nightly launchd job); `/experiments` on the metrics page is read-only (GET routes only).
+
+#67 — Start, cancel and promote experiments from the metrics page [ ] · Added: 2026-11-23 · Source: user
+Why: running an experiment means remembering variant ids (`MODEL/PROMPT@HASH8`) and typing them into the CLI, while the results are already on the web page. Starting and promoting from where the results are shown cuts that step.
+Idea: on `/experiments`: a "new experiment" form (role, challenger model and prompt picked from lists, later the #66 rules override), cancel on a running one, promote on a finished one. Each button calls the same functions as the CLI (`worker_experiments.run_command`, promote), so nothing new decides anything. Promote shows the comparison and asks for a confirm step, because it changes the live writer or reviewer.
+Safety: the page binds to loopback only (`metrics/web.py`, `DEFAULT_HOST`) and has no login, so any website open in the browser can send a POST to it. Every POST needs a CSRF token (per-process random, in the form) and an `Origin` / `Host` check that rejects anything but the page's own loopback origin; GETs stay side-effect free. A started run is a background job (the page does not block on a replay), and the cloud spend caps apply as on the CLI path.
+Verify: a POST without the token, or with a foreign `Origin`, is refused with 403 and changes nothing; promote without the confirm step changes nothing; a form-started run gives the same `experiments` row as the CLI with the same arguments. Non-vacuous: drop the Origin check and the foreign-origin test fails.
+Estimate: about 2–3 hours with tests.

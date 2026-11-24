@@ -172,7 +172,7 @@ def test_http_error_gives_clear(fake, proxy):
 
 def test_timeout_gives_clear_quickly(fake):
     async def slow(request: httpx.Request) -> httpx.Response:
-        await asyncio.sleep(1.5)
+        await asyncio.sleep(3.0)  # the reply would come long after the 0.3 s timeout
         return await fake.handle(request)
 
     p = _proxy(httpx.MockTransport(slow)).start()
@@ -183,7 +183,7 @@ def test_timeout_gives_clear_quickly(fake):
     finally:
         p.stop()
     assert isinstance(r, Clear) and r.is_fallback and "timed out" in r.reason
-    assert elapsed < 1.5
+    assert elapsed < 2.5  # gave up at the timeout; margin for a loaded (parallel) run
 
 
 def test_proxy_down_gives_clear():
