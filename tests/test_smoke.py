@@ -24,3 +24,19 @@ def test_version_flag() -> None:
 
 def test_worker_run_is_a_noop() -> None:
     assert run() is None
+
+
+def test_config_set_key_stores_in_keychain(monkeypatch):
+    from typer.testing import CliRunner
+
+    from foreman_inator import config as cfg
+    from foreman_inator.cli import app
+
+    stored = {}
+    monkeypatch.setattr(
+        cfg.keyring, "set_password", lambda service, name, value: stored.update({name: value})
+    )
+    result = CliRunner().invoke(app, ["config", "set-key", "glm"], input="fake-value\n")
+    assert result.exit_code == 0, result.output
+    assert stored == {"glm": "fake-value"}
+    assert "keychain:foreman-inator/glm" in result.output

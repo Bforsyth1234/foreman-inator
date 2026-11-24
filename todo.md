@@ -82,7 +82,7 @@ Package root below is `src/foreman_inator/` (written `pkg/`).
 | Wave | Slot: items | Owned files (disjoint within the wave) | Status |
 | :--- | :--- | :--- | :--- |
 | 1 | A: #1 (alone) | `pyproject.toml`, `uv.lock`, `.gitignore`, `LICENSE`, `README.md`, `.pre-commit-config.yaml`, `.github/workflows/ci.yml`, `pkg/__init__.py`, `pkg/cli.py` (skeleton), `pkg/worker.py` (skeleton), `tests/conftest.py`, `tests/fakes/__init__.py` | [x] |
-| 2 | A: #2 · B: #3 · C: #4 · D: #5 · E: #6 · F: #7 | A `pkg/paths.py`, `pkg/config.py` · B `pkg/db/schema.sql`, `pkg/db/store.py`, `pkg/db/__init__.py` · C `pkg/github/app_auth.py`, `pkg/github/client.py`, `pkg/github/__init__.py`, `tests/fakes/github.py` · D `pkg/tracing/otel.py`, `pkg/tracing/recorder.py`, `pkg/tracing/__init__.py` · E `pkg/runner/verify.py`, `tests/fixtures/repos/` · F `pkg/runner/worktree.py`, `pkg/runner/__init__.py` (+ each slot's own `tests/test_<module>.py`). Runner at close: `pyproject.toml` deps | [ ] |
+| 2 | A: #2 · B: #3 · C: #4 · D: #5 · E: #6 · F: #7 | A `pkg/paths.py`, `pkg/config.py` · B `pkg/db/schema.sql`, `pkg/db/store.py`, `pkg/db/__init__.py` · C `pkg/github/app_auth.py`, `pkg/github/client.py`, `pkg/github/__init__.py`, `tests/fakes/github.py` · D `pkg/tracing/otel.py`, `pkg/tracing/recorder.py`, `pkg/tracing/__init__.py` · E `pkg/runner/verify.py`, `tests/fixtures/repos/` · F `pkg/runner/worktree.py`, `pkg/runner/__init__.py` (+ each slot's own `tests/test_<module>.py`). Runner at close: `pyproject.toml` deps | [x] |
 | 3 | A: #8 · B: #9 · C: #10 · D: #11 · E: #12 · F: #13 | A `pkg/setup/manifest.py`, `pkg/setup/deps.py`, `pkg/setup/launchd.py`, `pkg/setup/__init__.py` · B `pkg/proxy/server.py`, `pkg/proxy/pricing.py`, `pkg/proxy/__init__.py`, `tests/fakes/models.py` · C `pkg/runner/opencode.py`, `tests/fakes/opencode.py` · D `pkg/github/poller.py`, `pkg/tickets/lifecycle.py`, `pkg/tickets/__init__.py` · E `pkg/pr/publisher.py`, `pkg/pr/__init__.py` · F `pkg/prompts/writer-v1.md`, `pkg/tickets/prompt.py` (+ own tests). Runner at close: `cli.py` (`setup`), `pyproject.toml` deps | [ ] |
 | 4 | A: #14 (alone: the main loop) | `pkg/worker.py`, `pkg/cli.py` (`run`, `status`), `tests/test_worker_v1.py`, `tests/fakes/` (additive only) | [ ] |
 | 5 | A: #15 · B: #16 · C: #17 · D: #18 · E: #19 · F: #20 | A `pkg/routing/rules.py`, `pkg/routing/__init__.py`, `pkg/prompts/router-v1.md` · B `pkg/routing/escalation.py` · C `pkg/review/reviewer.py`, `pkg/review/checks.py`, `pkg/review/__init__.py`, `pkg/prompts/reviewer-v1.md` · D `pkg/spend.py` · E `pkg/locks.py` · F `pkg/metrics/queries.py`, `pkg/metrics/web.py`, `pkg/metrics/__init__.py`, `pkg/pr/summary.py` (+ own tests). Runner at close: `pyproject.toml` deps | [ ] |
@@ -115,6 +115,12 @@ milestone 2's in #17 and #21.
 ## Completed items (archived to DONE.md)
 
 #1 — Repo scaffold: package, tooling, CI, secret guards [x] · 2026-11-23 · see DONE.md
+#2 — Paths and config: `~/.foreman-inator`, config.toml, Keychain keys [x] · 2026-11-23 · see DONE.md
+#3 — SQLite store: full schema and migrations [x] · 2026-11-23 · see DONE.md
+#4 — GitHub App auth, REST client and a fake GitHub [x] · 2026-11-23 · see DONE.md
+#5 — Tracing core and run recorder (fde-kit) [x] · 2026-11-23 · see DONE.md
+#6 — Verify command detection and runner [x] · 2026-11-23 · see DONE.md
+#7 — Worktree manager [x] · 2026-11-23 · see DONE.md
 
 ---
 
@@ -145,96 +151,6 @@ All items below were written 2026-11-23 from SPEC.md (user: "write
 todos organized in waves to build this app"). Section = SPEC milestone.
 
 ### Milestone 1 — GitHub App plus a polling worker on one tier
-
-#2 — Paths and config: `~/.foreman-inator`, config.toml, Keychain keys [ ]
-Wave: 2 · Agent: A · Added: 2026-11-23 · Source: spec
-Ask: Secrets and data outside the repo; API keys not in plain text.
-DECISIONS (assistant, 2026-11-23):
-1. Home is `~/.foreman-inator/` (override `FOREMAN_INATOR_HOME`), created with mode 700; `app.pem` written with mode 600.
-2. `config.toml` holds: App ID, App slug, installation IDs, `allowed_users`, repos, model endpoints per tier, spend caps, poll interval. API keys are stored as Keychain references (`keychain:foreman-inator/<name>`) resolved through the `keyring` package.
-3. Config is a typed dataclass (or pydantic model); unknown keys are an error, missing optional keys get defaults from SPEC.md.
-Files:
-⚬ OWNED: `src/foreman_inator/paths.py`, `src/foreman_inator/config.py`, `tests/test_config.py`
-⚬ Do NOT touch: `cli.py`, `pyproject.toml` (report `keyring`, `tomli-w` for the runner)
-Approach: `paths.py` exposes `home()`, `app_key_path()`, `db_path()`, `traces_dir()`, `recordings_dir()`, `worktrees_dir()`, each creating its folder with the right mode. `config.py` loads/saves TOML and resolves Keychain refs lazily (only when a cloud tier is used).
-Verify:
-⚬ Created folders are mode 700 and `app.pem` 600 (checked with `os.stat`).
-⚬ A plain-text API key in config.toml is rejected with a message pointing at `fman config set-key`.
-⚬ Keychain lookups are mocked in tests; non-vacuous: drop the plain-text check, its test fails.
-Deviations:
-
-#3 — SQLite store: full schema and migrations [ ]
-Wave: 2 · Agent: B · Added: 2026-11-23 · Source: spec
-Ask: The data model in SPEC.md, so later items never need a schema change to start.
-DECISIONS (assistant, 2026-11-23):
-1. One migration creates every table in SPEC "Data model": tickets, attempts, kickbacks, reviews, experiments, plus `variants` (id, role, model, prompt_name, prompt_hash) and `repo_settings` (repo, verify_command).
-2. Ticket IDs are integers that are never reused (no `AUTOINCREMENT` reset; deleted rows keep their ID used).
-3. Enums are CHECK constraints with the exact values in SPEC.md.
-Files:
-⚬ OWNED: `src/foreman_inator/db/schema.sql`, `src/foreman_inator/db/store.py`, `src/foreman_inator/db/__init__.py`, `tests/test_store.py`
-⚬ Do NOT touch: `paths.py` (take the db path as an argument)
-Approach: `Store(path)` with typed methods per table (`create_ticket`, `add_attempt`, `record_kickback`, `record_review`, `set_column`, …) and a `migrate()` that applies numbered SQL files in a transaction. WAL mode on.
-Verify:
-⚬ Migrating twice is a no-op; a fresh DB has every table and column in SPEC.md (test compares against a list copied from SPEC).
-⚬ An invalid enum value (e.g. column `doing`) raises; non-vacuous: drop its CHECK, test fails.
-Deviations:
-
-#4 — GitHub App auth, REST client and a fake GitHub [ ]
-Wave: 2 · Agent: C · Added: 2026-11-23 · Source: spec
-Ask: Talk to GitHub as the App, with a fake good enough for every later test.
-DECISIONS (assistant, 2026-11-23):
-1. App JWT (RS256, ≤10 min) → installation access token, cached until 1 minute before expiry.
-2. The client covers only what SPEC needs: list issues with a label, issue events (who applied a label), issue comments, create branch ref, create/update draft PR, mark PR ready for review, post PR review, list PR reviews, add/remove labels, close issue, post comment.
-3. `tests/fakes/github.py` is an in-memory GitHub with the same method names, used by every later test (rule 8).
-Files:
-⚬ OWNED: `src/foreman_inator/github/app_auth.py`, `src/foreman_inator/github/client.py`, `src/foreman_inator/github/__init__.py`, `tests/fakes/github.py`, `tests/test_github_client.py`
-Approach: Rule 12: confirm current REST endpoints (labels events, draft PRs, "ready for review" is GraphQL `markPullRequestReadyForReview` at the time of writing — check). Client methods return small dataclasses, not raw JSON. Retry with backoff on 5xx and secondary rate limits.
-Verify:
-⚬ JWT is generated from a test key made at test time; token caching tested with a fake clock.
-⚬ `fake_github` and the real client share an interface test (same calls, same dataclasses) run against the fake and against recorded HTTP fixtures.
-⚬ Non-vacuous: break the expiry margin, the caching test fails.
-Deviations:
-
-#5 — Tracing core and run recorder (fde-kit) [ ]
-Wave: 2 · Agent: D · Added: 2026-11-23 · Source: spec
-Ask: Every ticket is one trace and every attempt is recorded, from day one.
-DECISIONS (assistant, 2026-11-23):
-1. Spans go through `fde_kit.tracing.init_tracing` / `get_tracer`; content is truncated with `trace_content` (4,000 chars), full outputs saved as files next to the recording.
-2. Recordings use fde-kit's JSONL row format (`kind` first; header, `llm`, `tool`, result rows) under `~/.foreman-inator/recordings/<ticket>/<attempt>.jsonl.gz`.
-3. Span names and attributes are exactly SPEC "Tracing" → span layout: `route`, `attempt`, `llm.call`, `tool.call`, `verify`, `review` (+ one child per check), `github`.
-Files:
-⚬ OWNED: `src/foreman_inator/tracing/otel.py`, `src/foreman_inator/tracing/recorder.py`, `src/foreman_inator/tracing/__init__.py`, `tests/test_tracing.py`
-Approach: `ticket_span(ticket)` context manager returns the trace id for the tickets table; `Recorder(attempt)` with `llm(...)`, `tool(...)`, `close(result)`. Retention: merged tickets kept, others pruned after 90 days by `prune()`.
-Verify:
-⚬ An in-memory span exporter shows the expected tree for a fake attempt.
-⚬ A recording round-trips through fde-kit's `RunRecord` loader (or a documented subset if fde-kit's loader needs its own header fields: record the deviation).
-⚬ `prune()` keeps merged, deletes a 91-day-old unmerged recording; non-vacuous: invert the merged check, test fails.
-Deviations:
-
-#6 — Verify command detection and runner [ ]
-Wave: 2 · Agent: E · Added: 2026-11-23 · Source: spec (decision: detected from the repo)
-Ask: Know how to test any repo without asking, and ask once when it can't tell.
-DECISIONS (user, 2026-11-23): detected from the repo; if nothing is found the ticket is flagged once and the entered command is saved per repo.
-DECISIONS (assistant, 2026-11-23): detection order: `repo_settings` override → `Makefile` `test`/`check` target → `package.json` `test` script → `pyproject.toml`/`pytest.ini`/`tests/` → `Package.swift` (`swift test`) → none.
-Files:
-⚬ OWNED: `src/foreman_inator/runner/verify.py`, `tests/fixtures/repos/` (one tiny repo per ecosystem), `tests/test_verify.py`
-Approach: `detect(repo_dir) -> VerifyCommand | None`; `run(cmd, cwd, timeout) -> VerifyResult(passed, tests_run, tests_failed, output_path)`. Parse counts for pytest and npm/jest where easy; otherwise pass/fail only.
-Verify:
-⚬ Each fixture repo detects the right command; an empty repo returns None.
-⚬ A failing fixture test produces `passed=False` with output saved; non-vacuous: make `run` ignore the exit code, test fails.
-Deviations:
-
-#7 — Worktree manager [ ]
-Wave: 2 · Agent: F · Added: 2026-11-23 · Source: spec
-Ask: One clean git worktree per attempt, on a `fman/` branch.
-DECISIONS (assistant, 2026-11-23): one bare-ish mirror clone per repo under `~/.foreman-inator/worktrees/<owner>/<repo>/.mirror`, worktrees beside it; branch `fman/issue-<n>/a<attempt>`; cleanup after merge or drop.
-Files:
-⚬ OWNED: `src/foreman_inator/runner/worktree.py`, `src/foreman_inator/runner/__init__.py`, `tests/test_worktree.py`
-Approach: shell out to `git` (no GitPython). `create(repo, base_branch, ticket, attempt)`, `diff_stats(worktree)`, `commit_all(message)`, `push(branch, token)`, `remove()`. Refuse any branch name not starting with `fman/` (invariant 7a).
-Verify:
-⚬ Tests use local bare repos in `tmp_path`: create, edit, commit, diff stats, remove.
-⚬ Pushing to `main` raises; non-vacuous: drop the prefix check, test fails.
-Deviations:
 
 #8 — `fman setup`: App via manifest flow, dependency check, launchd [ ]
 Wave: 3 · Agent: A · Added: 2026-11-23 · Source: spec
