@@ -59,7 +59,7 @@ in the item, and put the shape you rely on behind one small adapter so a
 change touches one file.
 ============================================================ -->
 
-Next ID: #51
+Next ID: #52
 Legend: `[ ]` todo · `[~]` in progress · `[~] live` built, waiting on its live check · `[x]` done (move to DONE.md)
 
 ## Wave plan
@@ -86,7 +86,7 @@ Package root below is `src/foreman_inator/` (written `pkg/`).
 | 3 | A: #8 · B: #9 · C: #10 · D: #11 · E: #12 · F: #13 | A `pkg/setup/manifest.py`, `pkg/setup/deps.py`, `pkg/setup/launchd.py`, `pkg/setup/__init__.py` · B `pkg/proxy/server.py`, `pkg/proxy/pricing.py`, `pkg/proxy/__init__.py`, `tests/fakes/models.py` · C `pkg/runner/opencode.py`, `tests/fakes/opencode.py` · D `pkg/github/poller.py`, `pkg/tickets/lifecycle.py`, `pkg/tickets/__init__.py` · E `pkg/pr/publisher.py`, `pkg/pr/__init__.py` · F `pkg/prompts/writer-v1.md`, `pkg/tickets/prompt.py` (+ own tests). Runner at close: `cli.py` (`setup`), `pyproject.toml` deps | [x] built; live checks open for #8, #10 |
 | 4 | A: #14 (alone: the main loop) | `pkg/worker.py`, `pkg/cli.py` (`run`, `status`), `tests/test_worker_v1.py`, `tests/fakes/` (additive only) | [x] built; live check open for #14 |
 | 5 | A: #15 · B: #16 · C: #17 · D: #18 · E: #19 · F: #20 | A `pkg/routing/rules.py`, `pkg/routing/__init__.py`, `pkg/prompts/router-v1.md` · B `pkg/routing/escalation.py` · C `pkg/review/reviewer.py`, `pkg/review/checks.py`, `pkg/review/__init__.py`, `pkg/prompts/reviewer-v1.md` · D `pkg/spend.py` · E `pkg/locks.py` · F `pkg/metrics/queries.py`, `pkg/metrics/web.py`, `pkg/metrics/__init__.py`, `pkg/pr/summary.py` (+ own tests). Runner at close: `pyproject.toml` deps | [x] built; live check open for #17 |
-| 6 | A: #21 (alone: the main loop) | `pkg/worker.py`, `pkg/cli.py` (`metrics`), `pkg/pr/publisher.py` (ready-for-review + bot review posting), `tests/test_worker_v2.py` | [ ] |
+| 6 | A: #21 (alone: the main loop) | `pkg/worker.py`, `pkg/cli.py` (`metrics`), `pkg/pr/publisher.py` (ready-for-review + bot review posting), `tests/test_worker_v2.py` | [x] built; live check open for #21 |
 | 6b | A: #40 · B: #41, #42, #43 (one agent, in order: all three edit the GitHub client and poller) · C: #44 | A `pkg/runner/sandbox.py`; edits `pkg/runner/opencode.py`, `pkg/runner/verify.py`, `pkg/review/checks.py`, `pkg/config.py` · B `pkg/github/client.py`, `tests/fakes/github.py`, `pkg/github/poller.py`, `pkg/tickets/lifecycle.py`, `pkg/tickets/prompt.py`, `pkg/setup/manifest.py`, `pkg/runner/worktree.py`, `pkg/db/store.py`, `pkg/db/migrations/002_*.sql` · C `pkg/tickets/clarify.py`, `pkg/prompts/clarify-v1.md` (+ own tests). Runner at close: `worker.py` wiring for all five; for #44 the `NeedsInfoAnswered` event in `poller.py`/`lifecycle.py` and the Q&A block in `tickets/prompt.py` (after slot B is merged into the wave branch); `pyproject.toml` deps | [ ] |
 | 7 | A: #22 (cross-repo, optional) | bot-inator repo only; nothing in this repo | [ ] |
 | 8 | A: #23 · B: #24 · C: #25 · D: #26 · E: #27 · F: #28 | A `pkg/routing/knn.py`, `pkg/routing/explore.py` · B `pkg/experiments/variants.py`, `pkg/experiments/__init__.py`, `pkg/prompts/__init__.py` · C `pkg/experiments/replay_sets.py`, `pkg/experiments/replay_runner.py` · D `pkg/experiments/shadow.py` · E `pkg/tracing/failure_label.py`, `pkg/prompts/failure-label-v1.md` · F `pkg/tracing/replay.py`, `pkg/metrics/trace_view.py`, `tests/recordings/` (+ own tests). Runner at close: `pyproject.toml` deps | [ ] |
@@ -94,6 +94,7 @@ Package root below is `src/foreman_inator/` (written `pkg/`).
 | 10 | A: #30 · B: #31 · C: #32 | A `pkg/export.py` · B `pyproject.toml` (metadata, entry points), `.github/workflows/release.yml`, `docs/releasing.md` · C `README.md`, `docs/setup.md`, `docs/how-it-works.md`, `docs/demo.gif` (+ own tests). Runner at close: `cli.py` (`export`) | [ ] |
 | — | #33–#39 | unscheduled (SPEC milestone 5) | open |
 | — | #45–#50 | unscheduled (gap review, 2026-11-23) | open |
+| — | #51 | unscheduled (user request, 2026-11-23); proposed as its own wave after 6b | open |
 
 ### Runner decisions on open questions (assistant defaults, 2026-11-23)
 
@@ -119,7 +120,9 @@ Open (need the user; full steps in each item's DONE.md entry):
 
 - #17 AI reviewer: with review on, 5 real tickets on a toy repo; note whether its kickbacks were fair. Run together with #21's check.
 
-Still to come: #21 (milestone 2); #40, #41 and #44 (wave 6b).
+- #21 worker loop v2 (milestone 2): one week on 1–2 real repos (public only after #40), then read the metrics page. Steps in DONE.md.
+
+Still to come: #40, #41 and #44 (wave 6b).
 
 ## Completed items (archived to DONE.md)
 
@@ -143,6 +146,7 @@ Still to come: #21 (milestone 2); #40, #41 and #44 (wave 6b).
 #18 — Spend caps [x] · 2026-11-23 · see DONE.md
 #19 — File locks for parallel tickets [x] · 2026-11-23 · see DONE.md
 #20 — Metrics queries, local page, summary comment [x] · 2026-11-23 · see DONE.md
+#21 — Worker loop v2: tiers, escalation, review, caps, locks (milestone 2) [~] live · 2026-11-23 · see DONE.md
 
 ---
 
@@ -175,19 +179,6 @@ todos organized in waves to build this app"). Section = SPEC milestone.
 ### Milestone 1 — GitHub App plus a polling worker on one tier
 
 ### Milestone 2 — Tiers, escalation, AI review, caps, metrics
-
-#21 — Worker loop v2: tiers, escalation, review, caps, locks (milestone 2) [ ]
-Wave: 6 · Agent: A (alone) · Added: 2026-11-23 · Source: spec
-Ask: The full flow in SPEC "Ticket lifecycle".
-Files:
-⚬ OWNED: `src/foreman_inator/worker.py`, `src/foreman_inator/cli.py` (`metrics`, `approve-spend`), `src/foreman_inator/pr/publisher.py` (ready-for-review after review approval, bot review posting), `tests/test_worker_v2.py`
-⚬ EDITED (additive, from wave 4): `src/foreman_inator/tickets/prompt.py`: a kickback-triggered attempt that fails checks must get a retry prompt with both the note and the check output.
-Approach: replace v1's straight line with: route (#15) → write → verify → escalation (#16) → AI review (#17) → PR ready only on approval or handover → your review → escalation again. Wire spend (#18) into the proxy, locks (#19), metrics page + summary (#20). Remove the v1 "ready immediately" flag.
-Verify:
-⚬ Scenario tests against fakes for every row of the lifecycle diagram, including two AI kickbacks → writer escalates, tier 3 failure → handed to user.
-⚬ PR is never marked ready before an approve verdict or handover (invariant 7a); non-vacuous: mark ready early, test fails.
-Live (user): one week on 1–2 real repos. Then read the metrics page: share solved locally, cost per accepted ticket. On a public repo, run this week only after #40 (sandbox) is built.
-Deviations:
 
 ### Hardening — gaps found in review (wave 6b)
 
@@ -477,3 +468,38 @@ Idea: `cloud = false` for a repo: escalation stops at tier 2 and flags the user,
 #50 — Split a large issue into smaller tickets [ ] · Added: 2026-11-23 · Source: assistant (gap review)
 Why: an issue classified `large` goes straight to tier 3 as one attempt. Nothing breaks it into pieces a local model could do, which is the work the v1 goal (replace Max usage with local models) most needs.
 Idea: for `large`, a tier 3 model proposes sub-issues in a comment; the user approves by labeling them; each runs as a normal ticket. No sub-issue is created without the user (same consent idea as invariant 7b).
+
+### Unscheduled (user request, 2026-11-23)
+
+#51 — Repo profiles: per-repo `writer` and `review` settings [ ]
+Wave: _ (proposed: its own wave after 6b) · Agent: _ · Added: 2026-11-23 · Source: user
+Ask: "a setting per repo that prioritizes speed over cost saving and correctness over cost … personal project can take a lot of time and have bugs but cost little", and "sometimes i build prototypes and i want speed to be most important minor bugs dont matter".
+Why: the retry and kickback limits are module constants (`routing/escalation.py:75-79`), the router's pick is used as is, and AI review is the same for every repo. `repo_settings` holds only the verify command.
+DECISIONS (assistant, 2026-11-23; the user approved the two settings, `review = off` and the four presets, and can overturn the rest):
+1. Two settings per repo, not three sliders: cost is what the other two are bought with. `writer` = `thrifty` | `normal` | `fast`. `review` = `off` | `light` | `normal` | `strict`. No setting means `normal` + `normal`, which must behave exactly as the code does today.
+2. `writer`: `thrifty` allows 2 retries on a tier before moving up (3 check attempts) and makes a cloud writer attempt wait for approval. `fast` starts one tier above the router's pick (capped at the top tier) and moves up on the first failed check. User-kickback rules are the same in all three.
+3. `review`: `off` takes the existing `review:skip` path (checks pass → PR marked ready). `light` runs review checks 1–3 (tests, coverage, revert) and gives its verdict from hard findings alone: no run-app, no model call. `strict` ignores `review:skip` and moves the writer up on the first AI kickback.
+4. Presets: `prototype` = fast + off · `personal` = thrifty + light · `default` = normal + normal · `production` = fast + strict.
+5. Stored in `repo_settings` (`writer_mode`, `review_mode`), set by `fman repo set-profile <repo> <preset>` or `--writer` / `--review`, shown by `fman status` and in the PR description. Same home as `fman repo set-verify`; #49 (`cloud = false`) and #45 (install command) should use it too.
+6. A `tier:N` label is never shifted. The shift is applied after the router's guess; `route_reason` records both ("profile fast: tier 1 → 2"), and every attempt records `writer_mode` and `review_mode`. #23 must learn from the router's own pick, not the shifted start, and #20's metrics can split by mode.
+7. Exploration rate per mode (thrifty 25%, normal 10%, fast 0%) is defined here and read by #23 (`routing/explore.py`, wave 8); nothing explores until #23 is built.
+8. No per-repo budget in this item. The global daily and monthly caps apply to every profile. `thrifty`'s approval reuses the refusal and `approve` path in `spend.py` with its own reason.
+9. Invariants: every mode keeps a finite attempt bound (7e); `light` and `off` run no model reviewer, so 7f is not in play; `off` marks the PR ready with no review, as `review:skip` already does.
+SPEC change needed: "Routing and escalation" gains "Repo profiles" and `attempts` gains `writer_mode, review_mode`. Both are already in SPEC.md (2026-11-23); the Claude doc, the source of truth, still needs them.
+Files:
+⚬ OWNED: `src/foreman_inator/routing/profile.py`, `tests/test_profile.py`, one migration with the next free number when this is built (002 and 003 are claimed by #41 and #43)
+⚬ EDITED (additive, earlier waves): `src/foreman_inator/routing/escalation.py` (limits passed in; today's constants stay as the defaults), `src/foreman_inator/review/reviewer.py` (a `depth` argument on `review_change`), `src/foreman_inator/db/store.py` (`RepoSettings` fields, `set_profile`, the two attempt columns), `src/foreman_inator/spend.py` (the approval reason)
+⚬ Do NOT touch: `cli.py`, `worker.py`, `pr/publisher.py` (rule 9: the runner wires them at close).
+Scheduling: `store.py` and the migrations belong to wave 6b slot B, and the wiring needs #21's loop, so this runs after 6b. Because `normal` is the default and equals today's behaviour, #21 needs no change to be built first.
+Approach: `profile.py` is pure: `Profile(writer, review)`, `PRESETS`, `limits_for(profile) -> Limits` (check attempts, user and AI kickback limits, start shift, explore rate, cloud approval), `shift_start(tier, ladder, limits)`, `review_plan(profile)` (off | hard checks only | full; whether the skip label counts). `make_policy(ladder, limits=...)`, `next_step` and `attempt_bound` take `Limits`. Runner at close: `fman repo set-profile`, the profile line in `fman status` and the PR description, and three call sites in `worker.py` (route, policy, review). Fallback if `light` can't reuse the reviewer cleanly: `light` calls the check functions in `review/checks.py` directly and builds the verdict in `profile.py`'s caller.
+Verify:
+⚬ `default` gives the same decision as today on every existing escalation test, and `attempt_bound(4)` is unchanged.
+⚬ `fast`: tier 1 pick starts on tier 2, tier 3 stays 3, a `tier:N` label is not shifted, the first failed check escalates.
+⚬ `thrifty`: three failed checks before moving up; a cloud writer attempt is refused until approved.
+⚬ For every `writer` × `review` pair, any history ends with the user within `attempt_bound` (invariant 7e).
+⚬ `off`: no review row, no model call, PR ready. `light`: the fake reviewer model is called 0 times and a hard finding still gives `request_changes`. `strict`: `review:skip` is ignored and one AI kickback escalates.
+⚬ `set_profile` round-trips through the store; an unknown preset is rejected with the valid names; an attempt row records both modes.
+⚬ pytest + ruff gate (rule 8).
+⚬ Non-vacuous: make `limits_for(fast)` return the default limits, the `fast` tests fail; let `light` call the model, the zero-calls test fails.
+Live (user): set a toy repo to `prototype` and label 2 issues: both PRs arrive ready with no bot review. Set it to `production`, label one issue with `review:skip`: the review still runs.
+Deviations:

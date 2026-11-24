@@ -1,7 +1,8 @@
 """Command-line entry point for `foreman-inator` and its alias `fman`.
 
 Commands: ``setup`` (#8), ``config set-key`` (#2), ``run`` and ``status`` and
-``repo set-verify`` (#14). Later waves add ``@app.command()`` functions here.
+``repo set-verify`` (#14), ``metrics`` and ``approve-spend`` (#21). Later waves add
+``@app.command()`` functions here.
 
 The callback below keeps `app` a multi-command group, so adding commands
 never changes how `--version` works.
@@ -80,6 +81,7 @@ def status_command(
     ] = 5,
 ) -> None:
     """Tickets by column with their current attempt, flags and PR numbers (read-only)."""
+    from foreman_inator import config as config_mod
     from foreman_inator import paths
     from foreman_inator.db.store import Store
     from foreman_inator.worker_status import render_status
@@ -88,8 +90,60 @@ def status_command(
     if not db.exists():
         typer.echo("No tickets yet (the worker has not created its database).")
         return
+    try:
+        cfg = config_mod.load()
+    except config_mod.ConfigError as exc:
+        typer.echo(f"(config.toml not readable, spend line skipped: {exc})", err=True)
+        cfg = None
     with Store(db, read_only=True) as store:
-        typer.echo(render_status(store, closed_limit=closed))
+        typer.echo(render_status(store, closed_limit=closed, config=cfg))
+
+
+@app.command("metrics")
+def metrics_command(
+    port: Annotated[int, typer.Option("--port", help="Local port (127.0.0.1 only).")] = 8642,
+) -> None:
+    """Serve the metrics page on 127.0.0.1 (read-only; Ctrl-C stops it)."""
+    from foreman_inator import paths
+    from foreman_inator.metrics.web import metrics_url, serve
+
+    if not 0 < port < 65536:
+        raise typer.BadParameter("port must be between 1 and 65535")
+    db = paths.db_path()
+    if not db.exists():
+        typer.echo("No tickets yet (the worker has not created its database).")
+        raise typer.Exit(1)
+    typer.echo(f"Metrics on {metrics_url('127.0.0.1', port)} (Ctrl-C stops)")
+    serve(db, port=port)
+
+
+@app.command("approve-spend")
+def approve_spend_command(
+    ticket: Annotated[int, typer.Argument(help="Ticket id (from `fman status`).")],
+) -> None:
+    """Allow one more cloud attempt (and its review) of TICKET past the spend caps."""
+    from foreman_inator import config as config_mod
+    from foreman_inator import paths
+    from foreman_inator.db.store import Store
+    from foreman_inator.spend import Spend, SpendError
+
+    db = paths.db_path()
+    if not db.exists():
+        typer.echo("No tickets yet (the worker has not created its database).", err=True)
+        raise typer.Exit(1)
+    cfg = config_mod.load()
+    with Store(db) as store:
+        spend = Spend(store, cfg)
+        try:
+            approval = spend.approve(ticket)
+        except SpendError as exc:
+            typer.echo(f"Not approved: {exc}", err=True)
+            raise typer.Exit(1) from exc
+        usd = spend.approval_usd
+    typer.echo(
+        f"Approved (approval #{approval.id}): ticket #{ticket} may spend up to ${usd:.2f} of "
+        "cloud calls past the caps on its next attempt. The worker resumes it on its next pass."
+    )
 
 
 repo_app = typer.Typer(help="Per-repo settings kept in the worker's database.")

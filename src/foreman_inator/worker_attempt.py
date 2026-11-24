@@ -1,26 +1,34 @@
-"""The two jobs of worker loop v1 (todo #14): one attempt, and publishing its PR.
+"""Routing, one attempt, and publishing its draft PR (todo #21; v1 was #14).
 
-Split out of ``worker.py`` to keep each file readable; ``AttemptSteps`` is mixed into
-``Worker`` and uses its collaborators (``self.store``, ``self.worktrees``, ``self.driver``,
-``self.proxy``, ``self.publisher`` ...) and its transition helpers (``_commit``, ``_event``,
-``_run_actions``).
+``AttemptSteps`` is mixed into ``Worker`` and uses its collaborators and transition
+helpers. No store transaction is held across slow work.
 
-Attempt (``attempt_job``), in order, with no store transaction held across slow work:
+Route (``route_job``): the ``before_route`` seam (#44), then ``routing.route`` (#15)
+inside the ticket's trace (it opens its own ``route`` span), stored as ``routed_tier`` +
+``route_reason`` unless a ``tier:N`` label routed the ticket meanwhile. Then, in the same
+job, the first attempt if the queue allows it.
 
-1. ask the policy what comes next (retry, kickback, or hand to the user);
-2. fetch the mirror and create the attempt's worktree on ``fman/issue-<n>/a<k>``,
-   starting from the previous attempt's work when there is one;
-3. find the verify command (the repo's saved override first); none → flag once;
-4. ``AttemptStarted`` + the attempt row (base commit, branch, worktree) in one
-   transaction, then the writer prompt and ``variant_id``;
-5. inside ``attempt_span`` and a ``Recorder``: the OpenCode run, then the worker's own
-   commit, the diff stats, and verify inside ``verify_span``;
-6. finish the attempt row (diff, tests, seconds, outcome, verify output path on
-   failure); ``ChecksFailed`` → the policy, or publish.
+Attempt (``attempt_job``), in order:
 
-Publish (``publish_job``): force-push the attempt's branch to the PR head
-(``pr_head_branch``), then the actions of ``ChecksPassed`` (draft PR, then v1's ready),
-and only then the move to ``testing``. Re-running it after a crash is harmless.
+1. escalation decides from the stored rows (``Worker.policy_for``): a step, a hand-over,
+   or nothing;
+2. the writer is ``step.model`` (``config.model``), so tier 3's GLM → Claude step runs
+   Claude; a cloud writer at the spend cap pauses the ticket before anything runs;
+3. under the repo's mirror lock: fetch, and the attempt's worktree on
+   ``fman/issue-<n>/a<k>``, starting from the previous attempt's work when there is one;
+4. find the verify command (the repo's saved override first); none → hand over once;
+5. ``AttemptStarted`` + the attempt row in one transaction, then the writer prompt;
+6. inside ``attempt_span`` and a ``Recorder``: ``_launch_writer`` (OpenCode), the worker's
+   own commit, the diff, ``_launch_verify`` inside ``verify_span``;
+7. a spend refusal during the run → the attempt is set aside (uncounted) and the ticket
+   pauses; otherwise the attempt's diff widens its file locks (#19), and if another
+   ticket holds one of those files the attempt waits before publishing;
+8. ``ChecksFailed`` → escalation on the next pass, or publish → AI review.
+
+Publish (``publish_job_for``): force-push the attempt's branch to the PR head
+(``pr_head_branch``), open or update the draft PR, move to ``testing``, then the AI review
+(or the ``review:skip`` hand-over) in the same job. Re-running it after a crash is
+harmless: the push is the same commit and the publisher adopts the open PR.
 """
 
 from __future__ import annotations
@@ -30,9 +38,11 @@ import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from foreman_inator import tracing
+from foreman_inator import routing, tracing
+from foreman_inator.config import ConfigError, ModelEndpoint
 from foreman_inator.db.store import Attempt, Ticket
 from foreman_inator.pr.publisher import PublishError, pr_head_branch
+from foreman_inator.routing import escalation as esc
 from foreman_inator.runner import verify as verify_mod
 from foreman_inator.runner.worktree import RepoMirror, Worktree, WorktreeError
 from foreman_inator.tickets import lifecycle
@@ -42,12 +52,12 @@ from foreman_inator.worker_actions import Ctx
 from foreman_inator.worker_policy import (
     FLAG_NO_VERIFY,
     FLAG_PUBLISH_FAILED,
-    HandToUser,
+    published_attempt,
     start_from,
 )
 
 if TYPE_CHECKING:
-    from foreman_inator.worker import Job
+    from foreman_inator.worker_queue import Job
 
 log = logging.getLogger("foreman_inator.worker")
 
@@ -74,42 +84,115 @@ class AttemptSteps:
     # Provided by Worker.
     store: Any
     config: Any
-    worktrees: Any
     driver: Any
     proxy: Any
     publisher: Any
     api: Any
+    spend: Any
+    locks: Any
     recordings_dir: Path
     traces_dir: Path
     attempt_timeout: float | None
     verify_timeout: float
 
+    # ------------------------------------------------------------------ seams
+
+    def before_route(self, ticket: Ticket) -> bool:
+        """Seam for #44 (clarifying questions): called before a ticket is routed. Return
+        False to park it (e.g. a ``needs-info`` question was posted); the route job is
+        derived again on the next pass. No behaviour yet: always route."""
+        return True
+
+    def _launch_writer(self, **kw: Any) -> Any:
+        """Process launch point 1 of 3 (#40's sandbox): the OpenCode session."""
+        return self.driver.run(**kw)
+
+    def _launch_verify(self, cmd: verify_mod.VerifyCommand, cwd: Path, **kw: Any) -> Any:
+        """Process launch point 2 of 3 (#40's sandbox): the repo's verify command."""
+        return verify_mod.run(cmd, cwd, **kw)
+
+    # ------------------------------------------------------------------ route
+
+    def route_job(self, job: Job, cancel: threading.Event) -> None:
+        t = self.store.get_ticket(job.ticket_id)
+        if t.column != "todo" or t.flag_reason or t.routed_tier is not None:
+            return
+        if not self.before_route(t):
+            log.info("ticket %d: parked before routing", t.id)
+            return
+        t = self._route_ticket(t)
+        if cancel.is_set() or self.stopping:  # type: ignore[attr-defined]
+            return
+        if self.job_for(t) == "attempt":  # type: ignore[attr-defined]
+            self.attempt_job(job, cancel)  # carry the ticket on in the same job
+
+    def _route_ticket(self, t: Ticket, *, override: routing.Override | None = None) -> Ticket:
+        """Route ``t`` (#15) and store the pick. An override makes no model call (it runs
+        inside a poll transaction); a classification does, so it runs in a job and keeps
+        a pick that a ``tier:N`` label stored meanwhile."""
+        with self._trace(t):  # type: ignore[attr-defined]
+            r = routing.route(
+                t,
+                config=self.config,
+                proxy=None if override is not None else self.proxy,
+                override=override,
+                timeout=float(self.config.router_timeout_seconds),
+            )
+        with self.store.transaction():
+            cur = self.store.get_ticket(t.id)
+            if override is None and cur.routed_tier is not None:
+                return cur
+            cur = self.store.update_ticket(t.id, routed_tier=r.tier, route_reason=r.reason)
+        log.info("ticket %d: routed to tier %d (%s)", t.id, r.tier, r.source)
+        return cur
+
     # ------------------------------------------------------------------ attempt
+
+    def _writer_endpoint(self, step: esc.Retry) -> ModelEndpoint:
+        """The step's model (#16 picks the rung, e.g. tier 3's Claude after GLM)."""
+        name = getattr(step, "model", None)
+        if name:
+            try:
+                return self.config.model(name)
+            except ConfigError:
+                log.warning("model %r is no longer configured; using tier %d", name, step.tier)
+        return self.config.models_for_tier(step.tier)[0]
 
     def attempt_job(self, job: Job, cancel: threading.Event) -> None:
         ticket = self.store.get_ticket(job.ticket_id)
         if ticket.column not in ("todo", "in_progress") or ticket.flag_reason:
             return
-        attempts = self.store.list_attempts(ticket.id)
-        step = self.policy(attempts)  # type: ignore[attr-defined]
+        step = self.policy_for(ticket)  # type: ignore[attr-defined]
         if step is None:
             return
-        if isinstance(step, HandToUser):
-            self._event(ticket.id, lifecycle.HandedToUser(ticket.id, step.reason))  # type: ignore[attr-defined]
+        if isinstance(step, esc.HandToUser):
+            counted = self.history(ticket).attempts  # type: ignore[attr-defined]
+            self._event(  # type: ignore[attr-defined]
+                ticket.id,
+                lifecycle.HandedToUser(ticket.id, step.reason),
+                mark_ready=bool(step.mark_ready and ticket.pr_number is not None),
+                attempt=published_attempt(counted),
+            )
             return
-        endpoint = self.config.models_for_tier(step.tier)[0]
-        mirror = self.worktrees.mirror(ticket.repo, self.clone_url(ticket.repo))  # type: ignore[attr-defined]
+        endpoint = self._writer_endpoint(step)
+        if endpoint.is_cloud:
+            refusal = self.spend.blocked(ticket.id)
+            if refusal is not None:
+                self.pause_for_spend(ticket, refusal)  # type: ignore[attr-defined]
+                return
+        mirror = self._mirror(ticket.repo)  # type: ignore[attr-defined]
         token = self._token(ticket.repo)
         mirror.ensure(token)
         _write_excludes(mirror)
-        ordinal = len(attempts) + 1
+        ordinal = len(self.store.list_attempts(ticket.id)) + 1
+        counted = list(self.history(ticket).attempts)  # type: ignore[attr-defined]
         wt = mirror.create(
             ticket.base_branch,
             ticket.issue_number,
             ordinal,
             token=token,
             fetch=False,
-            start_point=_start_point(mirror, ticket, attempts),
+            start_point=_start_point(mirror, ticket, counted),
         )
         _remove_old_worktrees(mirror, ticket, ordinal)
         settings = self.store.get_repo_settings(ticket.repo)
@@ -129,7 +212,7 @@ class AttemptSteps:
             att = self.store.add_attempt(
                 ticket.id,
                 model=endpoint.name,
-                tier=step.tier,
+                tier=endpoint.tier,
                 trigger=step.trigger,
                 worktree=str(wt.path),
                 branch=wt.branch,
@@ -137,12 +220,13 @@ class AttemptSteps:
             )
         ticket = self.store.get_ticket(ticket.id)
         log.info(
-            "ticket %d: attempt %d started (%s, tier %d, %s)",
+            "ticket %d: attempt %d started (%s, tier %d, %s): %s",
             ticket.id,
             att.id,
             step.trigger,
-            step.tier,
+            endpoint.tier,
             endpoint.name,
+            step.reason,
         )
         try:
             att, passed, vr, diff = self._run_attempt(ticket, att, wt, endpoint, cmd, cancel)
@@ -153,10 +237,29 @@ class AttemptSteps:
             if self.store.get_attempt(att.id).ended_at is None:
                 self.store.finish_attempt(att.id, "superseded")
             raise
-        if passed:
-            self.publish_job_for(ticket.id, att, verify=vr, diff=diff, cancel=cancel)
-        else:
+        refusal = self.spend_refusal(att.id)  # type: ignore[attr-defined]
+        if refusal is not None:
+            self.set_aside(ticket, att, "a cloud call was refused at the spend cap")  # type: ignore[attr-defined]
+            self.pause_for_spend(ticket, refusal)  # type: ignore[attr-defined]
+            return
+        widened = self.locks.widen(ticket, wt.changed_files())
+        if not passed:
             self._event(ticket.id, ChecksFailed(ticket.id))  # type: ignore[attr-defined]
+            return
+        if ticket.id in widened.yielded:
+            self.set_aside(ticket, att, "it yielded its file locks to break a deadlock")  # type: ignore[attr-defined]
+            return
+        if not widened.ok:
+            self.set_lock_wait(ticket, att, widened.blockers)  # type: ignore[attr-defined]
+            log.info(
+                "ticket %d: attempt %d passed but changed files held by ticket(s) %s; "
+                "publishing when they are free",
+                ticket.id,
+                att.id,
+                ", ".join(f"#{b}" for b in widened.blockers),
+            )
+            return
+        self.publish_job_for(ticket.id, att, verify=vr, diff=diff, cancel=cancel)
 
     def _run_attempt(
         self,
@@ -196,7 +299,7 @@ class AttemptSteps:
                 tier=att.tier,
             ) as rec,
         ):
-            result = self.driver.run(
+            result = self._launch_writer(
                 attempt_id=att.id,
                 worktree=wt,
                 prompt=prompt.text,
@@ -221,7 +324,7 @@ class AttemptSteps:
                 passed = False
             else:
                 with tracing.verify_span(cmd.display) as vspan:
-                    vr = verify_mod.run(
+                    vr = self._launch_verify(
                         cmd, wt.path, timeout=self.verify_timeout, output_path=out_path,
                         cancel=cancel,
                     )  # fmt: skip
@@ -270,9 +373,16 @@ class AttemptSteps:
     # ------------------------------------------------------------------ publish
 
     def publish_job(self, job: Job, cancel: threading.Event) -> None:
-        """Resume publishing an attempt that passed its checks (after a crash or error)."""
-        attempts = self.store.list_attempts(job.ticket_id)
-        att = attempts[-1]
+        """Publish an attempt that passed its checks but has not been published (after a
+        crash, an error, or a wait on file locks)."""
+        ticket = self.store.get_ticket(job.ticket_id)
+        att = self.store.list_attempts(ticket.id)[-1]
+        merged = self.blocker_merged(ticket, att)  # type: ignore[attr-defined]
+        if merged is not None:
+            self.set_aside(  # type: ignore[attr-defined]
+                ticket, att, f"ticket #{merged} merged changes to its files; starting over"
+            )
+            return
         self.publish_job_for(job.ticket_id, att, cancel=cancel)
 
     def publish_job_for(
@@ -285,15 +395,12 @@ class AttemptSteps:
         cancel: threading.Event | None = None,
     ) -> None:
         ticket = self.store.get_ticket(ticket_id)
-        event = ChecksPassed(ticket.id)
-        try:
-            plan = lifecycle.apply(ticket.column, event)  # pure: what to do, committed below
-        except lifecycle.IllegalTransition:
+        if ticket.column != "in_progress":
             log.info("ticket %d: no longer in progress; not publishing", ticket.id)
             return
         if cancel is not None and cancel.is_set():
             return
-        mirror = self.worktrees.mirror(ticket.repo, self.clone_url(ticket.repo))  # type: ignore[attr-defined]
+        mirror = self._mirror(ticket.repo)  # type: ignore[attr-defined]
         ordinal = [a.id for a in self.store.list_attempts(ticket.id)].index(att.id) + 1
         try:
             wt = mirror.open(ticket.issue_number, ordinal)
@@ -307,21 +414,27 @@ class AttemptSteps:
             tracing.github_span("branch_pushed", attempt_id=att.id),
         ):
             wt.push(self._token(ticket.repo), remote_branch=head, force=True)
-        ctx = self._ctx(ticket, event, att, verify, diff or wt.diff_stats())
+        event = ChecksPassed(ticket.id, review_skip=self.review_skipped(ticket))
+        plan = lifecycle.apply(ticket.column, event)
+        ctx = Ctx(ticket, event, attempt=att, verify=verify, diff=diff or wt.diff_stats())
+        ctx.cancel = cancel
         try:
-            self._run_actions(ctx, plan.actions)  # type: ignore[attr-defined]
+            self._run_actions(ctx, plan.actions[:1])  # type: ignore[attr-defined]
         except PublishError as exc:
             self._event(  # type: ignore[attr-defined]
                 ticket.id, lifecycle.HandedToUser(ticket.id, f"{FLAG_PUBLISH_FAILED}: {exc}")
             )
             return
-        if not ctx.stop:  # the PR is open (and, in v1, ready): now it is in testing
-            self._commit(ticket.id, event)  # type: ignore[attr-defined]
-        else:  # a person closed or merged the PR: wait for the poller to say so
+        if ctx.stop:  # a person closed or merged the PR: wait for the poller to say so
             self.hold_repo(ticket.repo)  # type: ignore[attr-defined]
+            return
+        # The draft PR is open: now the ticket is in testing (the PR awaits review).
+        if self._commit(ticket.id, event) is None:  # type: ignore[attr-defined]
+            return
+        ctx.ticket = self.store.get_ticket(ticket.id)
+        self._run_actions(ctx, plan.actions[1:])  # type: ignore[attr-defined]  # review / skip
 
-    def _ctx(self, ticket: Ticket, event: Any, att: Attempt, verify: Any, diff: Any) -> Ctx:
-        return Ctx(ticket, event, attempt=att, verify=verify, diff=diff)
+    # ------------------------------------------------------------------ helpers
 
     def _token(self, repo: str) -> str:
         token_for = getattr(self.api, "token_for", None)
@@ -355,8 +468,8 @@ def _branch_exists(mirror: RepoMirror, ref: str) -> bool:
 
 
 def _start_point(mirror: RepoMirror, ticket: Ticket, attempts: list[Attempt]) -> str | None:
-    """Build on the previous attempt's committed work (its local branch), else on the PR
-    head on GitHub, else start fresh from the base branch."""
+    """Build on the previous counted attempt's committed work (its local branch), else on
+    the PR head on GitHub, else start fresh from the base branch."""
     prev = start_from(attempts)
     if prev is not None and prev.branch:
         ref = f"refs/heads/{prev.branch}"

@@ -1,10 +1,14 @@
-"""``fman run``: build the worker's real collaborators from config and paths (todo #14).
+"""``fman run``: build the worker's real collaborators from config and paths (#14, #21).
 
 GitHub clients (one per App installation; several are routed by repo), the store, the
-local traces, the model proxy on 127.0.0.1 (a free port), the OpenCode driver and the
-worktree manager. SIGINT and SIGTERM stop the worker cleanly (exit 0). Logs go to stdout,
-which the launchd agent writes to ``~/.foreman-inator/logs/``; one line per state change,
-never tokens, keys or file contents.
+local traces, the spend caps (#18) and the model proxy on 127.0.0.1 (a free port) with
+the caps as its spend hook (same store, same ``Spend`` instance the worker asks), the
+OpenCode driver and the worktree manager. Before the first tick, one ``opencode serve``
+is started and stopped (``warm_up_opencode``) so parallel attempts never race on
+OpenCode's first plugin install in the shared state directory. SIGINT and SIGTERM stop
+the worker cleanly (exit 0). Logs go to stdout, which the launchd agent writes to
+``~/.foreman-inator/logs/``; one line per state change, never tokens, keys or file
+contents.
 """
 
 from __future__ import annotations
@@ -19,6 +23,7 @@ from foreman_inator import tracing
 from foreman_inator.config import Config
 from foreman_inator.db.store import Store
 from foreman_inator.runner.worktree import WorktreeManager
+from foreman_inator.spend import Spend
 from foreman_inator.worker import Worker
 
 log = logging.getLogger("foreman_inator.worker")
@@ -84,6 +89,44 @@ def install_signal_handlers(worker: Worker) -> dict[int, Any]:
     return old
 
 
+def warm_up_opencode(driver: Any, cfg: Config, proxy: Any) -> bool:
+    """Start one ``opencode serve`` in a throwaway directory, wait until it listens, stop
+    it. OpenCode installs its plugins into the shared state directory on its first start;
+    two first starts at once can race. Never raises: a failure is only logged (the
+    first real attempt then reports the problem)."""
+    import secrets
+    import shutil
+    import tempfile
+
+    from foreman_inator.runner.opencode import OpenCodeServer, build_config
+
+    state = driver.state_root / "attempts" / f"warm-up-{secrets.token_hex(3)}"
+    try:
+        with tempfile.TemporaryDirectory(prefix="fman-warmup-") as tmp:
+            work = Path(tmp) / "work"
+            work.mkdir()
+            server = OpenCodeServer(
+                work,
+                config=build_config(cfg.models[0], proxy.base_url(0)),
+                attempt_dir=state,
+                shared_dir=driver.state_root / "shared",
+                opencode_bin=driver.opencode_bin,
+                startup_timeout=driver.startup_timeout,
+                base_env=driver.base_env,
+            )
+            try:
+                server.start()
+            finally:
+                server.stop()
+        log.info("opencode warm-up done")
+        return True
+    except Exception as exc:
+        log.warning("opencode warm-up failed: %s: %s", type(exc).__name__, exc)
+        return False
+    finally:
+        shutil.rmtree(state, ignore_errors=True)
+
+
 def run_worker(*, once: bool = False) -> int:
     """``fman run``: build the real collaborators and work until stopped. Exit code."""
     from foreman_inator import config as config_mod
@@ -106,7 +149,11 @@ def run_worker(*, once: bool = False) -> int:
     tracing.init(traces_dir=paths.traces_dir())
     api = build_github(cfg, key_path)
     bot = f"{cfg.app_slug}[bot]" if cfg.app_slug else "foreman-inator[bot]"
-    proxy = ModelProxy(cfg, store=store).start()
+    spend = Spend(store, cfg)
+    proxy = ModelProxy(cfg, store=store, spend_hook=spend.hook).start()
+    driver = OpenCodeDriver()
+    if not once:
+        warm_up_opencode(driver, cfg, proxy)
     worker = Worker(
         api=api,
         store=store,
@@ -115,8 +162,9 @@ def run_worker(*, once: bool = False) -> int:
             paths.worktrees_dir(),
             identity=GitIdentity(bot, f"{bot}@users.noreply.github.com"),
         ),
-        driver=OpenCodeDriver(),
+        driver=driver,
         proxy=proxy,
+        spend=spend,
         recordings_dir=paths.recordings_dir(),
         traces_dir=paths.traces_dir(),
     )
@@ -137,4 +185,4 @@ def run_worker(*, once: bool = False) -> int:
     return 0
 
 
-__all__ = ["build_github", "install_signal_handlers", "run_worker"]
+__all__ = ["build_github", "install_signal_handlers", "run_worker", "warm_up_opencode"]

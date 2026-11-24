@@ -17,6 +17,9 @@ Controls:
     stream_delay              seconds between streamed chunks (slow streams)
     hold_stream               a threading.Event; streams pause after their first chunk
                               until it is set (for disconnect tests; any thread may set it)
+    responder                 optional ``fn(request_json) -> str | Reply | None``; a non-None
+                              answer is the chat reply (before the queue). Lets one fake
+                              serve the router, the writer and the reviewer at once (#21).
 Inspection:
     requests                  every request: FakeRequest(method, url, headers, json)
     sent                      the exact response bytes of each answered request
@@ -62,6 +65,8 @@ class FakeModels:
         self.stream_delay = 0.0
         self.hold_stream: threading.Event | None = None
         self.stream_closed = 0
+        self.responder: Any = None
+        self._lock = threading.Lock()
         self.transport = httpx.MockTransport(self.handle)
 
     # ------------------------------------------------------------------ controls
@@ -179,7 +184,7 @@ class FakeModels:
                 }
             )
         if path.endswith("/chat/completions") or path.endswith("/completions"):
-            reply = self.replies.popleft() if self.replies else Reply(f"hello from {model}")
+            reply = self._reply_for(body, model)
             if body.get("stream"):
                 include = bool((body.get("stream_options") or {}).get("include_usage"))
                 chunks = self.stream_chunks(reply, model, include)
@@ -191,6 +196,14 @@ class FakeModels:
                 )
             return self._json(self.chat_body(reply, model))
         return self._json({"error": {"message": f"no route {path}"}}, status=404)
+
+    def _reply_for(self, body: Any, model: str) -> Reply:
+        if self.responder is not None:
+            with self._lock:
+                answer = self.responder(body)
+            if answer is not None:
+                return answer if isinstance(answer, Reply) else Reply(str(answer))
+        return self.replies.popleft() if self.replies else Reply(f"hello from {model}")
 
     def _json(self, obj: Any, status: int = 200) -> httpx.Response:
         data = json.dumps(obj, separators=(",", ":")).encode()
