@@ -200,7 +200,7 @@ def test_unknown_classifier_is_refused_by_the_proxy(fake, proxy):
 
 def test_timeout_falls_back_quickly(fake):
     async def slow(request: httpx.Request) -> httpx.Response:
-        await asyncio.sleep(1.5)
+        await asyncio.sleep(3.0)  # the reply would come long after the 0.3 s timeout
         return await fake.handle(request)
 
     p = _proxy(httpx.MockTransport(slow)).start()
@@ -212,7 +212,7 @@ def test_timeout_falls_back_quickly(fake):
         p.stop()
     assert (r.tier, r.source) == (2, "fallback")
     assert "timed out" in r.reason
-    assert elapsed < 1.5
+    assert elapsed < 2.5  # gave up at the timeout; margin for a loaded (parallel) run
 
 
 def test_proxy_down_falls_back():

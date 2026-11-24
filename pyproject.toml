@@ -29,6 +29,7 @@ fman = "foreman_inator.cli:app"
 dev = [
     "pytest>=8",
     "pytest-timeout>=2.3",
+    "pytest-xdist>=3.8.0",
     "ruff>=0.6",
 ]
 
@@ -38,7 +39,11 @@ build-backend = "uv_build"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-ra"
+# Parallel by default (pytest-xdist): one worker per CPU core. On a 16-core Mac
+# -n 8..16 all run the suite in ~60-75 s (serial: ~7-8 min). For a serial run to
+# debug, pass `-n 0` (or `-p no:xdist`: tests/conftest.py then accepts and ignores
+# this `--numprocesses`, which is spelled long so a conftest may define it).
+addopts = "-ra --numprocesses=auto"
 norecursedirs = ["fixtures", "recordings"]
 timeout = 60
 
