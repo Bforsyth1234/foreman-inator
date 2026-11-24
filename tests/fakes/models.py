@@ -13,6 +13,10 @@ Controls:
     queue_reply(text, tool_calls=, tokens=, finish_reason=, usage_in_stream=)
                               the next chat reply (default: "hello from <model>")
     fail_next(status, body)   the next request gets this HTTP error
+    refuse_param(name, times=1, status=400, body=None)
+                              requests whose JSON carries ``name`` get this plain JSON error
+                              (default: Anthropic's documented "`name` is deprecated for this
+                              model." 400), streaming or not, ``times`` times (None: always)
     raise_next(exc)           the next request raises (e.g. httpx.ConnectError)
     stream_delay              seconds between streamed chunks (slow streams)
     hold_stream               a threading.Event; streams pause after their first chunk
@@ -66,6 +70,7 @@ class FakeModels:
         self.hold_stream: threading.Event | None = None
         self.stream_closed = 0
         self.responder: Any = None
+        self.refusals: dict[str, list[Any]] = {}  # param -> [times left or None, status, body]
         self._lock = threading.Lock()
         self.transport = httpx.MockTransport(self.handle)
 
@@ -87,6 +92,30 @@ class FakeModels:
 
     def raise_next(self, exc: Exception) -> None:
         self.raises.append(exc)
+
+    def refuse_param(
+        self, name: str, *, times: int | None = 1, status: int = 400, body: Any = None
+    ) -> None:
+        if body is None:
+            body = {
+                "error": {
+                    "code": "invalid_request_error",
+                    "message": f"`{name}` is deprecated for this model.",
+                    "type": "invalid_request_error",
+                    "param": None,
+                }
+            }
+        self.refusals[name] = [times, status, body]
+
+    def _refusal_for(self, body: Any) -> tuple[int, Any] | None:
+        if not isinstance(body, dict):
+            return None
+        for name, slot in self.refusals.items():
+            if name in body and (slot[0] is None or slot[0] > 0):
+                if slot[0] is not None:
+                    slot[0] -= 1
+                return slot[1], slot[2]
+        return None
 
     # ------------------------------------------------------------------ helpers for tests
 
@@ -158,8 +187,9 @@ class FakeModels:
         )
         if self.raises:
             raise self.raises.popleft()
-        if self.failures:
-            status, err = self.failures.popleft()
+        refusal = self._refusal_for(body)
+        if refusal is not None or self.failures:
+            status, err = refusal if refusal is not None else self.failures.popleft()
             data = json.dumps(err).encode()
             self.sent.append(data)
             return httpx.Response(

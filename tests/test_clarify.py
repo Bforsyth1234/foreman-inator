@@ -566,3 +566,10 @@ def test_disabled_makes_no_call_and_no_write(fake, proxy):
     n = gh.create_issue("me/toy", "Fix it", "It's broken.", labels=["agent"])
     assert MiniWorker(gh, proxy, enabled=False).before_route(FakeTicket(), n) is True
     assert fake.requests == [] and gh.writes == []
+
+
+def test_fallback_reason_keeps_the_provider_message(fake, proxy):
+    fake.fail_next(400, {"error": {"code": "invalid_request_error", "message": "context too long"}})
+    r = assess(FakeTicket(), config=CONFIG, proxy=proxy)
+    assert isinstance(r, Clear)
+    assert "HTTP 400 invalid_request_error: context too long" in r.reason

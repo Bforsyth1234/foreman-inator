@@ -58,6 +58,27 @@ and both cloud APIs support it). A client disconnect or upstream failure mid-str
 produces the span (error status ``incomplete: ...``) and a recording row
 (``stop_reason="incomplete"``), never an unhandled error.
 
+Refused sampling parameters: when an upstream answers 400 and the error clearly says a
+parameter the client sent is not supported or deprecated for this model (``error.param``
+with a refusal code or wording, or else the message naming exactly one sent parameter in
+backticks or quotes next to "deprecated"/"not supported"/...), and that parameter is on
+``DROPPABLE_PARAMS`` (sampling knobs only), the proxy resends once without it, at most
+``MAX_RESENDS`` times per call. The (base_url, upstream model) pair and parameter are
+remembered for the life of the process (`refused_params(ep)`), so later calls drop it up
+front; the first time a pair is learned is logged once. The refused try is not billed and
+not recorded: the call still has one spend estimate, one ``actual``, one span and one
+recorder row. Responses say what was dropped in ``x-fman-dropped-params``; the span has
+``llm.dropped_params`` and ``llm.resends``. A refusal arrives as a plain JSON 400 before any
+stream bytes, so streaming requests are resent the same way.
+
+Upstream errors: for any non-2xx answer the provider's message (``error.message``, or the
+body text) is scrubbed of the API key and anything shaped like an Authorization/x-api-key
+value, flattened to one line and cut to ``ERROR_TEXT_LIMIT`` characters; it is the span's
+``llm.error.message`` attribute and status description (``upstream HTTP <n>: <message>``)
+and the recorder row's ``raw_content`` (``{"type": "error", "text": ...}``, ``text`` stays
+empty). The error body goes to the client unchanged, except that our own API key, should
+the provider echo it, is replaced with ``[redacted]``.
+
 Running: `start()` runs uvicorn on a background thread, bound to 127.0.0.1 (port 0 picks a
 free port; `url` says which); `stop()` shuts it down. `proxy.app` is a plain ASGI app, so
 tests can drive it with ``httpx.ASGITransport`` and no socket. Upstreams are reached with
@@ -72,6 +93,7 @@ import contextvars
 import ipaddress
 import json
 import logging
+import re
 import secrets
 import socket
 import threading
@@ -182,6 +204,116 @@ def error_response(status: int, code: str, message: str, type_: str = "invalid_r
         {"error": {"message": message, "type": type_, "param": None, "code": code}},
         status_code=status,
     )
+
+
+# --------------------------------------------------------------------------- refused parameters
+
+#: Request parameters the proxy may drop and resend without when a model refuses them.
+#: Each only tunes how tokens are sampled; leaving it out makes the provider use its own
+#: default, and the request still asks the same thing with the same messages, tools and
+#: output budget:
+#:   temperature, top_p, top_k   sampling randomness (our callers send temperature 0 for
+#:                               repeatable local answers; a cloud default is still fine)
+#:   presence_penalty,           nudges against repeating tokens; no effect on what is
+#:   frequency_penalty           asked or on the response's shape
+#:   seed                        a best-effort reproducibility hint; dropping it loses only
+#:                               that hint
+#: Never here: model, messages, prompt, input, tools, tool_choice, max_tokens,
+#: max_completion_tokens, stop, n, response_format, logit_bias, logprobs, stream,
+#: stream_options, reasoning_effort: each changes what is asked, what comes back or what
+#: it may cost.
+DROPPABLE_PARAMS: frozenset[str] = frozenset(
+    {"temperature", "top_p", "top_k", "presence_penalty", "frequency_penalty", "seed"}
+)
+#: Hard cap on resends per call (each one drops a different parameter).
+MAX_RESENDS = 2
+#: Structured error codes that mean "this parameter is not accepted" (OpenAI's wording).
+_REFUSAL_CODES = frozenset({"unsupported_parameter", "unsupported_value"})
+#: Message wording that says a parameter is not accepted, as opposed to a bad value.
+_REFUSAL_WORDS = re.compile(
+    r"\b(?:deprecated|unsupported|not\s+supported|no\s+longer\s+supported|"
+    r"does\s+not\s+support|not\s+allowed|not\s+permitted|unrecognized|"
+    r"unknown\s+(?:parameter|field|argument))\b",
+    re.IGNORECASE,
+)
+#: A parameter named in a message: in backticks, single or double quotes.
+_QUOTED_NAME = re.compile(r"[`'\"]([A-Za-z_][A-Za-z0-9_.]*)[`'\"]")
+DROPPED_HEADER = "x-fman-dropped-params"
+ERROR_TEXT_LIMIT = 500
+
+
+def upstream_error_message(data: Any) -> str | None:
+    """The human message in an OpenAI-style (or Anthropic-style) error body, or None."""
+    if not isinstance(data, dict):
+        return None
+    err = data.get("error")
+    if isinstance(err, str) and err.strip():
+        return err
+    for holder in (err, data):
+        if isinstance(holder, dict):
+            for k in ("message", "detail"):
+                if isinstance(holder.get(k), str) and holder[k].strip():
+                    return holder[k]
+    return None
+
+
+def refused_param(status: int, data: Any, sent: dict[str, Any]) -> str | None:
+    """The one allow-listed parameter a 400 clearly says the model does not accept, or None.
+
+    Structured first: ``error.param`` naming an allow-listed parameter the request sent,
+    with a refusal code (``unsupported_parameter``/``unsupported_value``) or refusal
+    wording in the message. If ``error.param`` names anything else, nothing is dropped.
+    Fallback: the message names exactly one parameter the request sent, in backticks or
+    quotes, that parameter is allow-listed, and the message uses refusal wording
+    ("deprecated", "not supported", ...). A vague 400, a bad value ("must be between ...")
+    or a message naming several sent parameters drops nothing."""
+    if status != 400 or not isinstance(data, dict) or not isinstance(data.get("error"), dict):
+        return None
+    err = data["error"]
+    message = err.get("message") if isinstance(err.get("message"), str) else ""
+    code = err.get("code") if isinstance(err.get("code"), str) else ""
+    worded = bool(_REFUSAL_WORDS.search(message))
+    param = err.get("param")
+    if isinstance(param, str) and param:
+        ok = param in DROPPABLE_PARAMS and param in sent and (code in _REFUSAL_CODES or worded)
+        return param if ok else None
+    if not worded:
+        return None
+    named = {m.group(1) for m in _QUOTED_NAME.finditer(message)} & set(sent)
+    if len(named) == 1 and (only := next(iter(named))) in DROPPABLE_PARAMS:
+        return only
+    return None
+
+
+_SECRET_PATTERNS = (
+    re.compile(
+        r"(?i)\b(authorization|x-api-key|api[_-]?key)([\s\"':=]{1,6})(bearer\s+)?[^\s\"',;}]+"
+    ),
+    re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{8,}"),
+    re.compile(r"\bsk-[A-Za-z0-9_-]{12,}"),
+)
+
+
+def scrub_secrets(text: str, key: str | None = None) -> str:
+    """Remove the API key and anything that looks like an Authorization/x-api-key value."""
+    if key:
+        text = text.replace(key, "[redacted]")
+    text = _SECRET_PATTERNS[0].sub(lambda m: f"{m.group(1)}{m.group(2)}[redacted]", text)
+    text = _SECRET_PATTERNS[1].sub("Bearer [redacted]", text)
+    return _SECRET_PATTERNS[2].sub("[redacted]", text)
+
+
+def _error_text(data: bytes, key: str | None) -> str:
+    """The provider's error message for spans and recordings: scrubbed, one line, bounded."""
+    raw = data[:65536].decode("utf-8", "replace")
+    try:
+        message = upstream_error_message(json.loads(raw))
+    except ValueError:
+        message = None
+    text = " ".join(scrub_secrets(message if message is not None else raw, key).split())
+    if len(text) > ERROR_TEXT_LIMIT:
+        text = text[: ERROR_TEXT_LIMIT - 3].rstrip() + "..."
+    return text
 
 
 # --------------------------------------------------------------------------- response teeing
@@ -309,6 +441,9 @@ class ModelProxy:
         self.upstream_timeout = upstream_timeout
         self._contexts: dict[str, CallContext] = {}
         self._ctx_lock = threading.Lock()
+        # (base_url, upstream model id) -> parameters that endpoint refused; process life.
+        self._refused: dict[tuple[str, str], set[str]] = {}
+        self._refused_lock = threading.Lock()
         self._client: httpx.AsyncClient | None = None
         self._server: uvicorn.Server | None = None
         self._thread: threading.Thread | None = None
@@ -504,9 +639,6 @@ class ModelProxy:
         except _Refused as r:
             return error_response(r.status, r.code, r.message, r.type)
 
-        upstream_body = dict(body, model=ep.model)
-        if stream and "stream_options" not in upstream_body:
-            upstream_body["stream_options"] = {"include_usage": True}
         headers = {"content-type": "application/json", "accept-encoding": "identity"}
         if stream:
             headers["accept"] = "text/event-stream"
@@ -515,31 +647,101 @@ class ModelProxy:
         url = ep.base_url.rstrip("/") + "/" + rest
         call = _Call(self, ctx, ep, rest, body, t0_ns)
         client = self._upstream()
-        req = client.build_request("POST", url, json=upstream_body, headers=headers)
-        try:
-            resp = await client.send(req, stream=True)
-        except httpx.HTTPError as exc:
-            call.finish(status=502, error=f"upstream unreachable: {type(exc).__name__}")
-            return error_response(
-                502,
-                "upstream_unreachable",
-                f"could not reach the upstream for model {ep.name!r} ({type(exc).__name__})",
-                "api_error",
-            )
-        out_headers = {"content-type": resp.headers.get("content-type", "application/json")}
-        if not stream or resp.status_code != 200:
+        dropped = [p for p in sorted(self.refused_params(ep)) if p in body]
+        resends = 0
+        while True:
+            upstream_body = {k: v for k, v in body.items() if k not in dropped}
+            upstream_body["model"] = ep.model
+            if stream and "stream_options" not in upstream_body:
+                upstream_body["stream_options"] = {"include_usage": True}
+            call.dropped, call.resends = tuple(dropped), resends
+            out_headers = {"content-type": "application/json"}
+            req = client.build_request("POST", url, json=upstream_body, headers=headers)
+            try:
+                resp = await client.send(req, stream=True)
+            except httpx.HTTPError as exc:
+                call.finish(status=502, error=f"upstream unreachable: {type(exc).__name__}")
+                return self._with_dropped(
+                    error_response(
+                        502,
+                        "upstream_unreachable",
+                        f"could not reach the upstream for model {ep.name!r} "
+                        f"({type(exc).__name__})",
+                        "api_error",
+                    ),
+                    dropped,
+                )
+            out_headers["content-type"] = resp.headers.get("content-type", "application/json")
+            if dropped:
+                out_headers[DROPPED_HEADER] = ",".join(dropped)
+            if stream and resp.status_code == 200:
+                return _TeeStream(resp, out_headers, call)
             try:
                 data = await resp.aread()
             except httpx.HTTPError as exc:
                 await resp.aclose()
                 call.finish(status=502, error=f"upstream read failed: {type(exc).__name__}")
-                return error_response(502, "upstream_read_failed", "upstream failed", "api_error")
+                return self._with_dropped(
+                    error_response(502, "upstream_read_failed", "upstream failed", "api_error"),
+                    dropped,
+                )
             await resp.aclose()
-            call.tee.parse_body(data)
-            err = None if resp.status_code < 400 else f"upstream HTTP {resp.status_code}"
-            call.finish(status=resp.status_code, error=err)
-            return Response(data, status_code=resp.status_code, headers=out_headers)
-        return _TeeStream(resp, out_headers, call)
+            if resp.status_code == 400 and resends < MAX_RESENDS:
+                param = self._refusal(ep, data, upstream_body, dropped)
+                if param is not None:
+                    dropped.append(param)
+                    resends += 1
+                    continue  # the refused try was not billed; nothing is recorded for it
+            break
+        call.tee.parse_body(data)
+        err = None
+        if resp.status_code >= 400:
+            call.error_text = _error_text(data, key)
+            err = f"upstream HTTP {resp.status_code}"
+            if call.error_text:
+                err += f": {call.error_text}"
+            if key and key.encode() in data:  # never hand our own key back (7c)
+                data = data.replace(key.encode(), b"[redacted]")
+        call.finish(status=resp.status_code, error=err)
+        return Response(data, status_code=resp.status_code, headers=out_headers)
+
+    # ------------------------------------------------------------------ refused parameters
+
+    def refused_params(self, ep: ModelEndpoint) -> frozenset[str]:
+        """Parameters this endpoint has refused since the process started (dropped up front)."""
+        with self._refused_lock:
+            return frozenset(self._refused.get((ep.base_url, ep.model), ()))
+
+    def _refusal(
+        self, ep: ModelEndpoint, data: bytes, sent: dict[str, Any], dropped: list[str]
+    ) -> str | None:
+        """The parameter to drop for a resend after this 400, learning it; None to pass the
+        400 through."""
+        try:
+            parsed = json.loads(data)
+        except ValueError:
+            return None
+        param = refused_param(400, parsed, sent)
+        if param is None or param in dropped:
+            return None
+        with self._refused_lock:
+            known = self._refused.setdefault((ep.base_url, ep.model), set())
+            learned = param not in known
+            known.add(param)
+        if learned:
+            log.warning(
+                "proxy: model %s (%s) refuses %r; dropping it from its requests from now on",
+                ep.name,
+                ep.model,
+                param,
+            )
+        return param
+
+    @staticmethod
+    def _with_dropped(response: Response, dropped: list[str]) -> Response:
+        if dropped:
+            response.headers[DROPPED_HEADER] = ",".join(dropped)
+        return response
 
     def _list_models(self) -> JSONResponse:
         return JSONResponse(
@@ -660,6 +862,9 @@ class _Call:
         )
         self.tee = _Tee()
         self._finished = False
+        self.dropped: tuple[str, ...] = ()  # parameters left out of the upstream request
+        self.resends = 0  # extra upstream tries after a refused parameter
+        self.error_text: str | None = None  # the provider's error message, scrubbed
 
     def _prompt_view(self) -> Any:
         if self.rest == "embeddings":
@@ -714,6 +919,11 @@ class _Call:
                 start_time_ns=self.t0_ns,
                 end_time_ns=end_ns,
                 error=error,
+                attributes={
+                    "llm.dropped_params": ",".join(self.dropped) or None,
+                    "llm.resends": self.resends or None,
+                    "llm.error.message": self.error_text or None,
+                },
             )
 
         try:
@@ -735,9 +945,13 @@ class _Call:
                     stop = {"tool_calls": "tool_use", "length": "max_tokens"}.get(
                         tee.finish_reason or "", "end_turn"
                     )
+                raw_content = None
+                if self.error_text:  # the provider's refusal, kept out of the model's text
+                    raw_content = [{"type": "error", "text": self.error_text}]
                 try:
                     rec.llm(
                         text=text,
+                        raw_content=raw_content,
                         tokens_in=tokens_in,
                         tokens_out=tokens_out,
                         model=self.ep.name,

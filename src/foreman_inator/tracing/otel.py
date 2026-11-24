@@ -39,7 +39,7 @@ import json
 import logging
 import secrets
 import threading
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -597,12 +597,16 @@ def record_llm_call(
     start_time_ns: int | None = None,
     end_time_ns: int | None = None,
     error: str | None = None,
+    attributes: Mapping[str, Any] | None = None,
 ) -> SpanContext:
     """One finished `llm.call` span under the attempt (or review) with that id, from any
-    thread or task. Times are epoch nanoseconds (`time.time_ns()`); default now."""
+    thread or task. Times are epoch nanoseconds (`time.time_ns()`); default now.
+    `attributes`: extra span attributes (None values dropped); they never replace the
+    standard ones above."""
     return _emit(
         "llm.call",
         {
+            **(attributes or {}),
             "attempt.id": attempt_id,
             "review.id": review_id,
             "llm.model_name": model,
