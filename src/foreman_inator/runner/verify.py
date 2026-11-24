@@ -22,6 +22,7 @@ import re
 import shlex
 import signal
 import subprocess
+import threading
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -244,13 +245,15 @@ def run(
     output_path: Path | str | None = None,
     *,
     env: Mapping[str, str] | None = None,
+    cancel: threading.Event | None = None,
 ) -> VerifyResult:
     """Run ``cmd`` in ``cwd`` with stdout+stderr saved to ``output_path``.
 
     ``output_path`` defaults to ``<cwd>/.fman-verify.log`` but callers should pass a
     path next to the trace. ``env`` entries are added to the inherited
     environment (``CI=1`` and colour-off variables are always set). Never raises
-    for a failing, missing or hanging command.
+    for a failing, missing or hanging command. ``cancel`` (the worker shutting down):
+    once set, the command's process group is killed and the result is a failure.
     """
     cwd = Path(cwd)
     out = Path(output_path) if output_path is not None else cwd / ".fman-verify.log"
@@ -277,7 +280,11 @@ def run(
             exit_code = 127
         else:
             try:
-                exit_code = proc.wait(timeout=timeout)
+                exit_code = _wait(proc, timeout, cancel)
+            except _Cancelled:
+                exit_code = None
+                _kill_group(proc)
+                fh.write(b"\nforeman-inator: verify cancelled\n")
             except subprocess.TimeoutExpired:
                 timed_out = True
                 exit_code = None
@@ -297,6 +304,27 @@ def run(
         seconds=seconds,
         command=cmd.display,
     )
+
+
+class _Cancelled(Exception):
+    pass
+
+
+def _wait(proc: subprocess.Popen[bytes], timeout: float, cancel: threading.Event | None) -> int:
+    """``proc.wait(timeout)``, polling ``cancel`` twice a second when one is given."""
+    if cancel is None:
+        return proc.wait(timeout=timeout)
+    deadline = time.monotonic() + timeout
+    while True:
+        if cancel.is_set():
+            raise _Cancelled
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise subprocess.TimeoutExpired(proc.args, timeout)
+        try:
+            return proc.wait(timeout=min(0.5, left))
+        except subprocess.TimeoutExpired:
+            continue
 
 
 def _child_env(extra: Mapping[str, str] | None) -> dict[str, str]:
