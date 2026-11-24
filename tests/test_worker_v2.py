@@ -730,6 +730,10 @@ def test_opencode_warm_up_starts_and_stops_one_server(env: Env) -> None:
     driver = env.oc.driver(timeout=30)
     assert warm_up_opencode(driver, env.config, env.proxy)
     (launch,) = env.oc.launches()
+    # It opens a session: that is what makes OpenCode write its shared config dir, which
+    # a sandboxed attempt can only read.
+    created = [c for c in env.oc.calls() if (c["method"], c["path"]) == ("POST", "/session")]
+    assert [c["body"]["title"] for c in created] == ["foreman-inator warm-up"]
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
         try:

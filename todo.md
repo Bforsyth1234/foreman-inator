@@ -102,6 +102,7 @@ Package root below is `src/foreman_inator/` (written `pkg/`).
 | — | #45–#50 | unscheduled (gap review, 2026-11-23) | open |
 | — | #51 | unscheduled (user request, 2026-11-23); proposed as its own wave after 6b | open |
 | — | #52 | unscheduled (user request, 2026-11-23); after 6b, can share a wave with #51 (disjoint files) | open |
+| — | #53–#56 | unscheduled (first live run, 2026-11-23); #45 gained live evidence in the same run | open |
 
 ### Runner decisions on open questions (assistant defaults, 2026-11-23)
 
@@ -289,6 +290,7 @@ write the full item from the template before scheduling one.
 #45 — Install dependencies in a fresh worktree before verify [ ] · Added: 2026-11-23 · Source: assistant (gap review)
 Why: no install step exists anywhere in the code (no `npm ci`, `uv sync` or `swift package resolve`), so a new worktree has no `node_modules` or venv and verify can fail for reasons unrelated to the change.
 Idea: detect an install command next to the verify command, save it per repo like `fman repo set-verify`, run it once per worktree. Needs network, so decide it together with #40's `sandbox_network`.
+Live evidence (2026-11-23, first live run, `Bforsyth1234/fman-playground`, ticket 2, attempt 11): with the sandbox on, verify ran `uv run pytest` and failed with "Network connectivity is disabled, but the requested data wasn't found in the cache" (`~/.foreman-inator/traces/2/attempt-11-verify.log`). The sandbox moves `UV_CACHE_DIR` into an empty scratch dir and the repo had no `sandbox_network = "allow"`, so nothing could be installed. The change itself was correct. The writer hit the same wall in its own bash tool and spent most of 18.6 minutes and 585k input tokens trying to get pytest to run. This now blocks every repo with dependencies, so it is no longer only a gap-review idea. Options seen: a read-only shared package cache inside the sandbox, an install step that runs with network before the sandboxed verify, or telling the user to set `sandbox_network` when verify fails this way.
 
 #46 — Metrics: attempt minutes and review count next to dollars [ ] · Added: 2026-11-23 · Source: assistant (gap review; user asked "why wouldnt local llms be priced at 0")
 Why: local models cost $0 per token (correct), so "cost per accepted ticket" shows a local model that took 3 attempts and 2 reviews as free.
@@ -382,3 +384,23 @@ Verify:
 ⚬ Non-vacuous: price cache reads at the full input rate and the cost test fails; drop `cache_read_input_tokens` from the sum and the `tokens_in` test fails; send `Authorization: Bearer` instead of `x-api-key` and the header test fails.
 Live (user): one real Claude writer attempt on a toy repo: from the second model call on, `cache_read_input_tokens` is above zero in the trace, and the attempt's cost is below the same token count at the uncached rate. One real GLM attempt on the Coding Plan endpoint: note whether `cached_tokens` is ever above zero, since the docs do not say caching applies there.
 Deviations:
+
+### Unscheduled (first live run, 2026-11-23)
+
+Found by the first real ticket: issue #1 on the private test repo `Bforsyth1234/fman-playground` ("Fix typo in README"), tier 1 `inkling-2-mini`, sandbox on, worker started with `uv run fman run`. One more problem from the same run is already fixed in the working tree: `warm_up_opencode` now opens one session, because OpenCode writes `config/opencode/.gitignore` into the shared config dir on its first session and a sandboxed attempt has that dir read-only (every attempt on a fresh install failed with `POST /session: 500`).
+
+#53 — A setup failure must flag the ticket, not climb the ladder [ ] · Added: 2026-11-23 · Source: assistant (first live run)
+Why: ticket 1 made 10 attempts in 20 seconds, two on every model up to `claude-fable`, and was then handed to the user. Each attempt ended in about 1 second with 0 tokens: the OpenCode session could not be opened (`POST /session: 500`), the driver returned `status="errored"`, and the worker treated that as failed checks and escalated. No model was ever called. With API keys stored, the cloud tiers would have been tried for a failure no model can fix, and all 10 rows count as `failed_checks` against their models in the metrics.
+Idea: tell "the attempt could not run" (server did not start, session not opened, 0 model calls) apart from "the change failed its checks". The first kind flags the ticket once with the error, makes no further attempt, and is left out of the per-model metrics, like `FLAG_SANDBOX` already does for a missing sandbox backend.
+
+#54 — The sandboxed child inherits the worker's PATH and VIRTUAL_ENV [ ] · Added: 2026-11-23 · Source: assistant (first live run)
+Why: the worker was started with `uv run fman run`, which puts `foreman-inator/.venv/bin` first on PATH and sets `VIRTUAL_ENV`. Both reached the sandboxed writer and verify: inside the attempt `which python3` was foreman-inator's own venv, `uv` warned that `VIRTUAL_ENV` "does not match the project environment path", and the model listed that venv's `site-packages` while looking for pytest. The attempt reads files outside its worktree and can run the worker's interpreter, so a repo's checks may pass or fail because of what foreman-inator itself has installed.
+Idea: `sandbox.child_env` drops `VIRTUAL_ENV` (and other tool-activation variables) and removes the worker's own venv from PATH. Decide whether reads under the worker's checkout should be denied by the profile as well.
+
+#55 — Heredocs fail in the sandboxed bash tool [ ] · Added: 2026-11-23 · Source: assistant (first live run)
+Why: the model's `python3 - <<'EOF'` and `cat > file <<'EOF'` commands both failed with "zsh:1: can't create temp file for here document: operation not permitted". Heredocs are how local models most often write files from the shell; this one fell back to `sed` and the write tool after two lost turns.
+Idea: likely cause, not confirmed: zsh creates heredoc temp files under `TMPPREFIX` (default `/tmp/zsh`), not `TMPDIR`, and the profile denies `/tmp`. Set `TMPPREFIX` into the scratch dir in `sandbox.child_env`, and add a sandbox test that runs a heredoc.
+
+#56 — Setup puts every installed repo into config.toml [ ] · Added: 2026-11-23 · Source: assistant (first live run)
+Why: GitHub's install page defaults to "All repositories". `fman setup` then wrote all 141 of the user's repos (87 public) into `repos`, and the worker started with "141 repo(s), polling every 45s": about 11,000 issue listings an hour, at or over the installation's rate limit (not confirmed for this account), and far more repos than the user meant to hand over. There is no command to change the list; it was cut to one repo by rewriting the file through `config.save`.
+Idea: setup shows the count and asks which repos to work on when the installation covers more than a few (default: none until chosen), and says how to narrow the installation on GitHub. Add `fman repo add` / `fman repo remove`. Consider one installation-wide listing per poll instead of one per repo.
