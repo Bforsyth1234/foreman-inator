@@ -80,7 +80,7 @@ def test_full_loop_label_kickback_approve_merge(env: Env, spans) -> None:
     a1 = env.attempts(n)[0]
     assert (a1.trigger, a1.tests_passed, a1.outcome) == ("first", True, None)
     assert a1.branch == "fman/issue-1/a1" and a1.base_commit and a1.worktree
-    assert a1.variant_id and a1.variant_id.startswith("qwen3.6-35b-a3b/writer-v1@")
+    assert a1.variant_id and a1.variant_id.startswith("inkling-2-mini/writer-v1@")
     assert a1.diff_files == 2 and a1.diff_lines and a1.seconds is not None
     assert a1.tokens_in > 0 and a1.tokens_out > 0  # from the proxy's llm.call
     assert a1.verify_output_path is None
@@ -137,8 +137,10 @@ def test_full_loop_label_kickback_approve_merge(env: Env, spans) -> None:
     for s in mine:
         if s.name in ("verify", "tool.call"):
             assert by_id[s.parent.span_id].name == "attempt", s.name
-        if s.name == "llm.call":  # the writer's, the router's and the reviewer's
-            assert by_id[s.parent.span_id].name in ("attempt", "route", "review")
+        if (
+            s.name == "llm.call"
+        ):  # the writer's, the clarify check's (#44), the router's, the reviewer's
+            assert by_id[s.parent.span_id].name in ("attempt", "clarify", "route", "review")
     for r in (s for s in mine if s.name == "review"):
         kids = [c.name for c in mine if c.parent and c.parent.span_id == r.context.span_id]
         assert kids.count("review.check") == 5 and set(kids) <= {"review.check", "llm.call"}
@@ -365,7 +367,7 @@ def test_status_lists_columns_attempts_flags_and_prs(env: Env) -> None:
     text = render_status(env.store, config=env.config)
     assert "TESTING" in text and "IN PROGRESS" in text
     assert "acme/widgets#1" in text and "PR #" in text
-    assert "attempt 2 (first, qwen3.6-35b-a3b, tier 1): failed checks" in text
+    assert "attempt 2 (first, inkling-2-mini, tier 1): failed checks" in text
     assert "cloud spend: $" in text
 
 

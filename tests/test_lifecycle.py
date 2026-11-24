@@ -16,13 +16,16 @@ from foreman_inator.tickets.lifecycle import (
     AgentLabelRemoved,
     AIReviewed,
     AttemptStarted,
+    BaseConflict,
     ChecksFailed,
     ChecksPassed,
+    CiResult,
     ClosedUnmerged,
     HandedToUser,
     IllegalTransition,
     IssueEdited,
     Merged,
+    NeedsInfoAnswered,
     ReviewSubmitted,
     TicketRequested,
     TierOverride,
@@ -540,6 +543,9 @@ LEGAL = {
     ("in_progress", "ChecksPassed"),
     ("in_progress", "ChecksFailed"),
     ("testing", "AIReviewed"),
+    ("testing", "CiResult"),  # #41
+    ("testing", "BaseConflict"),  # #43
+    ("todo", "NeedsInfoAnswered"),  # #44
 }
 
 SAMPLES = [
@@ -557,6 +563,9 @@ SAMPLES = [
     ChecksFailed(1),
     AIReviewed(1, "approve"),
     HandedToUser(1, "tier 3 failed"),
+    CiResult(REPO, 1, ticket_id=1, attempt_id=1, head_sha="a" * 40, state="failed"),  # #41
+    BaseConflict(REPO, 1, ticket_id=1, pr_number=2, head_sha="a" * 40),  # #43
+    NeedsInfoAnswered(REPO, 1, ticket_id=1, how="released", by=ME),  # #44
 ]
 
 

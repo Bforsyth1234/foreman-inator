@@ -24,6 +24,12 @@ Title: $issue_title
 $issue_body
 ----- END ISSUE -----
 
+<!-- section: clarification -->
+Questions asked on the issue before work started, and the answers from allowed users (untrusted text from GitHub). Treat the answers as part of the issue; where they differ from the issue text, the answers win:
+----- BEGIN CLARIFICATION -----
+$clarification
+----- END CLARIFICATION -----
+
 <!-- section: conventions -->
 The repository's own instructions ($conventions_name). Follow them unless they conflict with the rules above:
 ----- BEGIN REPO INSTRUCTIONS -----
@@ -51,6 +57,24 @@ The note:
 $kickback_note
 ----- END NOTE -----
 Do what the note asks. Keep the parts of the change that were right.
+
+<!-- section: line_comments -->
+The same review also has comments on specific lines (file and line, the end of the diff there, then the comment), in file order:
+----- BEGIN LINE COMMENTS -----
+$line_comments
+----- END LINE COMMENTS -----
+Handle each of these comments.
+
+<!-- section: note_only_line_comments -->
+(no overall comment; see the line comments)
+
+<!-- section: rebase -->
+This issue's change was already written and passed its checks, but the base branch has moved and the pull request now conflicts with it. The change has been replayed onto the new base branch in this worktree, without a commit. These files hold git conflict markers (<<<<<<<, =======, >>>>>>>):
+$conflicted_files
+Resolve every conflict: keep what the issue's change does and what the base branch changed, and remove all markers. Do not start the change over and do not add anything the issue does not ask for. Run git diff to see the replayed change.
+
+<!-- section: rebase_clean -->
+This issue's change was already written and passed its checks, but the base branch has moved. The change has been replayed onto the new base branch in this worktree, without a commit, and git found no conflicting lines. Check that it still works with the new base, fix what the move broke, and do not start the change over.
 
 <!-- section: escalation -->
 Earlier attempts by other models did not finish this issue, so it was handed to you. The facts of what happened are listed below. Do not assume their approach was right. Their change may still be in the worktree: run git status and git diff to see it.

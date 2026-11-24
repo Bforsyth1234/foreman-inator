@@ -46,16 +46,24 @@ read/edit/glob/grep/list/bash/task/todowrite/skill/lsp allow; `.env` reads, webf
 websearch, question, doom_loop and external_directory deny. Anything that still asks is
 rejected by the driver (counted in `permission_rejections`).
 
-Residual risk: OpenCode's `bash` tool runs with the user's own authority. external_directory
-is a best-effort check on paths it can see in the command; a shell command can still read or
-write outside the worktree and reach the network. The driver strips API keys, tokens,
-`SSH_AUTH_SOCK` and git askpass helpers from the server's environment, so the agent cannot
-push or use the user's credentials, but this is not a sandbox.
+Residual risk without a sandbox: OpenCode's `bash` tool runs with the user's own authority.
+external_directory is a best-effort check on paths it can see in the command; a shell
+command can still read or write outside the worktree and reach the network. The driver
+strips API keys, tokens, `SSH_AUTH_SOCK` and git askpass helpers from the server's
+environment, so the agent cannot push or use the user's credentials.
+
+Sandbox (#40): `run(..., sandbox=policy)` / `OpenCodeServer(..., sandbox=policy)` start
+`opencode serve` under `runner.sandbox` (macOS `sandbox-exec`), and its bash tool and every
+command it runs inherit it: writes only to the worktree, the attempt's state dir and the
+policy's scratch dir; the shared plugin/cache dir is read-only (the unsandboxed warm-up
+installs plugins); outbound network only to the proxy's loopback port; it may listen on
+loopback for the driver. No `sandbox` (the default) runs it exactly as before.
 """
 
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import json
 import logging
 import os
@@ -71,10 +79,13 @@ from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, Protocol
+from urllib.parse import urlsplit
 
 import httpx
 
 from foreman_inator.config import ModelEndpoint
+from foreman_inator.runner import sandbox as sandbox_mod
+from foreman_inator.runner.sandbox import Policy
 from foreman_inator.tracing import get_recorder, record_tool_call
 
 log = logging.getLogger(__name__)
@@ -253,8 +264,10 @@ class OpenCodeServer:
         opencode_bin: str = "opencode",
         startup_timeout: float = STARTUP_TIMEOUT,
         base_env: Mapping[str, str] | None = None,
+        sandbox: Policy | None = None,
     ):
         self.worktree_path = Path(worktree_path).resolve()
+        self.sandbox = sandbox
         self.attempt_dir = Path(attempt_dir)
         self.shared_dir = Path(shared_dir)
         self.config = config
@@ -289,6 +302,10 @@ class OpenCodeServer:
             password=self.password,
         )
         argv = [self.opencode_bin, "serve", "--pure", "--hostname", "127.0.0.1", "--port", "0"]
+        policy = self.sandbox_policy()
+        if policy is not None:
+            env = sandboxed_env(env, policy)
+            argv = sandbox_mod.wrap(argv, policy)  # raises SandboxUnavailable: fail closed
         with self.log_path.open("wb") as logf:
             self.proc = subprocess.Popen(
                 argv,
@@ -305,6 +322,23 @@ class OpenCodeServer:
             self.stop()
             raise
         return self.url
+
+    def sandbox_policy(self) -> Policy | None:
+        """The sandbox for this server: the given policy bound to this worktree, with the
+        attempt's state dir writable, the shared dir read-only, loopback listening on and
+        the opencode binary's install dir readable. None when no sandbox was given."""
+        if self.sandbox is None:
+            return None
+        if self.sandbox.mode == "off":
+            return self.sandbox
+        exe = shutil.which(self.opencode_bin, path=self.base_env.get("PATH")) or self.opencode_bin
+        policy = self.sandbox.bind(
+            self.worktree_path,
+            reads=[self.shared_dir],
+            writes=[self.attempt_dir],
+            argv0=exe,
+        )
+        return dataclasses.replace(policy, listen_loopback=True)
 
     def _wait_listening(self) -> str:
         assert self.proc is not None
@@ -354,6 +388,27 @@ class OpenCodeServer:
 
     def __exit__(self, *exc: object) -> None:
         self.stop()
+
+
+_KEEP_FROM_SERVER_ENV = ("XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME")
+
+
+def sandboxed_env(env: Mapping[str, str], policy: Policy) -> dict[str, str]:
+    """``server_env`` plus the sandbox's HOME/TMPDIR/cache overrides. OpenCode keeps its
+    own XDG dirs (the per-attempt and shared state dirs), so its isolation is unchanged."""
+    out = dict(env)
+    for k, v in sandbox_mod.child_env(policy, env.get("PATH", "")).items():
+        if k not in _KEEP_FROM_SERVER_ENV:
+            out[k] = v
+    return out
+
+
+def proxy_port(proxy_base_url: str) -> int | None:
+    """The loopback port of the proxy URL the attempt's provider points at."""
+    try:
+        return urlsplit(proxy_base_url).port
+    except ValueError:
+        return None
 
 
 def _is_within(path: Path, root: Path) -> bool:
@@ -786,12 +841,17 @@ class OpenCodeDriver:
         proxy_base_url: str,
         timeout: float | None = None,
         cancel: threading.Event | None = None,
+        sandbox: Policy | None = None,
     ) -> AttemptResult:
         """Run one attempt to the end. `worktree` is a `Worktree` or a path. Never leaves
         the server running: the process group is killed on return, error or Ctrl-C.
 
         `cancel` (worker shutdown, ticket dropped): once set, the session is aborted as on
-        a timeout, and the result has `cancelled=True` and status "errored"."""
+        a timeout, and the result has `cancelled=True` and status "errored".
+
+        `sandbox` (#40): run the server under this policy; its `proxy_port` defaults to
+        the port of `proxy_base_url`. `sandbox.SandboxUnavailable` is raised (not turned
+        into an errored result) so the worker flags the ticket instead of retrying."""
         wt_path = Path(getattr(worktree, "path", worktree)).resolve()
         limit = self.timeout if timeout is None else timeout
         t0 = time.monotonic()
@@ -804,6 +864,7 @@ class OpenCodeDriver:
             opencode_bin=self.opencode_bin,
             startup_timeout=self.startup_timeout,
             base_env=self.base_env,
+            sandbox=_with_proxy_port(sandbox, proxy_base_url),
         )
         rec = get_recorder(attempt_id)
         if rec is not None:
@@ -1010,6 +1071,12 @@ class OpenCodeDriver:
             run.error = run.error or ev.error or "event stream closed"
             return True
         return False
+
+
+def _with_proxy_port(policy: Policy | None, proxy_base_url: str) -> Policy | None:
+    if policy is None or policy.proxy_port is not None:
+        return policy
+    return dataclasses.replace(policy, proxy_port=proxy_port(proxy_base_url))
 
 
 def run_final_text(api: OpenCodeSession, run: _Run) -> str:

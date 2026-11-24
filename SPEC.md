@@ -59,7 +59,7 @@ Each ticket mirrors one GitHub issue, so tickets also store `issue_number` and `
 | Field | Type | Notes |
 | --- | --- | --- |
 | id, ticket_id | int | |
-| model, tier | text, int | e.g. qwen3.6-35b-a3b, tier 1 |
+| model, tier | text, int | e.g. inkling-2-mini, tier 1 |
 | variant_id | text | Model + prompt version |
 | trigger | enum | first · escalation · kickback · ai_kickback · explore |
 | writer_mode, review_mode | enum | The repo's profile when the attempt started |
@@ -115,7 +115,7 @@ Each ticket starts on the cheapest tier that seems likely to work and moves up o
 
 | Tier | Model (initial pick) | Where | Use for |
 | --- | --- | --- | --- |
-| 1 | Qwen3.6 35B-A3B | Local | Small, mechanical changes |
+| 1 | Inkling 2 Mini (26B, 5.4B active) | Local | Small, mechanical changes |
 | 2 | Qwen3.8-27B dense | Local | Normal features and bug fixes |
 | 3 | GLM plan first, then Claude API | Cloud, pay per use | Large refactors, anything that failed twice locally |
 
@@ -204,7 +204,7 @@ The worker serves the metrics page on localhost. When an issue closes, it also p
 
 Every model and prompt change is tested before it becomes the default. Most of that testing replays past tickets overnight, so it costs none of your review time.
 
-A **variant** is a model plus a prompt version, for example `qwen3.6-35b / writer-v3`. Prompts are versioned files in the worker's repo, so a prompt change is a commit. Each variant has a role: writer or reviewer. One variant per role is the **champion** (the default); others are **challengers**.
+A **variant** is a model plus a prompt version, for example `inkling-2-mini / writer-v3`. Prompts are versioned files in the worker's repo, so a prompt change is a commit. Each variant has a role: writer or reviewer. One variant per role is the **champion** (the default); others are **challengers**.
 
 | Mode | Role | How it works | Your time | When to use |
 | --- | --- | --- | --- | --- |
@@ -390,6 +390,7 @@ Milestones 1–2 make the GitHub add-on useful on its own. Bot-inator is optiona
 
 - **Verify command:** detected from the repo (package.json scripts, pytest, `swift typecheck`, Makefile). If nothing is found, the ticket is flagged once and the command you enter is saved for that repo.
 - **Web UI:** GitHub is the board. The worker serves only a local metrics page.
+- **Tier 1 (2026-11-23):** Inkling 2 Mini (Thinking Machines, open weights, about 20 GB on Ollama 0.40.17 or newer) replaces Qwen3.6 35B-A3B. Its maker reports coding scores level with Qwen3.8-27B at a fraction of the time per task, and it puts a second model family on the local tiers, so a move from tier 1 to tier 2 changes family. Tier 2 stays Qwen3.8-27B until the metrics say otherwise.
 - **Tier 3:** both. The GLM plan is tried first because it's a flat fee; the Claude API is used on escalation from GLM, or from the start for ticket types where GLM's accept rate is low.
 - **todo.md:** for the repos foreman-inator works on, the board replaces task tracking and the rules header moves to `AGENTS.md`. foreman-inator's own build is tracked in this repo's `todo.md` until it can run its own tickets.
 - **Name:** foreman-inator (renamed from Agent Board, then Foreman, on 2026-11-23), matching bot-inator. Repo and package foreman-inator, command foreman-inator with alias fman, bot account foreman-inator[bot]; confirm the names are free before the first release.

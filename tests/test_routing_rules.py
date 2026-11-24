@@ -32,7 +32,7 @@ from foreman_inator.routing.rules import (
 from foreman_inator.tickets.lifecycle import TicketRequested, TierOverride
 
 OLLAMA = "http://127.0.0.1:11434/v1"
-CONFIG = Config()  # SPEC defaults: tier 1/2 local qwen, tier 3 glm then claude (cloud)
+CONFIG = Config()  # SPEC defaults: tier 1 inkling, tier 2 qwen (local), tier 3 glm then claude
 TIER1 = CONFIG.models_for_tier(1)[0]
 
 
@@ -294,7 +294,7 @@ def test_request_is_local_fenced_bounded_and_versioned(fake, proxy):
     (req,) = chat_requests(fake)
     assert req.url == f"{TIER1.base_url}/chat/completions"
     assert req.json["model"] == TIER1.model
-    assert (req.json["temperature"], req.json["max_tokens"], req.json["stream"]) == (0, 16, False)
+    assert (req.json["temperature"], req.json["max_tokens"], req.json["stream"]) == (0, 512, False)
     assert req.json["reasoning_effort"] == "none"
     system, user = req.json["messages"]
     assert system["role"] == "system" and "small, normal or large" in system["content"]

@@ -7,8 +7,12 @@ poller, clock); ``run()`` at the bottom builds the real ones (``worker_run``).
 
 The flow (SPEC "Ticket lifecycle")
 ----------------------------------
-route (#15) → write (OpenCode) → verify → escalation (#16) → draft PR → AI review (#17)
-→ PR marked ready only on an AI approve or a handover → your review → escalation again.
+clarify (#44) → route (#15) → write (OpenCode, sandboxed: #40) → verify (sandboxed) →
+escalation (#16) → push + draft PR → GitHub CI gate (#41) → AI review (#17, its checks
+sandboxed) or the ``review:skip`` hand-over → PR marked ready only on an AI approve or a
+handover → your review (its line comments reach the next attempt: #42) → escalation
+again. A base-branch conflict while the PR waits (#43) → a ``rebase`` attempt (capped at
+2, then flagged) → the same gates again.
 
 Loop order (``tick``)
 ---------------------
@@ -25,11 +29,14 @@ Loop order (``tick``)
    ticket that wants a file another ticket holds waits, which is not a failure. Job
    kinds, in the order a ticket meets them:
 
-   ``route``     the router's model call (a ``todo`` ticket with no ``routed_tier``)
+   ``route``     the clarify check (#44), then the router's model call (a ``todo``
+                 ticket with no ``routed_tier``, or whose clarification is not done)
    ``attempt``   worktree → writer prompt → OpenCode → commit → verify; or a hand-over
                  when escalation says the ladder is done
    ``publish``   push → draft PR → ``testing`` (an attempt that passed but did not publish)
-   ``review``    the AI review of the PR's attempt (``testing``, no review row yet)
+   ``review``    the AI review of the PR's attempt (``testing``, no review row yet),
+                 once the CI gate is open
+   ``rebase``    replay the PR's change onto the moved base, resolve, verify (#43)
    ``finalize``  the GitHub side of a stored review: the COMMENT review, the PR body,
                  marking ready, the hand-over (after a crash, or right after the review)
 
@@ -61,21 +68,27 @@ a second PR (the publisher adopts the open one), a double-counted attempt or a l
 hand-over. Killed during routing: ``routed_tier`` is still NULL, so it routes again.
 Killed during the AI review: no review row, so the review runs again. Killed in a spend
 pause: the flag is stored; it resumes on its own. Killed while waiting on a lock: the
-wait is derived from the lock table each pass.
+wait is derived from the lock table each pass. Wave 6b: killed while waiting at the CI
+gate: the gate is ``attempts.ci_status``, so the poller just reads CI again; killed after
+a red CI result was stored but before the next attempt: escalation decides from the
+stored ``failed_checks`` row; killed with a rebase pending: the pending mark is a store
+cursor; killed during a rebase attempt: it is superseded and re-run within the rebase
+cap; killed between posting a clarifying question and its label or cursor: the question's
+marker is found on the issue, so no second model call or comment; killed after an answer
+was seen but before ``needs-info`` was removed: the removal is redone.
 
-Seams for wave 6b and later (no behaviour yet)
-----------------------------------------------
-* ``before_route(ticket) -> bool`` (``worker_attempt``): #44 parks a vague ticket as
-  needs-info before routing by returning False.
-* ``ci_gate(ticket, attempt) -> bool`` (``worker_review``): between "local checks passed
-  + draft PR pushed" and the AI review; #41 waits for GitHub CI there (False: not yet,
-  the review job is derived again next pass).
-* The three process launch points, one method each, for #40's sandbox adapter:
-  ``_launch_writer`` (OpenCode), ``_launch_verify`` (the verify command), and
-  ``_launch_review`` (the reviewer's checks) in ``worker_attempt``/``worker_review``.
-* Triggers: nothing here enumerates ``attempts.trigger``; a retry keeps the retried
-  attempt's trigger, and ``uncounted_attempts`` (``worker_pause``) is how an attempt is
-  kept out of escalation's counts, so #43's ``rebase`` trigger needs no change here.
+Wave 6b (wired at the wave's close)
+-----------------------------------
+* #40 sandbox: ``worker_sandbox`` builds the policy for the three launch points
+  (``_launch_writer``, ``_launch_verify``, ``_launch_review``); it fails closed (the ticket
+  is flagged ``sandbox_unavailable`` before an attempt row exists; nothing retries).
+* #41 CI: ``Poller(ci=True)``; ``RECORD_CI`` stores ``attempts.ci_status``; a red run is
+  failed checks (escalation's bound applies); ``ci_gate`` holds the AI review and the
+  ``review:skip`` hand-over; ``_mark_ready`` refuses a red or undecided attempt (7a).
+* #42: a user kickback stores the review body plus its line comments.
+* #43 conflicts: ``Poller(conflicts=True)``; ``START_REBASE`` → ``worker_rebase``;
+  ``history`` leaves rebases out of escalation's counts (``lifecycle.rebase_uncounted``).
+* #44 clarify: ``worker_route.before_route``; ``NeedsInfoAnswered`` resumes the ticket.
 * #51 (repo profiles): ``policy_for(ticket)`` (here), ``review_skipped(ticket)``
   (``worker_review``) and ``_route_ticket`` (``worker_attempt``) are its three call sites.
 
@@ -103,6 +116,7 @@ from foreman_inator.github.poller import Poller
 from foreman_inator.locks import Locks
 from foreman_inator.pr.publisher import Publisher
 from foreman_inator.routing import escalation
+from foreman_inator.runner import sandbox
 from foreman_inator.runner.worktree import WorktreeManager
 from foreman_inator.spend import Spend
 from foreman_inator.tickets import lifecycle
@@ -110,15 +124,29 @@ from foreman_inator.tickets.lifecycle import Action, IllegalTransition
 from foreman_inator.worker_actions import ActionHandlers, Ctx, flag_comment
 from foreman_inator.worker_attempt import AttemptSteps
 from foreman_inator.worker_pause import PauseSteps
+from foreman_inator.worker_publish import PublishSteps
 from foreman_inator.worker_queue import JOIN_TIMEOUT, Job, QueueSteps
+from foreman_inator.worker_rebase import RebaseSteps
 from foreman_inator.worker_review import ReviewSteps
+from foreman_inator.worker_route import RouteSteps
+from foreman_inator.worker_sandbox import SandboxSteps
 
 log = logging.getLogger("foreman_inator.worker")
 
 Policy = Callable[[escalation.History], escalation.Step | None]
 
 
-class Worker(ActionHandlers, AttemptSteps, ReviewSteps, PauseSteps, QueueSteps):
+class Worker(
+    ActionHandlers,
+    RouteSteps,
+    AttemptSteps,
+    PublishSteps,
+    RebaseSteps,
+    ReviewSteps,
+    PauseSteps,
+    QueueSteps,
+    SandboxSteps,
+):
     def __init__(
         self,
         *,
@@ -149,8 +177,11 @@ class Worker(ActionHandlers, AttemptSteps, ReviewSteps, PauseSteps, QueueSteps):
         self.proxy = proxy
         self.recordings_dir = Path(recordings_dir)
         self.traces_dir = Path(traces_dir)
-        self.publisher = publisher or Publisher(api, store)
-        self.poller = poller or Poller(api, store, config)
+        self.publisher = publisher or Publisher(
+            api, store, sandbox_line=sandbox.describe(config.sandbox, dict(config.sandbox_network))
+        )
+        #: CI (#41) and base conflicts (#43) on: their handlers are in ``self.actions``.
+        self.poller = poller or Poller(api, store, config, ci=True, conflicts=True)
         #: Must be the instance whose ``hook`` the proxy calls (``worker_run`` builds both).
         self.spend = spend or Spend(store, config)
         self.locks = locks or Locks(store)
@@ -188,6 +219,8 @@ class Worker(ActionHandlers, AttemptSteps, ReviewSteps, PauseSteps, QueueSteps):
             Action.RELEASE_LOCKS: self._a_release_locks,
             Action.CLEANUP_WORKTREE: self._a_cleanup_worktree,
             Action.FLAG_TICKET: self._a_flag_ticket,
+            Action.RECORD_CI: self._a_record_ci,
+            Action.START_REBASE: self._a_start_rebase,
         }
 
     # ================================================================== the loop
@@ -269,11 +302,13 @@ class Worker(ActionHandlers, AttemptSteps, ReviewSteps, PauseSteps, QueueSteps):
     def history(self, ticket: Ticket) -> escalation.History:
         """What escalation reads. Attempts paused by a spend cap or a lock yield are left
         out (``uncounted_attempts``): they never count toward escalation or the
-        interrupted cap. ``routed_tier`` and the explore flag come from the ticket, so a
-        restarted worker decides the same way."""
-        skip = self.uncounted_attempts(ticket)
+        interrupted cap; so are rebases (#43: failed or interrupted rebase attempts and
+        the attempt each rebase replaced). ``routed_tier`` and the explore flag come from
+        the ticket, so a restarted worker decides the same way."""
+        attempts = self.store.list_attempts(ticket.id)
+        skip = self.uncounted_attempts(ticket) | lifecycle.rebase_uncounted(attempts)
         return escalation.History(
-            tuple(a for a in self.store.list_attempts(ticket.id) if a.id not in skip),
+            tuple(a for a in attempts if a.id not in skip),
             tuple(self.store.list_kickbacks(ticket_id=ticket.id)),
             tuple(self.store.list_reviews(ticket_id=ticket.id, shadow=False)),
             routed_tier=ticket.routed_tier,
@@ -324,6 +359,8 @@ class Worker(ActionHandlers, AttemptSteps, ReviewSteps, PauseSteps, QueueSteps):
         if ticket is not None and tr.column != column:
             ticket = self.store.set_column(ticket.id, tr.column)
             self._log_move(ticket, column, tr.column, event)
+        if isinstance(event, lifecycle.NeedsInfoAnswered) and ticket is not None:
+            log.info("ticket %d: needs-info %s by %s", ticket.id, event.how, event.by)
         self._run_actions(Ctx(ticket, event), tr.actions)
 
     # ------------------------------------------------------------------ transitions

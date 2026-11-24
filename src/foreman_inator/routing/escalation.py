@@ -48,7 +48,7 @@ ticket escalates to: that rung starts with fresh counts.
 three segments (separated by at most one user and one AI kickback that stay on the rung)
 of at most ``MAX_CHECK_ATTEMPTS`` attempts each. Rungs only go up. So a ticket gets at
 most ``attempt_bound(len(ladder)) = rungs × 6 + MAX_INTERRUPTED`` attempts before it is
-handed to the user; SPEC's default four-rung ladder gives ``SPEC_LADDER_WORST_CASE`` = 27.
+handed to the user; the default five-rung ladder gives ``SPEC_LADDER_WORST_CASE`` = 33.
 
 **Kickback kinds.** A ``kicked_back`` attempt's kickbacks come from its kickback rows
 (``by`` user or reviewer, oldest first). When it has no reviewer row but a non-shadow AI
@@ -98,8 +98,8 @@ def attempt_bound(rungs: int) -> int:
     return rungs * MAX_ATTEMPTS_PER_RUNG + MAX_INTERRUPTED
 
 
-#: The bound for SPEC's default ladder (tier 1, tier 2, tier 3 GLM, tier 3 Claude).
-SPEC_LADDER_WORST_CASE = attempt_bound(4)
+#: The bound for the default ladder (tier 1, tier 2, tier 3 GLM, Claude Opus, Claude Fable).
+SPEC_LADDER_WORST_CASE = attempt_bound(5)
 
 
 # --------------------------------------------------------------------------- types

@@ -14,9 +14,14 @@ Layout (every key optional; missing keys take the defaults below)::
     allowed_users = ["you"]
     repos = ["you/project"]
     poll_interval_seconds = 45
-    reviewer_models = ["claude-sonnet", "glm"]
+    reviewer_models = ["claude-opus", "glm"]
     max_parallel_per_repo = 1   # tickets worked at once per repo (file locks permit)
     router_timeout_seconds = 30
+    sandbox = "on"       # on | off: model-written code runs under sandbox-exec (#40)
+    clarify = true       # ask on a vague issue before working on it (#44)
+
+    [sandbox_network]    # per repo: "allow" opens outbound network for its verify + checks
+    "you/project" = "none"
 
     [spend_caps]
     daily_usd = 5.0
@@ -55,6 +60,8 @@ KEY_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 TIERS = (1, 2, 3)
 MIN_POLL_SECONDS = 5
 MAX_PARALLEL_PER_REPO = 16
+SANDBOX_MODES = ("on", "off")
+SANDBOX_NETWORKS = ("none", "allow")
 
 Kind = Literal["local", "cloud"]
 
@@ -131,12 +138,12 @@ def resolve_key(ref: str) -> str:
 class ModelEndpoint:
     """One model the worker can call, through an OpenAI-compatible endpoint."""
 
-    name: str  # unique handle used in config and attempts, e.g. "qwen3.6-35b-a3b"
+    name: str  # unique handle used in config and attempts, e.g. "inkling-2-mini"
     tier: int  # 1, 2 or 3
     kind: Kind  # local (this Mac) or cloud (pay per use, counts toward spend caps)
     model: str  # model id sent to the endpoint
     base_url: str  # OpenAI-compatible base URL
-    family: str  # e.g. "qwen", "glm", "claude"; reviewer independence compares this
+    family: str  # e.g. "inkling", "qwen", "glm", "claude"; reviewer independence compares this
     api_key_ref: str | None = None  # keychain:foreman-inator/<name>
 
     @property
@@ -161,9 +168,9 @@ OLLAMA_URL = "http://127.0.0.1:11434/v1"
 
 
 def default_models() -> tuple[ModelEndpoint, ...]:
-    """SPEC.md's initial tier picks. Cloud ids/URLs are placeholders until tier 3 lands."""
+    """The default tier picks. Tier 3 is tried in this order: GLM, Claude Opus, Claude Fable."""
     return (
-        ModelEndpoint("qwen3.6-35b-a3b", 1, "local", "qwen3.6:35b-a3b", OLLAMA_URL, "qwen"),
+        ModelEndpoint("inkling-2-mini", 1, "local", "inkling-2-mini", OLLAMA_URL, "inkling"),
         ModelEndpoint("qwen3.8-27b", 2, "local", "qwen3.8:27b", OLLAMA_URL, "qwen"),
         ModelEndpoint(
             "glm",
@@ -175,10 +182,19 @@ def default_models() -> tuple[ModelEndpoint, ...]:
             key_ref("glm"),
         ),
         ModelEndpoint(
-            "claude-sonnet",
+            "claude-opus",
             3,
             "cloud",
-            "claude-sonnet-5-5",
+            "claude-opus-5-5",
+            "https://api.anthropic.com/v1",
+            "claude",
+            key_ref("anthropic"),
+        ),
+        ModelEndpoint(
+            "claude-fable",
+            3,
+            "cloud",
+            "claude-fable-5-2",
             "https://api.anthropic.com/v1",
             "claude",
             key_ref("anthropic"),
@@ -198,15 +214,32 @@ class Config:
     poll_interval_seconds: int = 45
     spend_caps: SpendCaps = field(default_factory=SpendCaps)
     models: tuple[ModelEndpoint, ...] = field(default_factory=default_models)
-    reviewer_models: tuple[str, ...] = ("claude-sonnet", "glm")  # preference order
+    reviewer_models: tuple[str, ...] = ("claude-opus", "glm")  # preference order
     #: Tickets of one repo worked at the same time, as far as file locks permit (#21).
     #: 1 (the default) suits one local GPU.
     max_parallel_per_repo: int = 1
     #: Whole-call bound for the router's classification (#15); a cold local model load
     #: can take longer than the router's own 10 s default.
     router_timeout_seconds: float = 30.0
+    #: "on" (default): OpenCode, verify and the reviewer's checks run under the sandbox
+    #: (#40), and an attempt that cannot be sandboxed is not run. "off" runs them
+    #: unsandboxed; `fman status` and the PR description say so.
+    sandbox: str = "on"
+    #: Per repo ("owner/name" -> "none" | "allow"): "allow" opens outbound network for
+    #: that repo's verify command and reviewer checks (never for the writer, which only
+    #: reaches the proxy). Repos not listed get "none".
+    #: Stored as sorted ``(repo, network)`` pairs so Config stays hashable; a dict is
+    #: accepted and converted.
+    sandbox_network: tuple[tuple[str, str], ...] = ()
+    #: #44: before a ticket is routed, a small local model checks the issue can be worked
+    #: on as written; if not, the worker asks on the issue (``needs-info``) and waits for
+    #: an allowed user. False turns the check off.
+    clarify: bool = True
 
     def __post_init__(self) -> None:
+        if isinstance(self.sandbox_network, Mapping):
+            pairs = tuple(sorted(self.sandbox_network.items()))
+            object.__setattr__(self, "sandbox_network", pairs)
         _validate(self)
 
     def model(self, name: str) -> ModelEndpoint:
@@ -230,6 +263,11 @@ class Config:
     def is_allowed_user(self, login: str) -> bool:
         return login.lower() in {u.lower() for u in self.allowed_users}
 
+    def sandbox_network_for(self, repo: str) -> str:
+        """``"allow"`` or ``"none"``: the verify/check network for ``repo`` (#40)."""
+        lowered = {k.lower(): v for k, v in self.sandbox_network}
+        return lowered.get(repo.lower(), "none")
+
 
 # --------------------------------------------------------------------------- validation
 
@@ -247,6 +285,17 @@ def _validate(cfg: Config) -> None:
     for repo in cfg.repos:
         if not re.match(r"^[\w.-]+/[\w.-]+$", repo):
             raise ConfigError(f"repo {repo!r} must look like 'owner/name'")
+    if not isinstance(cfg.clarify, bool):
+        raise ConfigError("clarify must be true or false")
+    if cfg.sandbox not in SANDBOX_MODES:
+        raise ConfigError(f"sandbox must be one of {', '.join(SANDBOX_MODES)}")
+    for repo, net in cfg.sandbox_network:
+        if not re.match(r"^[\w.-]+/[\w.-]+$", repo):
+            raise ConfigError(f"sandbox_network: repo {repo!r} must look like 'owner/name'")
+        if net not in SANDBOX_NETWORKS:
+            raise ConfigError(
+                f"sandbox_network.{repo} must be one of {', '.join(SANDBOX_NETWORKS)}"
+            )
     names = [m.name for m in cfg.models]
     if len(set(names)) != len(names):
         raise ConfigError("model names must be unique")
@@ -378,6 +427,16 @@ def from_dict(data: Mapping[str, Any]) -> Config:
         kw["router_timeout_seconds"] = float(
             _typed(data["router_timeout_seconds"], (int, float), "router_timeout_seconds")
         )
+    if "sandbox" in data:
+        kw["sandbox"] = _typed(data["sandbox"], str, "sandbox")
+    if "clarify" in data:
+        kw["clarify"] = _typed(data["clarify"], bool, "clarify")
+    if "sandbox_network" in data:
+        nets = _typed(data["sandbox_network"], dict, "sandbox_network")
+        kw["sandbox_network"] = {
+            _typed(k, str, "sandbox_network"): _typed(v, str, f"sandbox_network.{k}")
+            for k, v in nets.items()
+        }
     if "spend_caps" in data:
         caps = _typed(data["spend_caps"], dict, "spend_caps")
         _check_keys(caps, {f.name for f in fields(SpendCaps)}, "spend_caps")
@@ -404,6 +463,10 @@ def to_dict(cfg: Config) -> dict[str, Any]:
     out["reviewer_models"] = list(cfg.reviewer_models)
     out["max_parallel_per_repo"] = cfg.max_parallel_per_repo
     out["router_timeout_seconds"] = cfg.router_timeout_seconds
+    out["sandbox"] = cfg.sandbox
+    out["clarify"] = cfg.clarify
+    if cfg.sandbox_network:
+        out["sandbox_network"] = dict(cfg.sandbox_network)
     out["spend_caps"] = {f.name: getattr(cfg.spend_caps, f.name) for f in fields(SpendCaps)}
     out["models"] = [
         {

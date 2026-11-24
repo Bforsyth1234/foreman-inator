@@ -260,6 +260,11 @@ class Worktree:
         """The full unified diff against the base commit (binary files as stubs)."""
         return self._diff([])
 
+    def conflicted_files(self) -> list[str]:
+        """Paths git still lists as unmerged (after ``replay_onto_base``), sorted."""
+        out = _git(["diff", "--name-only", "--diff-filter=U", "-z"], cwd=self.path).stdout
+        return sorted({p for p in out.split("\0") if p})
+
     # -- writes -------------------------------------------------------------
 
     def _current_branch(self) -> str | None:
@@ -318,6 +323,19 @@ class Worktree:
         if delete_branch and self.branch and self.branch.startswith(BRANCH_PREFIX):
             self.mirror._delete_local_branch(self.branch)
         self._removed = True
+
+
+@dataclass(frozen=True)
+class Replay:
+    """The result of ``RepoMirror.replay_onto_base`` (#43)."""
+
+    worktree: Worktree
+    conflicted: tuple[str, ...]  # files holding conflict markers, sorted; () = clean
+    previous_sha: str  # the PR head whose change was replayed
+
+    @property
+    def clean(self) -> bool:
+        return not self.conflicted
 
 
 # --------------------------------------------------------------------------- mirror
@@ -429,6 +447,46 @@ class RepoMirror:
         )
         _write_base(path, base_sha)
         return Worktree(self, path, branch, base_sha, can_push=True)
+
+    def replay_onto_base(
+        self,
+        base_branch: str,
+        issue: int,
+        attempt: int,
+        *,
+        previous: str,
+        token: str | None = None,
+        fetch: bool = True,
+    ) -> Replay:
+        """#43: a fresh worktree for ``attempt`` on ``origin/<base_branch>`` (the moved base)
+        with the change of ``previous`` (the PR head: a commit or ``origin/fman/...``)
+        replayed onto it, for the model to finish.
+
+        The change is a squash merge of ``previous`` (everything since its merge base with
+        the new base), left uncommitted. Where it conflicts, git's markers (``<<<<<<<``,
+        ``=======``, ``>>>>>>>``) stay in the files and ``Replay.conflicted`` lists them;
+        ``commit_all`` later stages the resolved files. Diffs are measured against the new
+        base. Nothing is pushed: the worker force-pushes the result to the ticket's own
+        ``fman/`` PR branch (invariant 7a)."""
+        if fetch or not self._mirror_ok():
+            self.ensure(token)
+        prev_sha = self.resolve(previous)
+        wt = self.create(base_branch, issue, attempt, token=token, fetch=False)
+        ident = self.identity
+        env = {
+            "GIT_AUTHOR_NAME": ident.name,
+            "GIT_AUTHOR_EMAIL": ident.email,
+            "GIT_COMMITTER_NAME": ident.name,
+            "GIT_COMMITTER_EMAIL": ident.email,
+        }
+        proc = _git(
+            ["merge", "--squash", "--no-verify", "-q", prev_sha], cwd=wt.path, env=env, check=False
+        )
+        conflicted = tuple(wt.conflicted_files())
+        if proc.returncode != 0 and not conflicted:
+            detail = (proc.stderr or proc.stdout).strip()
+            raise WorktreeError(f"replaying {prev_sha[:12]} onto {base_branch} failed: {detail}")
+        return Replay(wt, conflicted, prev_sha)
 
     def scratch(self, commit: str, name: str, *, branch: str | None = None) -> Worktree:
         """A throwaway worktree at ``commit`` that can never push (reviewer revert check,

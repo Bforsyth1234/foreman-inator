@@ -25,6 +25,12 @@ Readings shared by every metric (SPEC leaves these open; also listed in the item
   its kickbacks are not counted, and escalating away from it is not an escalation. An
   explore attempt that succeeds counts like any other. Its cost still counts in the
   ticket's spend ("Total spend on all attempts … including the failed attempts").
+* **Rebases** (#43 decision 3: "a failed ``rebase`` attempt doesn't count against the
+  model in metrics"): an attempt with trigger ``rebase`` whose outcome is
+  ``failed_checks`` or ``superseded`` is invisible the same way. A rebase is the worker
+  keeping a finished change mergeable after the base branch moved, not the model's
+  answer to the issue. A rebase attempt that passes counts like any other, and every
+  rebase attempt's cost stays in the ticket's spend (cost per accepted ticket).
 * **A ticket's start attempt** is its first visible attempt (lowest id). Ticket-level
   metrics are attributed to the start attempt's model: the model filter on a ticket
   metric means "tickets started on this model". Attempt-level metrics (kickbacks per
@@ -199,7 +205,8 @@ class FilterOptions:
 # --- shared SQL -----------------------------------------------------------------------
 
 # scope: non-dropped tickets in the repo/date filter.
-# vis:   attempts that count against their model (failed explore attempts removed).
+# vis:   attempts that count against their model (failed explore and rebase attempts
+#        removed).
 _SCOPE_VIS = """
 scope AS (
     SELECT t.* FROM tickets t
@@ -211,6 +218,7 @@ scope AS (
 vis AS (
     SELECT a.* FROM attempts a JOIN scope s ON s.id = a.ticket_id
     WHERE NOT (a."trigger" = 'explore' AND a.outcome IN ('failed_checks', 'kicked_back'))
+      AND NOT (a."trigger" = 'rebase' AND a.outcome IN ('failed_checks', 'superseded'))
 )"""
 
 # started: one row per scoped ticket with a visible start attempt on the filter model.

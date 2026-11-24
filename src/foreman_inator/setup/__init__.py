@@ -21,7 +21,7 @@ import httpx
 import typer
 
 from foreman_inator import config, paths
-from foreman_inator.github.app_auth import API_URL, AppAuth
+from foreman_inator.github.app_auth import API_URL, AppAuth, GitHubError, Installation
 from foreman_inator.setup import deps, launchd, manifest
 
 Echo = Callable[[str], None]
@@ -130,6 +130,7 @@ def run_setup(
     config.save(cfg)
     if installations:
         echo(f"Installed on: {', '.join(repos) or '(no repos selected)'}")
+        _check_permissions(auth, cfg, installations, org=org, echo=echo)
     else:
         echo("No installation yet. Install the App, then run `fman setup` again.")
 
@@ -147,6 +148,38 @@ def run_setup(
     result.config = cfg
     echo(f"Config written to {paths.config_path()}.")
     return result
+
+
+def _check_permissions(
+    auth: AppAuth,
+    cfg: config.Config,
+    installations: Sequence[Installation],
+    *,
+    org: str | None,
+    echo: Echo,
+) -> dict[str, str]:
+    """#41: an App created before ``checks: read`` / ``actions: read`` were added lacks
+    them; print how to add them (the worker meanwhile skips CI with one warning).
+    Returns the missing permissions (union over installations)."""
+    missing: dict[str, str] = {}
+    lacking: list[int] = []
+    for inst in installations:
+        try:
+            granted = manifest.installation_permissions(auth, inst.id)
+        except GitHubError as exc:
+            echo(f"Could not read the permissions of installation {inst.id}: {exc}")
+            continue
+        gap = manifest.missing_permissions(granted)
+        if gap:
+            missing.update(gap)
+            lacking.append(inst.id)
+    if missing:
+        echo(
+            manifest.permissions_upgrade_text(
+                cfg.app_slug, missing, org=org, installation_ids=lacking
+            )
+        )
+    return missing
 
 
 def uninstall(

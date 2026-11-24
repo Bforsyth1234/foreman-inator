@@ -57,13 +57,26 @@ APP_DESCRIPTION = (
     "local and cloud models. Runs on the owner's Mac; polls, no webhook."
 )
 
-# SPEC "Architecture and GitHub mapping": exactly these, nothing more.
+# SPEC "Architecture and GitHub mapping": exactly these, nothing more. ``checks`` and
+# ``actions`` (read) were added by #41 to read CI on the PR head and its job logs
+# (docs.github.com/en/rest/authentication/permissions-required-for-github-apps, read
+# 2026-11-23: list check runs for a ref needs Checks read; download job logs needs
+# Actions read).
 PERMISSIONS: dict[str, str] = {
     "issues": "write",
     "pull_requests": "write",
     "contents": "write",
     "metadata": "read",
+    "checks": "read",
+    "actions": "read",
 }
+#: Permissions added after the first release, with why: an App registered earlier lacks
+#: them and the worker skips that step with one warning (#41).
+ADDED_PERMISSIONS: dict[str, tuple[str, str]] = {
+    "checks": ("read", "read GitHub CI results for the PR head"),
+    "actions": ("read", "read the log of a failing Actions job"),
+}
+_LEVEL = {"read": 1, "write": 2}
 
 CALLBACK_PATH = "/callback"
 START_PATH = "/start"
@@ -303,6 +316,64 @@ def installation_repos(auth: AppAuth, installation_id: int) -> list[str]:
         page += 1
 
 
+def missing_permissions(granted: dict[str, str]) -> dict[str, str]:
+    """``PERMISSIONS`` entries ``granted`` lacks or holds at a lower level."""
+    return {
+        k: v for k, v in PERMISSIONS.items() if _LEVEL.get(granted.get(k, ""), 0) < _LEVEL.get(v, 0)
+    }
+
+
+def installation_permissions(auth: AppAuth, installation_id: int) -> dict[str, str]:
+    """``GET /app/installations/{id}`` (App JWT) -> the permissions that installation has
+    granted. https://docs.github.com/en/rest/apps/apps#get-an-installation-for-the-authenticated-app
+    (read 2026-11-23)."""
+    data = auth._request("GET", f"/app/installations/{int(installation_id)}")
+    return {str(k): str(v) for k, v in (data.get("permissions") or {}).items()}
+
+
+def permissions_upgrade_text(
+    app_slug: str | None,
+    missing: dict[str, str],
+    *,
+    org: str | None = None,
+    installation_ids: Sequence[int] = (),
+) -> str:
+    """What ``fman setup`` prints for an App registered before a permission was added
+    (empty when nothing is missing)."""
+    if not missing:
+        return ""
+    slug = quote(app_slug or "<your-app>", safe="")
+    settings = (
+        f"{GITHUB_URL}/organizations/{quote(org, safe='')}/settings/apps/{slug}/permissions"
+        if org
+        else f"{GITHUB_URL}/settings/apps/{slug}/permissions"
+    )
+    lines = ["Your GitHub App is missing permissions this version of foreman-inator uses:"]
+    for name, level in missing.items():
+        why = ADDED_PERMISSIONS.get(name, (level, "needed by the worker"))[1]
+        label = name.replace("_", " ").capitalize()
+        lines.append(f"  - {label}: {level} (to {why})")
+    lines += [
+        "To add them:",
+        f"  1. Open {settings}",
+        "  2. Under 'Repository permissions', set each one above to the level shown, then"
+        " 'Save changes'.",
+        "  3. GitHub asks each installation to accept the new permissions: open the"
+        " installation's page and click 'Accept new permissions'"
+        + (
+            ":"
+            if installation_ids
+            else f" ({GITHUB_URL}/settings/installations, or your org's settings)."
+        ),
+    ]
+    lines += [f"     {GITHUB_URL}/settings/installations/{int(i)}" for i in installation_ids]
+    lines.append(
+        "Until then the worker skips the CI step with one warning and PRs still get the AI"
+        " review; nothing else changes."
+    )
+    return "\n".join(lines)
+
+
 def _merge(old: tuple[Any, ...], new: list[Any]) -> tuple[Any, ...]:
     out = list(old)
     for item in new:
@@ -338,6 +409,7 @@ def apply_installations(cfg: Config, installations: list[Installation], repos: l
 
 
 __all__ = [
+    "ADDED_PERMISSIONS",
     "PERMISSIONS",
     "AppCredentials",
     "CallbackServer",
@@ -349,8 +421,11 @@ __all__ = [
     "convert_code",
     "default_app_name",
     "install_url",
+    "installation_permissions",
     "installation_repos",
+    "missing_permissions",
     "new_app_url",
+    "permissions_upgrade_text",
     "start_page",
     "wait_for_installations",
 ]
