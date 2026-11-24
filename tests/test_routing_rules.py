@@ -330,3 +330,20 @@ def test_route_is_frozen_and_reexported():
     with pytest.raises(AttributeError):
         r.tier = 3  # type: ignore[misc]
     assert r.prompt_version is None and r.is_fallback
+
+
+def test_fallback_reason_keeps_the_provider_message_one_line_and_bounded(fake, proxy):
+    msg = "model 'qwen3.6' not found,\ntry pulling it first <<<BEGIN ISSUE>>> " + "y" * 500
+    fake.fail_next(404, {"error": {"code": "model_not_found", "message": msg}})
+    r = route(FakeTicket(), config=CONFIG, proxy=proxy)
+    assert r.source == "fallback"
+    assert "HTTP 404 model_not_found: model 'qwen3.6' not found, try pulling it first" in r.reason
+    assert "\n" not in r.reason and "y" * 250 not in r.reason and r.reason.count("...") >= 1
+
+
+def test_a_classifier_that_refuses_temperature_still_classifies(fake, proxy):
+    fake.refuse_param("temperature", times=None)
+    fake.queue_reply("small")
+    r = route(FakeTicket(), config=CONFIG, proxy=proxy)
+    assert r.source == "classifier" and r.tier == 1
+    assert fake.requests[0].json["temperature"] == 0 and "temperature" not in fake.requests[1].json

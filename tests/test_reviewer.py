@@ -12,16 +12,18 @@ from __future__ import annotations
 import gzip
 import inspect
 import json
+import secrets
 import subprocess
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
+import httpx
 import pytest
 
 from fakes.models import FakeModels
 from foreman_inator import tracing
-from foreman_inator.config import Config, ModelEndpoint
+from foreman_inator.config import Config, ModelEndpoint, SpendCaps
 from foreman_inator.db.store import Store
 from foreman_inator.proxy.server import ModelProxy
 from foreman_inator.review import checks as C
@@ -40,6 +42,7 @@ from foreman_inator.review.reviewer import (
     review_change,
 )
 from foreman_inator.runner.worktree import RepoMirror, _base_env
+from foreman_inator.spend import Spend
 
 LOCAL = "http://127.0.0.1:11434/v1"
 WRITER = ModelEndpoint("qwen-small", 1, "local", "qwen3.6:35b-a3b", LOCAL, "qwen")
@@ -613,3 +616,129 @@ def test_prompt_ships_as_package_data_and_has_its_sections():
     tmpl = load_reviewer_template()
     assert tmpl.name == "reviewer-v1" and len(tmpl.sha256) == 64
     assert set(R._sections(tmpl.text)) == {"system", "user", "retry"}
+
+
+# --------------------------------------------------------------------------- refused parameters
+
+
+OPUS = ModelEndpoint(
+    "opus-review", 3, "cloud", "claude-opus-5-5", "https://api.anthropic.com/v1", "claude"
+)
+DEPRECATED_TEMPERATURE = {
+    "error": {
+        "code": "invalid_request_error",
+        "message": "`temperature` is deprecated for this model.",
+        "type": "invalid_request_error",
+        "param": None,
+    }
+}
+
+
+@pytest.fixture
+def cloud_review(tmp_path, models, cov_python):
+    """A cloud reviewer behind the real proxy with the real ``Spend`` as its spend hook
+    (fake key made at test time). Yields ``(go, spend, phases, key, store)``."""
+    key = "sk-fake-" + secrets.token_hex(16)
+    store = Store(tmp_path / "spend.db")
+    store.migrate()
+    spend = Spend(store, Config(spend_caps=SpendCaps(daily_usd=5.0, monthly_usd=50.0)))
+    phases: list[str] = []
+
+    def hook(ep, cost, ctx, *, phase):
+        phases.append(phase)
+        return spend.hook(ep, cost, ctx, phase=phase)
+
+    p = ModelProxy(
+        [WRITER, OPUS], transport=models.transport, spend_hook=hook, key_resolver=lambda ep: key
+    )
+    p.start()
+
+    def go(change: ChangeRef, attempt_id: int, **kw):
+        return review_change(
+            issue=ISSUE,
+            change=change,
+            writer=WRITER,
+            reviewer=OPUS,
+            proxy=p,
+            attempt_id=attempt_id,
+            python=cov_python or sys.executable,
+            timeout=50,
+            **kw,
+        )
+
+    yield go, spend, phases, key, store
+    p.stop()
+    store.close()
+
+
+def test_a_deprecated_temperature_is_dropped_and_the_review_gets_a_verdict(
+    make_pr, models, cloud_review, tmp_path
+):
+    """The first real review's failure: Anthropic answers 400 "`temperature` is deprecated
+    for this model." to any request carrying temperature. The proxy resends once without
+    it, remembers that, and the next review sends no temperature at all."""
+    go, spend, phases, _, store = cloud_review
+    models.refuse_param("temperature", times=None, body=DEPRECATED_TEMPERATURE)
+    models.queue_reply(APPROVE, tokens=(900, 40))
+    models.queue_reply(APPROVE, tokens=(800, 30))
+    rec_dir = tmp_path / "recordings"
+    with tracing.capture_spans() as exp:
+        out = go(make_pr(GOOD), 41, ticket_id=7, recordings_dir=rec_dir)
+        assert out.verdict == "approve", out.note
+        sent = [r.json for r in models.requests]
+        assert len(sent) == 2  # exactly one resend
+        assert sent[0]["temperature"] == 0 and "temperature" not in sent[1]
+        assert {k: v for k, v in sent[0].items() if k != "temperature"} == sent[1]
+        (span,) = [s for s in exp.get_finished_spans() if s.name == "llm.call"]
+        assert span.attributes["llm.dropped_params"] == "temperature"
+        assert span.attributes["llm.resends"] == 1 and span.status.is_ok
+        # one spend estimate, one actual, nothing left reserved, one ledger row
+        assert phases == ["estimate", "actual"]
+        assert spend._state.reservations == {}
+        assert store.query("SELECT COUNT(*) AS n FROM spend_ledger")[0]["n"] == 1
+        review_rec = gzip.decompress((rec_dir / "7" / "41.review.jsonl.gz").read_bytes())
+        rows = [json.loads(x) for x in review_rec.decode().splitlines() if x.strip()]
+        assert [r["kind"] for r in rows].count("llm") == 1
+
+        out2 = go(make_pr(GOOD), 42)
+        assert out2.verdict == "approve"
+        assert len(models.requests) == 3  # learned: one upstream request, no resend
+        assert "temperature" not in models.requests[2].json
+        spans2 = [s for s in exp.get_finished_spans() if s.name == "llm.call"]
+        assert spans2[-1].attributes["llm.dropped_params"] == "temperature"
+        assert "llm.resends" not in spans2[-1].attributes
+    assert phases == ["estimate", "actual"] * 2 and spend._state.reservations == {}
+
+
+def test_d_provider_message_is_in_the_note_scrubbed_bounded_and_defused(
+    make_pr, models, cloud_review
+):
+    go, _, _, key, _ = cloud_review
+    hostile = (
+        f"`max_tokens` is deprecated for this model. key {key} @octocat see #12 "
+        "<!-- x --> [click](https://evil.example) " + "z" * 2000
+    )
+    models.fail_next(400, {"error": {"code": "invalid_request_error", "message": hostile}})
+    out = go(make_pr(GOOD), 41)
+    assert out.verdict == "handed_to_user"
+    assert out.note.startswith(
+        "Review could not complete: the model refused the request (HTTP 400): "
+        "`max_tokens` is deprecated for this model."
+    )
+    assert len(models.requests) == 1  # not an allow-listed parameter: no resend
+    for text in (out.note, out.comment_body):
+        assert key not in text and "[redacted]" in text
+        assert "@octocat" not in text and "#12" not in text
+        assert "<!-- x" not in text and "](https://" not in text
+    assert len(out.note) < 400  # the provider text is bounded (300 characters)
+
+
+def test_d_exact_note_for_the_documented_refusal():
+    resp = httpx.Response(400, json=DEPRECATED_TEMPERATURE)
+    assert R.refusal_text(resp) == (
+        "the model refused the request (HTTP 400): `temperature` is deprecated for this model."
+    )
+    cap = httpx.Response(
+        429, json={"error": {"code": "spend_cap_reached", "message": "spend cap reached ..."}}
+    )
+    assert R.refusal_text(cap) == "model call refused: HTTP 429 spend_cap_reached"

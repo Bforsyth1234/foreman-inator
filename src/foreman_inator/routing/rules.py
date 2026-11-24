@@ -54,6 +54,7 @@ from fde_kit.prompts import PromptRef, load_prompt
 
 from foreman_inator import tracing
 from foreman_inator.config import Config, ModelEndpoint
+from foreman_inator.proxy.server import upstream_error_message
 from foreman_inator.tickets import lifecycle
 from foreman_inator.tickets.prompt import clip_head, defuse
 
@@ -316,11 +317,22 @@ def _post(url: str, body: dict[str, Any], headers: dict[str, str], timeout: floa
         code = None
         if isinstance(data, dict) and isinstance(data.get("error"), dict):
             code = data["error"].get("code") or data["error"].get("type")
-        detail = f" {clip_head(str(code), ERROR_DETAIL_BUDGET)}" if code else ""
+        detail = f" {_one_line(str(code), ERROR_DETAIL_BUDGET)}" if code else ""
+        message = upstream_error_message(data)
+        if message and (text := _one_line(message, ERROR_DETAIL_BUDGET)):
+            detail += f": {text}"
         raise RouterError(f"HTTP {status}{detail}")
     if data is None:
         raise RouterError("response is not JSON")
     return data
+
+
+def _one_line(text: str, budget: int) -> str:
+    """Untrusted provider text for a reason string: one line, printable, no fence markers,
+    bounded (with "..." when cut)."""
+    text = "".join(ch if ch.isprintable() else " " for ch in text)
+    text = " ".join(defuse(text).split())
+    return text if len(text) <= budget else text[: budget - 3].rstrip() + "..."
 
 
 def _post_with_deadline(

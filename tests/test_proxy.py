@@ -496,3 +496,302 @@ def test_pricing_local_free_known_cloud_and_conservative_default():
         assert p.source.startswith("https://") and p.as_of == "2026-11-23"
     haiku = pricing.PRICES["claude-haiku-5-5"]
     assert haiku.cost(200_000, 0) == pytest.approx(0.1)  # long-prompt rate
+
+
+# --------------------------------------------------------------------------- refused parameters
+
+DEPRECATED = {
+    "error": {
+        "code": "invalid_request_error",
+        "message": "`temperature` is deprecated for this model.",
+        "type": "invalid_request_error",
+        "param": None,
+    }
+}
+
+
+def _prefix(proxy: ModelProxy, kind: str, stack) -> str:
+    if kind == "c":
+        return stack.enter_context(proxy.context(label="review")).base_url.removeprefix(proxy.url)
+    return {"a": "/a/5/v1", "x": "/x/5/v1", "none": "/v1"}[kind]
+
+
+@pytest.mark.parametrize("kind", ["a", "x", "c", "none"])
+async def test_refused_temperature_is_dropped_resent_once_and_learned(fake, spans, caplog, kind):
+    import contextlib
+
+    caplog.set_level(logging.INFO)
+    fake.refuse_param("temperature", times=None, body=DEPRECATED)
+    proxy = make_proxy(fake)
+    body = chat("claude", temperature=0, max_tokens=1500, stream=False)
+    with contextlib.ExitStack() as stack:
+        base = _prefix(proxy, kind, stack)
+        async with client_for(proxy) as c:
+            r = await c.post(f"{base}/chat/completions", json=body)
+            assert r.status_code == 200
+            assert r.content == fake.sent[-1]  # the successful body, byte for byte
+            assert r.headers["x-fman-dropped-params"] == "temperature"
+            first, second = fake.requests
+            assert first.json["temperature"] == 0 and "temperature" not in second.json
+            assert {k: v for k, v in first.json.items() if k != "temperature"} == second.json
+            (s,) = llm_spans(spans)
+            assert s.attributes["llm.dropped_params"] == "temperature"
+            assert s.attributes["llm.resends"] == 1
+            assert s.status.is_ok and "llm.error.message" not in s.attributes
+            # the second call drops it up front: one upstream request, no temperature
+            r2 = await c.post(f"{base}/chat/completions", json=body)
+    assert r2.status_code == 200 and r2.headers["x-fman-dropped-params"] == "temperature"
+    assert len(fake.requests) == 3 and "temperature" not in fake.requests[2].json
+    s2 = llm_spans(spans)[-1]
+    assert s2.attributes["llm.dropped_params"] == "temperature"
+    assert "llm.resends" not in s2.attributes
+    assert proxy.refused_params(MODELS[2]) == {"temperature"}
+    learned = [x for x in caplog.records if "refuses 'temperature'" in x.getMessage()]
+    assert len(learned) == 1  # one log line, the first time the pair is learned
+
+
+async def test_learned_drop_is_per_endpoint(fake, spans):
+    fake.refuse_param("temperature", times=1, body=DEPRECATED)
+    proxy = make_proxy(fake)
+    async with client_for(proxy) as c:
+        await c.post("/v1/chat/completions", json=chat("claude", temperature=0))
+        r = await c.post("/v1/chat/completions", json=chat("qwen-small", temperature=0))
+    assert fake.requests[-1].json["temperature"] == 0  # the local model was never refused
+    assert "x-fman-dropped-params" not in r.headers
+
+
+async def test_resend_reserves_and_settles_spend_once_and_records_one_row(fake, spans, tmp_path):
+    from foreman_inator.config import Config, SpendCaps
+    from foreman_inator.spend import Spend
+
+    store = Store(tmp_path / "db.sqlite")
+    store.migrate()
+    ticket = store.create_ticket(
+        repo="o/r", issue_number=1, title="t", request="r", base_branch="main"
+    )
+    attempt = store.add_attempt(ticket.id, model="claude", tier=3, trigger="first")
+    spend = Spend(store, Config(spend_caps=SpendCaps(daily_usd=5.0, monthly_usd=50.0)))
+    phases: list[tuple[str, float]] = []
+    usage: list[CallUsage] = []
+
+    def hook(ep, cost, ctx, *, phase):
+        phases.append((phase, cost))
+        return spend.hook(ep, cost, ctx, phase=phase)
+
+    fake.refuse_param("temperature", times=None, body=DEPRECATED)
+    fake.queue_reply("cloud answer", tokens=(1000, 100))
+    proxy = make_proxy(fake, spend_hook=hook, store=store, on_usage=usage.append)
+    with (
+        tracing.ticket_span(ticket.id),
+        tracing.attempt_span(attempt.id, variant_id="v", model="claude", tier=3, trigger="first"),
+        tracing.Recorder(tmp_path / "rec", ticket.id, attempt.id) as rec,
+    ):
+        async with client_for(proxy) as c:
+            r = await c.post(
+                f"/a/{attempt.id}/v1/chat/completions",
+                json=chat("claude", temperature=0, max_tokens=1500),
+            )
+    assert r.status_code == 200 and len(fake.requests) == 2
+    assert [p for p, _ in phases] == ["estimate", "actual"]  # no second estimate
+    assert spend._state.reservations == {}  # nothing left reserved
+    assert store.query("SELECT COUNT(*) AS n FROM spend_ledger")[0]["n"] == 1
+    expected = 1000 * 2 / 1e6 + 100 * 10 / 1e6  # only the answered try is billed
+    assert phases[1][1] == pytest.approx(expected)
+    assert len(usage) == 1 and usage[0].status_code == 200
+    assert store.get_attempt(attempt.id).tokens_in == 1000
+    assert len(llm_spans(spans)) == 1
+    rows = [x for x in _raw_rows(rec.path) if x["kind"] == "llm"]
+    assert len(rows) == 1 and rows[0]["text"] == "cloud answer"
+    assert rows[0]["request"]["temperature"] == 0  # the call as the client made it
+    store.close()
+
+
+async def test_streaming_refusal_is_resent_and_streamed_unchanged(fake, spans):
+    fake.refuse_param("temperature", times=1, body=DEPRECATED)
+    fake.queue_reply("streamed after the resend", tokens=(20, 4))
+    proxy = make_proxy(fake)
+    async with client_for(proxy) as c:
+        r = await c.post(
+            "/a/3/v1/chat/completions", json=chat("claude", temperature=0, stream=True)
+        )
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("text/event-stream")
+    assert r.headers["x-fman-dropped-params"] == "temperature"
+    # the refusal arrived as a plain JSON 400 before any stream bytes
+    assert json.loads(fake.sent[0]) == DEPRECATED
+    assert r.content == fake.sent[-1] and r.content.endswith(b"data: [DONE]\n\n")
+    assert len(fake.requests) == 2 and "temperature" not in fake.requests[1].json
+    assert fake.requests[1].json["stream_options"] == {"include_usage": True}
+    (s,) = llm_spans(spans)
+    assert s.attributes["output.value"] == "streamed after the resend"
+    assert s.attributes["llm.resends"] == 1 and s.status.is_ok
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        # vague
+        {"message": "Invalid request.", "type": "invalid_request_error"},
+        # a parameter that changes what is asked
+        {"message": "`max_tokens` is deprecated for this model.", "code": "invalid_request_error"},
+        {"message": "'stop' is not supported with this model.", "code": "unsupported_parameter"},
+        # structured param not on the allow-list wins over a message naming temperature
+        {
+            "message": "`temperature` is not supported here.",
+            "param": "stop",
+            "code": "unsupported_parameter",
+        },
+        # a bad value, not a refused parameter
+        {"message": "`temperature` must be between 0 and 1.", "code": "invalid_request_error"},
+        # several sent parameters named: ambiguous
+        {"message": "`temperature` and `top_p` are not supported together.", "param": None},
+        # a parameter the client did not send
+        {"message": "`seed` is not supported for this model.", "param": None},
+    ],
+)
+async def test_other_400s_pass_through_unchanged_without_resend(fake, spans, error):
+    fake.fail_next(400, {"error": error})
+    proxy = make_proxy(fake)
+    async with client_for(proxy) as c:
+        r = await c.post(
+            "/a/1/v1/chat/completions",
+            json=chat("claude", temperature=0, top_p=1, stop=["x"], max_tokens=10),
+        )
+    assert r.status_code == 400 and r.content == fake.sent[-1]
+    assert len(fake.requests) == 1
+    assert "x-fman-dropped-params" not in r.headers
+    assert proxy.refused_params(MODELS[2]) == frozenset()
+
+
+async def test_a_refusal_that_is_not_a_400_is_not_resent(fake, spans):
+    fake.refuse_param("temperature", status=500, body=DEPRECATED)
+    proxy = make_proxy(fake)
+    async with client_for(proxy) as c:
+        r = await c.post("/v1/chat/completions", json=chat("claude", temperature=0))
+    assert r.status_code == 500 and len(fake.requests) == 1
+
+
+@pytest.mark.parametrize("code", ["unsupported_parameter", "unsupported_value"])
+async def test_structured_refusal_is_matched_on_param_and_code(fake, spans, code):
+    body = {
+        "error": {
+            "message": "Unsupported value: 'top_p' does not support 0.5 with this model.",
+            "type": "invalid_request_error",
+            "param": "top_p",
+            "code": code,
+        }
+    }
+    fake.refuse_param("top_p", body=body)
+    proxy = make_proxy(fake)
+    async with client_for(proxy) as c:
+        r = await c.post("/v1/chat/completions", json=chat("claude", top_p=0.5))
+    assert r.status_code == 200 and r.headers["x-fman-dropped-params"] == "top_p"
+    assert "top_p" not in fake.requests[1].json
+
+
+async def test_resends_are_capped_per_call(fake, spans):
+    for p in ("temperature", "top_p", "seed"):
+        fake.refuse_param(
+            p,
+            times=None,
+            body={"error": {"message": f"`{p}` is not supported for this model."}},
+        )
+    proxy = make_proxy(fake)
+    async with client_for(proxy) as c:
+        r = await c.post(
+            "/v1/chat/completions", json=chat("claude", temperature=0, top_p=1, seed=7)
+        )
+    assert len(fake.requests) == 3  # the first try and two resends, then pass through
+    assert r.status_code == 400 and r.content == fake.sent[-1]
+    assert r.headers["x-fman-dropped-params"] == "temperature,top_p"
+    (s,) = llm_spans(spans)
+    assert s.attributes["llm.resends"] == 2 and not s.status.is_ok
+
+
+# --------------------------------------------------------------------------- provider error text
+
+
+async def test_provider_error_text_is_on_the_span_and_recording_and_bounded(fake, spans, tmp_path):
+    long = "This model is overloaded right now. " + "x" * 3000
+    fake.fail_next(529, {"type": "error", "error": {"type": "overloaded_error", "message": long}})
+    proxy = make_proxy(fake)
+    with (
+        tracing.ticket_span(1),
+        tracing.attempt_span(2, variant_id="v", model="claude", tier=3, trigger="first"),
+        tracing.Recorder(tmp_path / "rec", 1, 2) as rec,
+    ):
+        async with client_for(proxy) as c:
+            r = await c.post("/a/2/v1/chat/completions", json=chat("claude"))
+    assert r.status_code == 529 and r.content == fake.sent[-1]  # passed through unchanged
+    (s,) = llm_spans(spans)
+    msg = s.attributes["llm.error.message"]
+    assert msg.startswith("This model is overloaded right now.") and len(msg) <= 500
+    assert s.status.description == f"upstream HTTP 529: {msg}"
+    assert "output.value" not in s.attributes or s.attributes["output.value"] == ""
+    (row,) = [x for x in _raw_rows(rec.path) if x["kind"] == "llm"]
+    assert row["stop_reason"] == "error" and row["text"] == ""
+    assert row["raw_content"] == [{"type": "error", "text": msg}]
+
+
+async def test_non_json_error_body_is_kept_as_text(fake, spans):
+    async def html(request):
+        return httpx.Response(502, content=b"<html>Bad gateway\n</html>")
+
+    proxy = ModelProxy(MODELS, transport=httpx.MockTransport(html))
+    async with client_for(proxy) as c:
+        r = await c.post("/v1/chat/completions", json=chat())
+    assert r.status_code == 502 and r.content == b"<html>Bad gateway\n</html>"
+    (s,) = llm_spans(spans)
+    assert s.attributes["llm.error.message"] == "<html>Bad gateway </html>"
+
+
+async def test_upstream_echoing_the_key_leaks_it_nowhere(
+    fake, spans, tmp_path, caplog, fake_keychain
+):
+    caplog.set_level(logging.DEBUG)
+    key = fake_keychain[("foreman-inator", "anthropic")]
+    other = "sk-ant-other-" + secrets.token_hex(12)
+    echo = (
+        f"invalid x-api-key: {key}. You sent Authorization: Bearer {key} "
+        f'(headers {{"authorization": "Bearer {other}", "x-api-key": "{other}"}})'
+    )
+    fake.fail_next(401, {"error": {"type": "authentication_error", "message": echo}})
+    fake.fail_next(400, {"error": {"message": f"`temperature` bad for key {key}"}})
+    proxy = make_proxy(fake)
+    bodies = []
+    with (
+        tracing.ticket_span(1),
+        tracing.attempt_span(2, variant_id="v", model="claude", tier=3, trigger="first"),
+        tracing.Recorder(tmp_path / "rec", 1, 2) as rec,
+    ):
+        async with client_for(proxy) as c:
+            for stream in (False, True):
+                r = await c.post("/a/2/v1/chat/completions", json=chat("claude", stream=stream))
+                bodies.append(r.content)
+    assert fake.requests[0].headers["authorization"] == f"Bearer {key}"
+    assert b"[redacted]" in bodies[0]  # the rest of the error still reaches the client
+    everything = [json.dumps(dict(s.attributes), default=str) for s in spans.get_finished_spans()]
+    everything += [s.status.description or "" for s in spans.get_finished_spans()]
+    everything += [b.decode() for b in bodies]
+    everything += [rec.path.read_bytes().hex(), json.dumps(_raw_rows(rec.path))]
+    everything += [r.getMessage() for r in caplog.records]
+    assert not any(key in text for text in everything)
+    # anything else that looks like a credential is scrubbed from what the proxy stores
+    # (the client's own copy of the error body is the provider's, minus our key)
+    stored = [t for t in everything if t not in {b.decode() for b in bodies}]
+    assert not any(other in text for text in stored)
+    msgs = [s.attributes["llm.error.message"] for s in llm_spans(spans)]
+    assert "invalid x-api-key: [redacted]" in msgs[0]
+
+
+def test_refused_param_matcher_rules():
+    from foreman_inator.proxy.server import DROPPABLE_PARAMS, refused_param
+
+    sent = {"model": "m", "messages": [], "temperature": 0, "max_tokens": 5}
+    assert refused_param(400, DEPRECATED, sent) == "temperature"
+    assert refused_param(400, DEPRECATED, {"model": "m"}) is None  # not sent
+    assert refused_param(422, DEPRECATED, sent) is None
+    assert refused_param(400, {"error": "temperature unsupported"}, sent) is None
+    assert DROPPABLE_PARAMS.isdisjoint(
+        {"model", "messages", "tools", "max_tokens", "max_completion_tokens", "stop"}
+    )

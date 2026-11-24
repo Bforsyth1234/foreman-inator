@@ -639,3 +639,11 @@ def test_prompt_template_ships_with_both_sections():
     for label in MODEL_LABELS:
         assert label in ref.text
     assert "reviewer_miss" not in ref.text
+
+
+def test_http_error_reason_keeps_the_provider_message(store, rec_dir, fake, proxy):
+    _, _, k, _ = _setup(store, rec_dir, "wrong_edit")
+    fake.fail_next(503, {"error": {"code": "overloaded", "message": "server busy, retry later"}})
+    res = label_kickback(store, k.id, recordings_dir=rec_dir, config=CONFIG, proxy=proxy)
+    assert res.label is None
+    assert "HTTP 503 overloaded: server busy, retry later" in res.reason

@@ -68,6 +68,7 @@ from foreman_inator import tracing
 from foreman_inator.config import Config, ModelEndpoint
 from foreman_inator.db.store import TAGS, Kickback, Review, Store
 from foreman_inator.proxy import pricing
+from foreman_inator.proxy.server import scrub_secrets, upstream_error_message
 from foreman_inator.runner import verify
 from foreman_inator.runner.worktree import RepoMirror, Worktree
 from foreman_inator.tickets.prompt import clip_head, defuse
@@ -117,6 +118,40 @@ class MalformedVerdict(ValueError):
 
 class ModelCallError(RuntimeError):
     """The proxy or upstream refused or failed the reviewer's model call."""
+
+
+#: How much of a provider's error message the hand-over note quotes.
+PROVIDER_TEXT_BUDGET = 300
+_ISSUE_REF = re.compile(r"#(?=\d)")
+
+
+def provider_text(text: str, budget: int = PROVIDER_TEXT_BUDGET) -> str:
+    """A provider's error message made safe for a GitHub comment and the PR body (it is
+    untrusted): one line, no control characters, no fence markers, @mentions, issue
+    references, HTML, markdown links or images, and at most ``budget`` characters."""
+    text = "".join(ch if ch.isprintable() else " " for ch in text)
+    text = " ".join(scrub_secrets(defuse(text)).split())
+    text = text.replace("<", "&lt;").replace(">", "&gt;")
+    text = text.replace("](", "] (").replace("![", "! [")
+    text = _ISSUE_REF.sub("#\u200b", _MENTION.sub("@\u200b", text))
+    if len(text) > budget:
+        text = text[: budget - 3].rstrip() + "..."
+    return text
+
+
+def refusal_text(resp: httpx.Response) -> str:
+    """What a non-200 from the proxy means, for the hand-over note. A spend-cap refusal
+    keeps its fixed wording; otherwise the provider's (or proxy's) message is quoted."""
+    data: Any = None
+    with contextlib.suppress(ValueError):
+        data = resp.json()
+    err = data.get("error") if isinstance(data, dict) else None
+    code = err.get("code") if isinstance(err, dict) else None
+    code = code if isinstance(code, str) else ""
+    message = upstream_error_message(data)
+    if code == "spend_cap_reached" or not message or not provider_text(message):
+        return f"model call refused: HTTP {resp.status_code} {code}".strip()
+    return f"the model refused the request (HTTP {resp.status_code}): {provider_text(message)}"
 
 
 class _OutOfTime(Exception):
@@ -216,10 +251,7 @@ class ProxyReviewModel:
         except httpx.HTTPError as exc:
             raise ModelCallError(f"model call failed: {type(exc).__name__}") from None
         if resp.status_code != 200:
-            code = ""
-            with contextlib.suppress(ValueError, AttributeError, TypeError):
-                code = resp.json()["error"].get("code") or ""
-            raise ModelCallError(f"model call refused: HTTP {resp.status_code} {code}".strip())
+            raise ModelCallError(refusal_text(resp))
         try:
             data = resp.json()
             text = data["choices"][0]["message"]["content"] or ""
@@ -658,7 +690,8 @@ class _Run:
             )
             return self.finish("handed_to_user", None, f"Review could not complete: {why}.", shadow)
         except ModelCallError as exc:
-            return self.finish("handed_to_user", None, f"Review could not complete: {exc}.", shadow)
+            why = str(exc).rstrip(".")
+            return self.finish("handed_to_user", None, f"Review could not complete: {why}.", shadow)
         except Exception as exc:  # a review that cannot complete never approves
             return self.finish(
                 "handed_to_user",
