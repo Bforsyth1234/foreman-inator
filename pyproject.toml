@@ -7,6 +7,32 @@ license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "Brooks Forsyth" }]
 requires-python = ">=3.12"
+keywords = [
+    "github-app",
+    "coding-agent",
+    "llm",
+    "model-routing",
+    "code-review",
+    "ollama",
+    "opencode",
+]
+# No "License ::" classifier: the SPDX `license` expression above replaces it (PEP 639).
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development",
+    "Topic :: Software Development :: Quality Assurance",
+]
+# fde-kit is not on PyPI (checked 2026-11-23). `[tool.uv.sources]` below points it at
+# GitHub, but only uv reads that table, and only when building from this source tree or a
+# git checkout: a built wheel says just `Requires-Dist: fde-kit`. So the package installs
+# from GitHub today, not from PyPI. See docs/releasing.md ("The fde-kit problem").
 dependencies = [
     "fde-kit",
     "httpx>=0.27",
@@ -19,7 +45,11 @@ dependencies = [
 ]
 
 [project.urls]
+Homepage = "https://github.com/Bforsyth1234/foreman-inator"
 Repository = "https://github.com/Bforsyth1234/foreman-inator"
+Documentation = "https://github.com/Bforsyth1234/foreman-inator/tree/main/docs"
+Issues = "https://github.com/Bforsyth1234/foreman-inator/issues"
+Changelog = "https://github.com/Bforsyth1234/foreman-inator/releases"
 
 [project.scripts]
 foreman-inator = "foreman_inator.cli:app"

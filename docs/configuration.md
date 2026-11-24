@@ -1,0 +1,159 @@
+# Configuration
+
+The worker reads `~/.foreman-inator/config.toml` (or
+`$FOREMAN_INATOR_HOME/config.toml`) once, when it starts; restart it after an
+edit (see [setup.md](setup.md#8-stopping-restarting-and-uninstalling)).
+`fman setup` writes the file with every key filled in, so you edit values
+rather than add keys. Every key is optional; a missing key takes the default
+below. The source of truth is `src/foreman_inator/config.py`.
+
+Validation is strict: an unknown key at any level is an error, and so is any
+key named like a secret (`api_key`, `key`, `token`, `secret`, `password`, ...)
+or any value shaped like an API key (`sk-...`, `ghp_...`, ...). API keys live in
+the macOS Keychain: store one with `fman config set-key <name>` and refer to it
+as `"keychain:foreman-inator/<name>"`.
+
+## Top-level keys
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `app_id` | none | Your GitHub App's id. Written by `fman setup`. |
+| `app_slug` | none | Your App's slug; the bot account is `<slug>[bot]`. Written by `fman setup`. |
+| `installation_ids` | `[]` | The App's installations. Written by `fman setup`. |
+| `allowed_users` | `[]` | GitHub logins whose labels, reviews and answers count (case-insensitive). Empty means no label starts work. |
+| `repos` | `[]` | Repos to poll, as `"owner/name"`. Setup adds every repo of the installation; remove the ones you do not want worked on. |
+| `poll_interval_seconds` | `45` | Seconds between polls. At least 5. |
+| `reviewer_models` | `["claude-opus", "glm"]` | AI reviewer preference order, by model `name`. The first whose `family` differs from the writer's is used. Each name must be in `[[models]]`. |
+| `max_parallel_per_repo` | `1` | Tickets of one repo worked at the same time, as far as file locks permit. 1 to 16. 1 suits one local GPU. |
+| `router_timeout_seconds` | `30` | Time limit for the router's classification call. Above 0, at most 600. |
+| `sandbox` | `"on"` | `"on"`: OpenCode, the verify command and the reviewer's checks run under `sandbox-exec`, and nothing runs if the sandbox cannot start. `"off"`: they run unsandboxed, and `fman status` and every PR description say so. |
+| `clarify` | `true` | Ask questions on a vague issue before working on it. |
+| `embedding_model` | `"embeddinggemma"` | Model the nearest-neighbor router embeds issues with. Must differ from every writer model `name`. |
+| `embedding_base_url` | `"http://127.0.0.1:11434/v1"` | Its OpenAI-compatible endpoint (Ollama by default). A non-localhost URL needs `allow_cloud_embedder = true`, https and `embedding_api_key_ref`. |
+| `allow_cloud_embedder` | `false` | Allow sending issue text to a cloud embedding service. |
+| `embedding_api_key_ref` | none | Keychain reference for a cloud embedding service's key. |
+| `knn_threshold` | `50` | Accepted tickets before the nearest-neighbor router replaces the rules router. At least 1. |
+| `knn_k` | `10` | Neighbors that vote. At least 1. |
+| `knn_timeout_seconds` | `5` | Time limit for one routing embedding call. Above 0, at most 600. |
+| `explore_rate` | `0.10` | Share of tickets started one tier below the router's pick. 0 to 1; 0 turns it off. |
+| `failure_labels` | `true` | After each kickback, label the failure step with a local model, in the background. |
+| `failure_label_timeout_seconds` | `30` | Time limit for one labeling call. Above 0, at most 600. |
+| `allow_cloud_labeler` | `false` | Allow a cloud model as the failure labeler (by default it is the first local model). |
+
+## `[spend_caps]`
+
+Cloud spend caps in US dollars. Each must be 0 or more; 0 turns that kind of
+cloud call off.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `daily_usd` | `5.0` | Live cloud spend per local calendar day: writers and the AI reviewer. |
+| `monthly_usd` | `50.0` | Live cloud spend per local calendar month. |
+| `experiments_monthly_usd` | `10.0` | Replays and shadow reviews per month. Never draws on the live caps. |
+
+## `[sandbox_network]`
+
+Per repo, whether the sandbox lets that repo's verify command and the
+reviewer's checks reach the network. The writer (OpenCode) can only ever reach
+the model proxy. Repos not listed get `"none"`.
+
+```toml
+[sandbox_network]
+"owner/name" = "allow"   # or "none"
+```
+
+`"allow"` is needed today for a repo whose checks install dependencies (todo
+#45). It also lets check code send anything it can read.
+
+## `[experiments]`
+
+Replays, the shadow reviewer and the nightly run.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `set_size` | `100` | Latest merges a replay set is built from. At least 1. |
+| `run_budget_usd` | `2.0` | Cloud spend one replay run may use, inside the experiments budget. 0 or more. |
+| `writer_timeout_s` | `1200` | Time limit for one writer replay side. |
+| `verify_timeout_s` | `600` | Time limit for scoring one writer side with the merged tests. |
+| `review_timeout_s` | `1800` | Time limit for one replayed review. |
+| `min_cases` | `10` | Cases scored on both sides before a replay gives a verdict. At least 1. |
+| `live_min_sample` | `30` | Paired PRs you decided before a shadowed reviewer is judged live. At least 1. |
+| `shadow` | `true` | Run a running shadow experiment's challenger on live PRs. |
+| `shadow_timeout_s` | `900` | Time limit for one shadow review. |
+| `nightly_hour` | `2` | Local hour (0–23) of the nightly `fman experiment run --all`. Takes effect when `fman setup` is run again. |
+| `nightly_minute` | `0` | Its minute (0–59). |
+
+Timeouts are in seconds and must be above 0.
+
+## Models
+
+`[[models]]` is the list of writer and reviewer models, one table each. It
+replaces the default list as a whole, and every tier (1, 2 and 3) needs at
+least one model. Within a tier, the order in the file is the try order, and
+every model is one rung of the escalation ladder.
+
+| Key | Required | Meaning |
+| --- | --- | --- |
+| `name` | yes | Unique handle used in config, attempts and metrics, for example `"inkling-2-mini"`. |
+| `tier` | yes | 1, 2 or 3. |
+| `kind` | yes | `"local"` (on this Mac; must be a localhost URL; free) or `"cloud"` (https, needs `api_key_ref`, counts toward the spend caps). |
+| `model` | yes | The model id sent to the endpoint. |
+| `base_url` | yes | OpenAI-compatible base URL. |
+| `family` | yes | For example `"qwen"` or `"claude"`. The AI reviewer must be from a different family than the writer. |
+| `api_key_ref` | for cloud | `"keychain:foreman-inator/<name>"`. |
+
+The defaults:
+
+| `name` | `tier` | `kind` | `model` | `base_url` | `family` | `api_key_ref` |
+| --- | --- | --- | --- | --- | --- | --- |
+| `inkling-2-mini` | 1 | local | `inkling-2-mini` | `http://127.0.0.1:11434/v1` | inkling | |
+| `qwen3.8-27b` | 2 | local | `qwen3.8:27b` | `http://127.0.0.1:11434/v1` | qwen | |
+| `glm` | 3 | cloud | `glm-5.3` | `https://api.z.ai/api/coding/paas/v4` | glm | `keychain:foreman-inator/glm` |
+| `claude-opus` | 3 | cloud | `claude-opus-5-5` | `https://api.anthropic.com/v1` | claude | `keychain:foreman-inator/anthropic` |
+| `claude-fable` | 3 | cloud | `claude-fable-5-2` | `https://api.anthropic.com/v1` | claude | `keychain:foreman-inator/anthropic` |
+
+The Claude models are called through Anthropic's OpenAI-compatible endpoint,
+which has no prompt caching (todo #52).
+
+## Example
+
+```toml
+app_id = 123456
+app_slug = "foreman-inator-a1b2c3"
+installation_ids = [7890]
+allowed_users = ["you"]
+repos = ["you/project"]
+poll_interval_seconds = 45
+reviewer_models = ["claude-opus", "glm"]
+sandbox = "on"
+
+[sandbox_network]
+"you/project" = "none"
+
+[spend_caps]
+daily_usd = 5.0
+monthly_usd = 50.0
+experiments_monthly_usd = 10.0
+```
+
+This file has no `[[models]]` tables, so it uses the five default models. A
+file with `[[models]]` lists every model itself, one table each:
+
+```toml
+[[models]]
+name = "glm"
+tier = 3
+kind = "cloud"
+model = "glm-5.3"
+base_url = "https://api.z.ai/api/coding/paas/v4"
+family = "glm"
+api_key_ref = "keychain:foreman-inator/glm"
+```
+
+## Per-repo settings in the database
+
+One setting is kept in the worker's database rather than in `config.toml`:
+the verify command, set with `fman repo set-verify <owner/name> '<command>'`
+and cleared with `--clear`. The per-repo profiles described in SPEC.md
+(`writer` and `review` modes, `fman repo set-profile`) are not built yet
+(todo #51).

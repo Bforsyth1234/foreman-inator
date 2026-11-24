@@ -328,6 +328,69 @@ def replay_command(
     )
 
 
+@app.command("export")
+def export_command(
+    ticket: Annotated[str, typer.Argument(help="Ticket id (from `fman status`).")],
+    redact: Annotated[
+        bool,
+        typer.Option("--redact", help="Required: replace your code and text (no raw mode)."),
+    ] = False,
+    output: Annotated[
+        Path | None,
+        typer.Option(
+            "-o",
+            "--output",
+            help="A .tar.gz/.tgz file, or an empty folder (default: ~/Downloads).",
+            show_default=False,
+        ),
+    ] = None,
+    recordings: Annotated[
+        Path | None, typer.Option("--recordings", help="Recordings folder (default: yours).")
+    ] = None,
+    traces: Annotated[
+        Path | None, typer.Option("--traces", help="Traces folder (default: yours).")
+    ] = None,
+    db: Annotated[
+        Path | None, typer.Option("--db", help="Database (default: yours; opened read-only).")
+    ] = None,
+) -> None:
+    """Export one ticket's trace, recordings and store rows for a bug report, with your
+    code, prompts, tool output, notes, repo names and paths replaced (allow-list
+    redaction). Only structure, timings, counts, models and decisions are kept."""
+    from foreman_inator import config as config_mod
+    from foreman_inator import export, paths
+    from foreman_inator.routing import escalation
+
+    if not redact:
+        typer.echo(export.REFUSE_RAW, err=True)
+        raise typer.Exit(2)
+    base = None if recordings and traces and db else paths.home()
+    try:
+        cfg = config_mod.load()
+    except config_mod.ConfigError:
+        cfg = config_mod.Config()
+    try:
+        res = export.export_ticket(
+            ticket,
+            recordings_dir=recordings or base / "recordings",  # type: ignore[operator]
+            traces_dir=traces or base / "traces",  # type: ignore[operator]
+            db_path=db or base / paths.DB_NAME,  # type: ignore[operator]
+            out=output,
+            ladder=escalation.build_ladder(cfg.models),
+        )
+    except export.ExportError as exc:
+        _fail(exc)
+    tree = export.git_work_tree(res.path)
+    if tree is not None:
+        typer.echo(f"Warning: {res.path} is inside the git work tree {tree}; do not commit it.")
+    n = res.manifest["counts"]
+    typer.echo(
+        f"Wrote {res.path} ({len(res.manifest['files'])} files, "
+        f"{n['values_replaced']} values replaced). Read MANIFEST.json before sharing: "
+        "sizes, timings, counts and file extensions are still visible."
+    )
+
+
 def _register_setup() -> None:
     from foreman_inator.setup import setup_command
 

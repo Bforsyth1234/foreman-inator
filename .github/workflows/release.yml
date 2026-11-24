@@ -1,0 +1,280 @@
+# Release foreman-inator: build, check, smoke-test, publish (trusted publishing), GitHub release.
+#
+# Triggers
+#   push of a tag v*          full version (v0.2.0)       -> PyPI, then a GitHub release
+#                             pre-release (v0.2.0rc1)     -> TestPyPI, then a GitHub pre-release
+#   workflow_dispatch         manual run from any ref     -> TestPyPI only (no GitHub release)
+#
+# No stored tokens: PyPI and TestPyPI accept this workflow through trusted publishing (OIDC,
+# `id-token: write` on the publish jobs only). GitHub-hosted runners only: this repo is public.
+#
+# PUBLISH GATE. Nothing is uploaded unless BOTH hold:
+#   1. PUBLISH_ENABLED below is "true" (the maintainer flips it in a reviewed commit), and
+#   2. the built wheel resolves from PyPI alone, the way a stranger's
+#      `uv tool install foreman-inator` would resolve it.
+# Today (2026-11-23) fde-kit is not on PyPI, so 2 fails and PUBLISH_ENABLED is "false":
+# the publish jobs are skipped and the `publish-skipped` job says why. Tags still get a
+# GitHub release with the wheel and sdist attached. See docs/releasing.md.
+#
+# Pins: every action is pinned to a full commit SHA (GitHub's hardening guidance), with the
+# release tag in a comment. To update: `git ls-remote --tags https://github.com/OWNER/REPO`
+# and take the commit of the new tag (the `^{}` line for annotated tags), or let Dependabot
+# (github-actions ecosystem) propose bumps. See docs/releasing.md ("Updating action pins").
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # Flip to "true" only after the fde-kit decision in docs/releasing.md is carried out.
+  PUBLISH_ENABLED: "false"
+  UV_VERSION: "0.9.29"
+
+jobs:
+  build:
+    name: Build and check distributions
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      prerelease: ${{ steps.meta.outputs.prerelease }}
+      publishable: ${{ steps.gate.outputs.publishable }}
+      reason: ${{ steps.gate.outputs.reason }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: false # no shared cache in a release workflow (cache poisoning)
+
+      - name: Build sdist and wheel
+        run: uv build --no-sources --out-dir dist
+
+      - name: Read version; check it matches the tag
+        id: meta
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          python3 - <<'PY'
+          import email, glob, os, re, sys, zipfile
+          (wheel,) = glob.glob("dist/*.whl")
+          with zipfile.ZipFile(wheel) as zf:
+              meta = next(n for n in zf.namelist() if n.endswith(".dist-info/METADATA"))
+              version = email.message_from_bytes(zf.read(meta))["Version"]
+          if os.environ["REF_TYPE"] == "tag" and os.environ["REF_NAME"] != f"v{version}":
+              print(f"::error::tag {os.environ['REF_NAME']} does not match package version "
+                    f"{version} (expected tag v{version}). Bump `version` in pyproject.toml "
+                    "or fix the tag.")
+              sys.exit(1)
+          pre = bool(re.search(r"(a|b|rc)\d+|\.dev\d+", version))
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"version={version}\nprerelease={str(pre).lower()}\n")
+          print(f"version {version}, pre-release: {pre}")
+          PY
+
+      - name: Check package contents and metadata
+        run: |
+          python3 - <<'PY'
+          import email, glob, pathlib, sys, tarfile, zipfile
+          src = pathlib.Path("src/foreman_inator")
+          data = {p.relative_to(src.parent).as_posix()
+                  for p in [*src.glob("prompts/*.md"), *src.glob("db/migrations/*.sql")]}
+          (wheel,) = glob.glob("dist/*.whl")
+          (sdist,) = glob.glob("dist/*.tar.gz")
+          names = set(zipfile.ZipFile(wheel).namelist())
+          problems = [f"wheel is missing {p}" for p in sorted(data - names)]
+          problems += [f"wheel contains {n}" for n in sorted(names)
+                       if n.startswith("tests/") or n.endswith((".pyc", "conftest.py"))]
+          snames = {m.name.split("/", 1)[-1] for m in tarfile.open(sdist).getmembers()}
+          problems += [f"sdist is missing src/{p}" for p in sorted(data) if f"src/{p}" not in snames]
+          meta_name = next(n for n in names if n.endswith(".dist-info/METADATA"))
+          meta = email.message_from_bytes(zipfile.ZipFile(wheel).read(meta_name))
+          direct = [r for r in meta.get_all("Requires-Dist") or [] if " @ " in r]
+          problems += [f"direct URL requirement (PyPI refuses it): {r}" for r in direct]
+          for p in problems:
+              print(f"::error::{p}")
+          sys.exit(1 if problems else 0)
+          PY
+
+      - name: Publish gate (does the wheel install from PyPI alone?)
+        id: gate
+        run: |
+          uv venv --python 3.12 "$RUNNER_TEMP/gate"
+          if uv pip install --dry-run --no-sources --no-build --no-config \
+               --python "$RUNNER_TEMP/gate/bin/python" --default-index https://pypi.org/simple \
+               dist/*.whl > "$RUNNER_TEMP/gate.log" 2>&1; then
+            resolves=true
+          else
+            resolves=false
+          fi
+          cat "$RUNNER_TEMP/gate.log"
+          if [ "$resolves" = true ] && [ "$PUBLISH_ENABLED" = true ]; then
+            echo "publishable=true" >> "$GITHUB_OUTPUT"
+            echo "reason=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$resolves" != true ]; then
+            reason="the wheel does not install from PyPI alone (fde-kit is not on PyPI?)"
+          else
+            reason="PUBLISH_ENABLED is not \"true\" in release.yml"
+          fi
+          echo "publishable=false" >> "$GITHUB_OUTPUT"
+          echo "reason=$reason" >> "$GITHUB_OUTPUT"
+          echo "::warning title=Publish skipped::$reason. See docs/releasing.md."
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
+
+  smoke:
+    # The suite runs against the BUILT wheel (not the source tree), on both CI platforms.
+    # fde-kit comes from the lockfile (its git commit), the route that works today.
+    name: Test the built wheel (${{ matrix.os }})
+    needs: build
+    strategy:
+      fail-fast: true
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist
+          path: dist/
+      - name: Install dependencies, then the wheel (not the source tree)
+        run: |
+          uv sync --locked --no-install-project
+          uv pip install --no-deps dist/*.whl
+      - name: Entry points
+        run: |
+          uv run --no-sync python -c "import foreman_inator as f; assert 'site-packages' in f.__file__, f.__file__"
+          uv run --no-sync foreman-inator --version
+          uv run --no-sync fman --version
+          uv run --no-sync fman --help
+      - name: Test suite against the installed wheel
+        run: uv run --no-sync pytest -q -n auto -p no:cacheprovider
+
+  publish-skipped:
+    name: Publish skipped
+    needs: [build, smoke]
+    if: needs.build.outputs.publishable != 'true'
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Explain
+        env:
+          REASON: ${{ needs.build.outputs.reason }}
+        run: |
+          msg="Not publishing to PyPI or TestPyPI: ${REASON}. See docs/releasing.md."
+          echo "::notice title=Publish skipped::${msg}"
+          echo "### Publish skipped" >> "$GITHUB_STEP_SUMMARY"
+          echo "${msg}" >> "$GITHUB_STEP_SUMMARY"
+
+  publish-testpypi:
+    name: Publish to TestPyPI
+    needs: [build, smoke]
+    if: >-
+      needs.build.outputs.publishable == 'true' &&
+      (github.event_name == 'workflow_dispatch' ||
+       (github.ref_type == 'tag' && needs.build.outputs.prerelease == 'true'))
+    runs-on: ubuntu-latest
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/p/foreman-inator
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+        with:
+          repository-url: https://test.pypi.org/legacy/
+
+  publish-pypi:
+    name: Publish to PyPI
+    needs: [build, smoke]
+    if: >-
+      needs.build.outputs.publishable == 'true' &&
+      github.event_name == 'push' && github.ref_type == 'tag' &&
+      needs.build.outputs.prerelease == 'false'
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/foreman-inator
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+
+  github-release:
+    name: GitHub release
+    needs: [build, smoke, publish-testpypi, publish-pypi]
+    # Runs for tag pushes once the wheel passed its tests, and only if no publish job failed
+    # (a skipped publish is fine: the release then says the package is not on PyPI yet).
+    if: >-
+      always() && github.event_name == 'push' && github.ref_type == 'tag' &&
+      needs.build.result == 'success' && needs.smoke.result == 'success' &&
+      needs.publish-testpypi.result != 'failure' && needs.publish-testpypi.result != 'cancelled' &&
+      needs.publish-pypi.result != 'failure' && needs.publish-pypi.result != 'cancelled'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist
+          path: dist/
+      # `--notes` is prepended to the generated notes (gh release create --help).
+      - name: Create the release with generated notes and the built files
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          PRERELEASE: ${{ needs.build.outputs.prerelease }}
+          PUBLISHED: ${{ needs.build.outputs.publishable }}
+        run: |
+          {
+            if [ "$PUBLISHED" = true ]; then
+              echo "Install: \`uv tool install foreman-inator\` or \`pipx install foreman-inator\`."
+            else
+              echo "Not on PyPI yet. Install from GitHub:"
+              echo
+              echo "    uv tool install git+https://github.com/${GITHUB_REPOSITORY}@${TAG}"
+            fi
+          } > notes.md
+          flags=()
+          if [ "$PRERELEASE" = true ]; then flags+=(--prerelease); fi
+          gh release create "$TAG" dist/* \
+            --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes \
+            --notes "$(cat notes.md)" --title "$TAG" "${flags[@]}"
