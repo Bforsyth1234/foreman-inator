@@ -215,7 +215,7 @@ class _Gen:
                 for name, kind, inp, out in tools:
                     row = self.tool(rec, a.id, name=name, input=inp, output=out, kind=kind)
                     if tag_row is not None and (name, kind) == tag_row and marked is None:
-                        marked = row["seq"] - 1  # the row's index in RunRecord.rows
+                        marked = row["seq"]  # #27's failure_step_index: the 1-based seq
             with tracing.verify_span("pytest -q") as v:
                 tracing.set_verify_result(
                     v,
@@ -893,7 +893,7 @@ def test_timeline_steps_carry_row_indexes_and_the_failure_step(cases: Path) -> N
     a3 = tl.recordings[3]
     (marked,) = a3.failure_steps
     kick = next(k for k in rows.kickbacks if k.by == "user")
-    assert marked.row_index == kick.failure_step_index
+    assert marked.row_index == kick.failure_step_index - 1  # #27 stores the 1-based seq
     assert marked.failure_step == "wrong_edit" and marked.title == "Tool edit (edit)"
     assert a3.steps[-1].kind == "kickback" and "wrong_edit" in a3.steps[-1].title
     review = tl.recordings[2]

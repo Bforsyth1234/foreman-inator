@@ -25,6 +25,22 @@ State is the ``poll_cursors`` row ``lifecycle.clarify_cursor(ticket)``: ``clear`
   ``router_timeout_seconds``): ``Clear`` → ``clear``; ``NeedsInfo`` → post the question,
   add ``needs-info``, store ``asked``, in that order.
 
+Routing (#15, #23; wired in wave 9)
+-----------------------------------
+A ``tier:N`` label is the route, with no model call. Otherwise the nearest-neighbour
+router (``knn.route_knn``) is asked first; below ``knn_threshold`` accepted tickets, or on
+any embedding failure, it returns None and the rules router (``routing.route``) decides.
+The exploration decision (``explore.should_explore`` with ``explore_rate``; never for an
+override) is made once, here, and stored as the ``explore:<ticket>`` cursor in the same
+transaction as ``routed_tier`` and ``route_reason``; ``Worker.explore`` reads it, so a
+restart or a config change gives the same answer. A later ``tier:N`` label before any
+attempt routes again through the override path, which stores "0".
+
+Crash safety (routing): killed after ``route_knn`` but before that transaction, nothing
+is stored (``routed_tier`` NULL), so the ticket is routed again; the new ticket's vector
+was stored by ``route_knn``, so no second embedding call, and the explore draw is
+deterministic per ticket. Nothing reaches GitHub during routing.
+
 Crash safety: killed after the question was posted but before the label or the cursor →
 the marker is found, the label added, ``asked`` stored. Killed after the answer was seen
 but before the label was removed → ``answered`` is still stored, so the removal (a no-op
@@ -42,6 +58,7 @@ from typing import TYPE_CHECKING, Any
 from foreman_inator import routing
 from foreman_inator.db.store import Ticket
 from foreman_inator.github.app_auth import GitHubNotFound
+from foreman_inator.routing import explore, knn
 from foreman_inator.tickets import clarify
 from foreman_inator.tickets.lifecycle import clarify_cursor
 
@@ -149,24 +166,62 @@ class RouteSteps:
             self.attempt_job(job, cancel)  # carry the ticket on in the same job
 
     def _route_ticket(self, t: Ticket, *, override: routing.Override | None = None) -> Ticket:
-        """Route ``t`` (#15) and store the pick. An override makes no model call (it runs
-        inside a poll transaction); a classification does, so it runs in a job and keeps
-        a pick that a ``tier:N`` label stored meanwhile."""
-        with self._trace(t):  # type: ignore[attr-defined]
-            r = routing.route(
-                t,
-                config=self.config,
-                proxy=None if override is not None else self.proxy,
-                override=override,
-                timeout=float(self.config.router_timeout_seconds),
-            )
+        """Route ``t`` and store the pick with its explore decision (see the module
+        docstring, "Routing"). An override makes no model call (it runs inside a poll
+        transaction); a classification does, so it runs in a job and keeps a pick that a
+        ``tier:N`` label stored meanwhile."""
+        if override is not None:
+            r = routing.route(t, config=self.config, proxy=None, override=override)
+        else:
+            with self._trace(t):  # type: ignore[attr-defined]
+                r = self._knn_route(t) or routing.route(
+                    t,
+                    config=self.config,
+                    proxy=self.proxy,
+                    timeout=float(self.config.router_timeout_seconds),
+                )
+        ex = explore.should_explore(
+            t.id,
+            float(self.config.explore_rate),
+            routed_tier=r.tier,
+            tiers=self.config,
+            override=r.source == "override",
+        )
         with self.store.transaction():
             cur = self.store.get_ticket(t.id)
             if override is None and cur.routed_tier is not None:
                 return cur
             cur = self.store.update_ticket(t.id, routed_tier=r.tier, route_reason=r.reason)
-        log.info("ticket %d: routed to tier %d (%s)", t.id, r.tier, r.source)
+            self.store.set_cursor(t.repo, explore.encode(ex), explore.explore_cursor(t.id))
+        log.info(
+            "ticket %d: routed to tier %d (%s)%s",
+            t.id,
+            r.tier,
+            r.source,
+            "; exploring one tier lower" if ex else "",
+        )
         return cur
+
+    def _knn_route(self, t: Ticket) -> routing.Route | None:
+        """#23 once ``knn_threshold`` tickets are accepted; None falls back to the rules.
+        ``route_knn`` never raises and stores the new ticket's vector, so a re-route after a
+        crash reuses it (no second embedding call)."""
+        return knn.route_knn(
+            t,
+            store=self.store,
+            config=self.config,
+            proxy=self.proxy,
+            embedder=self.embedder,  # type: ignore[attr-defined]
+            threshold=int(self.config.knn_threshold),
+            k=int(self.config.knn_k),
+            timeout=float(self.config.knn_timeout_seconds),
+            allow_cloud_embedder=bool(self.config.allow_cloud_embedder),
+        )
+
+    def explore(self, ticket: Ticket) -> bool:
+        """#23's stored decision (``explore:<ticket>`` cursor, written with the route). No
+        row (routed before wave 9, or not routed yet) means no exploration."""
+        return explore.decode(self.store.get_cursor(ticket.repo, explore.explore_cursor(ticket.id)))
 
 
 __all__ = ["CLARIFY_DONE", "RouteSteps"]

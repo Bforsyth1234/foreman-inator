@@ -701,13 +701,17 @@ def test_cli_metrics_serves_on_loopback(foreman_home: Path, monkeypatch) -> None
     from foreman_inator.metrics import web
 
     calls = []
-    monkeypatch.setattr(web, "serve", lambda path, *, port: calls.append((path, port)))
+    # Wave 9 (#29): `fman metrics` also mounts the trace view, failure steps and experiments.
+    monkeypatch.setattr(
+        web, "serve", lambda path, *, port, **kw: calls.append((path, port, sorted(kw)))
+    )
     runner = CliRunner()
     assert runner.invoke(app, ["metrics"]).exit_code == 1  # no database yet
     Store(paths.db_path()).close()
     res = runner.invoke(app, ["metrics", "--port", "9911"])
     assert res.exit_code == 0, res.output
-    assert "http://127.0.0.1:9911/" in res.output and calls == [(paths.db_path(), 9911)]
+    assert "http://127.0.0.1:9911/" in res.output
+    assert calls == [(paths.db_path(), 9911, ["config", "recordings_dir", "traces_dir"])]
 
 
 def test_cli_status_shows_the_spend_line(foreman_home: Path) -> None:

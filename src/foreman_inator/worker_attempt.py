@@ -15,7 +15,9 @@ Attempt (``attempt_job``), in order:
 4. find the verify command (the repo's saved override first); none → hand over once;
 5. the sandbox (#40) must be able to run (``sandbox = "on"`` and no backend → the ticket
    is flagged ``sandbox_unavailable``, no attempt row, nothing retried);
-6. ``AttemptStarted`` + the attempt row in one transaction, then the writer prompt;
+6. ``AttemptStarted`` + the attempt row in one transaction, then the writer prompt from
+   the writer champion's prompt file (#24, ``writer_template``) and the attempt's
+   registered variant id;
 7. inside ``attempt_span`` and a ``Recorder``: ``_launch_writer`` (OpenCode, sandboxed),
    the worker's own commit, the diff, ``_launch_verify`` (sandboxed) inside
    ``verify_span``; a rebase attempt whose conflicted files still hold markers fails its
@@ -35,17 +37,25 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from foreman_inator import tracing
+from fde_kit.prompts import PromptRef
+
+from foreman_inator import prompts, tracing
 from foreman_inator.config import ConfigError, ModelEndpoint
 from foreman_inator.db.store import Attempt, Ticket
+from foreman_inator.experiments import variants
 from foreman_inator.pr.publisher import pr_head_branch
 from foreman_inator.routing import escalation as esc
 from foreman_inator.runner import sandbox
 from foreman_inator.runner import verify as verify_mod
 from foreman_inator.runner.worktree import RepoMirror, Worktree, WorktreeError
 from foreman_inator.tickets import lifecycle
-from foreman_inator.tickets.lifecycle import AttemptStarted, ChecksFailed
-from foreman_inator.tickets.prompt import writer_prompt_for
+from foreman_inator.tickets.lifecycle import AttemptStarted, ChecksFailed, clarify_qa_cursor
+from foreman_inator.tickets.prompt import (
+    WRITER_PROMPT_NAME,
+    build_writer_prompt,
+    load_history,
+    read_conventions,
+)
 from foreman_inator.worker_policy import (
     FLAG_NO_VERIFY,
     published_attempt,
@@ -303,15 +313,20 @@ class AttemptSteps:
         *,
         conflicted: Sequence[str] = (),
     ) -> tuple[Attempt, bool, Any, Any]:
-        prompt = writer_prompt_for(
-            self.store,
+        template = self.writer_template()
+        conv = read_conventions(wt.path)
+        prompt = build_writer_prompt(  # ``writer_prompt_for`` with the champion's template
             ticket,
             att,
-            worktree=wt.path,
+            load_history(self.store, ticket.id, before=att.id),
             verify_command=cmd.display,
+            conventions=conv[1] if conv else None,
+            conventions_name=conv[0] if conv else "AGENTS.md",
+            template=template,
             conflicted_files=conflicted,
+            clarification=self.store.get_cursor(ticket.repo, clarify_qa_cursor(ticket.id)),
         )
-        variant = prompt.variant_id(endpoint.name)
+        variant = variants.register(self.store, "writer", endpoint.name, template).id
         att = self.store.update_attempt(att.id, variant_id=variant)
         out_path = self.traces_dir / str(ticket.id) / f"attempt-{att.id}-verify.log"
         vr = None
@@ -418,6 +433,19 @@ class AttemptSteps:
         raise _Cancelled
 
     # ------------------------------------------------------------------ helpers
+
+    def writer_template(self) -> PromptRef:
+        """#24: the writer champion's prompt, read from the file on disk (what runs is the
+        file; an edited file is a new, unpromoted variant, and ``fman status`` says so).
+        No champion, or its file gone: the packaged default."""
+        champ = variants.champion(self.store, "writer")
+        name = champ.prompt_name if champ is not None else WRITER_PROMPT_NAME
+        try:
+            return prompts.load(name)
+        except (FileNotFoundError, ValueError):
+            log.warning("writer champion's prompt %s is missing; using %s", name,
+                        WRITER_PROMPT_NAME)  # fmt: skip
+            return prompts.load(WRITER_PROMPT_NAME)
 
     def _token(self, repo: str) -> str:
         token_for = getattr(self.api, "token_for", None)

@@ -15,8 +15,11 @@ HTML-escaped (issue titles are untrusted GitHub text). Requests whose ``Host`` h
 not a loopback name are refused (DNS-rebinding guard), and ``serve`` / ``MetricsServer``
 bind to loopback only (invariant 7c: the page is local only).
 
-Room for #29: pass ``extra_routes`` (more Starlette routes, e.g. the trace view) and
-``nav`` links to ``create_app``; ``render_page`` gives new pages the same layout.
+Wave 9 (#29): ``full_app`` (what ``fman metrics`` serves) mounts the trace view (#28,
+``/traces``, with each ticket's stored explore decision), ``/failures`` (failure steps per
+writer variant, ``reviewer_miss`` per reviewer variant, the unlabeled share) and
+``/experiments`` (champions, running and ended experiments with their replay comparison
+and live judgment). All read-only, escaped, no JavaScript, behind the same loopback guard.
 """
 
 from __future__ import annotations
@@ -29,7 +32,7 @@ import sqlite3
 import threading
 import time
 from collections.abc import Callable, Sequence
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, is_dataclass, replace
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -480,6 +483,230 @@ def create_app(
     return LoopbackHostOnly(app)
 
 
+# --- milestone 4 pages (#29) -----------------------------------------------------------
+
+#: Nav links of the pages ``full_app`` adds (the trace view's first).
+M4_NAV: tuple[tuple[str, str], ...] = (
+    ("/traces", "Traces"),
+    ("/failures", "Failure steps"),
+    ("/experiments", "Experiments"),
+)
+
+
+def _steps_table(rows: Sequence[q.FailureSteps]) -> str:
+    if not rows:
+        return '<p class="empty">No kickbacks yet.</p>'
+    labels = sorted({k for r in rows for k in r.steps})
+    head = "".join(f"<th>{e(lb)}</th>" for lb in labels)
+    body = "".join(
+        f"<tr><td>{e(r.variant_id)}</td>"
+        + "".join(f"<td>{r.steps.get(lb, 0)}</td>" for lb in labels)
+        + f"<td>{r.total}</td><td>{fmt_rate(r.unlabeled_share)}</td></tr>"
+        for r in rows
+    )
+    total = sum(r.total for r in rows)
+    unlabeled = q.Rate(sum(r.unlabeled for r in rows), total)
+    return (
+        f'<p class="headline">Unlabeled: {fmt_rate(unlabeled)} of {total} kickback(s)</p>'
+        '<div class="scroll"><table><tr><th>Writer variant</th>'
+        f"{head}<th>Kickbacks</th><th>Unlabeled</th></tr>{body}</table></div>"
+    )
+
+
+def _misses_table(rows: Sequence[q.ReviewerMisses]) -> str:
+    if not rows:
+        return '<p class="empty">No judged AI approvals yet.</p>'
+    body = "".join(f"<tr><td>{e(r.variant_id)}</td><td>{fmt_rate(r.rate)}</td></tr>" for r in rows)
+    return (
+        '<div class="scroll"><table><tr><th>Reviewer variant</th>'
+        "<th>reviewer_miss (of its judged approvals)</th></tr>"
+        f"{body}</table></div>"
+    )
+
+
+def render_failures(
+    writers: Sequence[q.FailureSteps],
+    reviewers: Sequence[q.ReviewerMisses],
+    *,
+    nav: Sequence[tuple[str, str]] = (),
+) -> str:
+    body = (
+        "<h1>Failure steps per variant</h1>"
+        '<p class="lede">Where kicked-back attempts went wrong, as labeled from their '
+        "recordings (SPEC Tracing). Failed exploration attempts and dropped tickets are left "
+        "out; reviewer_miss is charged to the reviewer that approved the change.</p>"
+        "<h2>Writer variants</h2>"
+        + _steps_table(writers)
+        + "<h2>Reviewer variants</h2>"
+        + _misses_table(reviewers)
+    )
+    return render_page("Failure steps", body, nav=nav)
+
+
+def _experiment_rows(store: Store, min_cases: int, min_sample: int) -> list[dict[str, str]]:
+    from foreman_inator.experiments import replay_runner as rr
+    from foreman_inator.experiments import shadow
+
+    out = []
+    for x in reversed(store.list_experiments()):
+        result = ""
+        if x.mode == "replay":
+            try:
+                c = rr.compare(store, x.id, min_cases=min_cases)
+                result = (
+                    f"replay {c.state}{f' ({c.stop_reason})' if c.stop_reason else ''}: "
+                    f"{c.verdict} ({c.reason}); {c.scored_cases}/{c.total_cases} cases, "
+                    f"{c.wins} won, {c.losses} lost, {c.ties} tied"
+                )
+            except LookupError:
+                result = "no replay run"
+        elif x.mode == "shadow" and x.role == "reviewer":
+            cmp_ = shadow.score_experiment(store, x.id)
+            j = shadow.judge_live(cmp_, min_sample=min_sample)
+            result = (
+                f"live {j.status}: {cmp_.paired} paired, {j.decided_pairs} decided by you "
+                f"(of {min_sample})" + (f"; {'; '.join(j.reasons)}" if j.reasons else "")
+            )
+        out.append(
+            {
+                "id": str(x.id),
+                "role": x.role,
+                "mode": x.mode,
+                "status": x.status,
+                "champion": x.champion_variant,
+                "challenger": x.challenger_variant,
+                "dates": f"{x.started_at:%Y-%m-%d}"
+                + (f" → {x.ended_at:%Y-%m-%d}" if x.ended_at else ""),
+                "result": result,
+            }
+        )
+    return out
+
+
+def render_experiments(
+    champions: Sequence[str], rows: Sequence[dict[str, str]], *, nav: Sequence[tuple[str, str]]
+) -> str:
+    cols = ("id", "role", "mode", "status", "champion", "challenger", "dates", "result")
+    names = ("#", "Role", "Mode", "Status", "Champion", "Challenger", "Dates", "Result")
+
+    def table(items: Sequence[dict[str, str]]) -> str:
+        if not items:
+            return '<p class="empty">None.</p>'
+        head = "".join(f"<th>{n}</th>" for n in names)
+        body = "".join(
+            "<tr>" + "".join(f"<td>{e(r[c])}</td>" for c in cols) + "</tr>" for r in items
+        )
+        return f'<div class="scroll"><table><tr>{head}</tr>{body}</table></div>'
+
+    champs = "".join(f"<li>{e(line)}</li>" for line in champions)
+    body = (
+        "<h1>Experiments</h1>"
+        '<p class="lede">A challenger becomes champion only after it wins on replay and '
+        "holds up live, and only when you run <code>fman experiment promote</code>.</p>"
+        f"<h2>Champions</h2><ul>{champs}</ul>"
+        "<h2>Running</h2>"
+        + table([r for r in rows if r["status"] == "running"])
+        + "<h2>Ended</h2>"
+        + table([r for r in rows if r["status"] != "running"])
+    )
+    return render_page("Experiments", body, nav=nav)
+
+
+def m4_routes(
+    store_path: str | Path,
+    *,
+    min_cases: int = 10,
+    min_sample: int = 30,
+    nav: Sequence[tuple[str, str]] = M4_NAV,
+) -> list[BaseRoute]:
+    """``GET /failures`` and ``GET /experiments`` (read-only, from a read-only store)."""
+
+    def no_db() -> Response:
+        body = "<h1>foreman-inator</h1><p>No database yet: run the worker first.</p>"
+        return HTMLResponse(render_page("No data", body, nav=nav), 503)
+
+    def failures(request: Request) -> Response:
+        try:
+            store = open_store(store_path)
+        except (FileNotFoundError, sqlite3.OperationalError):
+            return no_db()
+        try:
+            html_ = render_failures(
+                q.failure_steps_by_variant(store), q.reviewer_misses_by_variant(store), nav=nav
+            )
+        finally:
+            store.close()
+        return HTMLResponse(html_)
+
+    def experiments(request: Request) -> Response:
+        from foreman_inator.experiments import variants
+
+        try:
+            store = open_store(store_path)
+        except (FileNotFoundError, sqlite3.OperationalError):
+            return no_db()
+        try:
+            champions = variants.status_lines(store)
+            rows = _experiment_rows(store, min_cases, min_sample)
+        finally:
+            store.close()
+        return HTMLResponse(render_experiments(champions, rows, nav=nav))
+
+    return [
+        Route("/failures", failures, methods=["GET"]),
+        Route("/experiments", experiments, methods=["GET"]),
+    ]
+
+
+def full_app(
+    store_path: str | Path,
+    *,
+    recordings_dir: str | Path,
+    traces_dir: str | Path | None,
+    config: Any = None,
+) -> ASGIApp:
+    """The page ``fman metrics`` serves: the metrics page, the trace view (#28) and the
+    failure-step and experiment pages, all behind the loopback guard."""
+    from foreman_inator.config import Config
+    from foreman_inator.metrics import trace_view
+    from foreman_inator.routing import escalation, explore
+
+    cfg = config if config is not None else Config()
+    ladder = escalation.build_ladder(cfg.models)
+    plain = trace_view.store_rows_for(
+        store_path, ladder=ladder, recordings_dir=recordings_dir, traces_dir=traces_dir
+    )
+
+    def rows_for(ticket_id: int) -> Any:
+        """The trace view's rows with the ticket's stored explore decision (#23)."""
+        rows = plain(ticket_id)
+        if rows is None:
+            return None
+        try:
+            store = open_store(store_path)
+        except (FileNotFoundError, sqlite3.Error):
+            return rows
+        try:
+            t = rows.ticket
+            flag = explore.decode(store.get_cursor(t.repo, explore.explore_cursor(t.id)))
+        finally:
+            store.close()
+        return replace(rows, explore=flag) if flag != rows.explore else rows
+
+    routes = [
+        *trace_view.trace_routes(
+            recordings_dir, traces_dir, store_path=store_path, ladder=ladder,
+            rows_for=rows_for, nav=M4_NAV,
+        ),
+        *m4_routes(
+            store_path,
+            min_cases=cfg.experiments.min_cases,
+            min_sample=cfg.experiments.live_min_sample,
+        ),
+    ]  # fmt: skip
+    return create_app(store_path, extra_routes=routes, nav=M4_NAV)
+
+
 def metrics_url(host: str, port: int, **params: str) -> str:
     query = urlencode({k: v for k, v in params.items() if v})
     shown = f"[{host}]" if ":" in host else host
@@ -572,9 +799,23 @@ class MetricsServer:
         self.stop()
 
 
-def serve(store_path: str | Path, *, port: int = DEFAULT_PORT, host: str = DEFAULT_HOST) -> None:
-    """Serve the metrics page in the foreground (``fman metrics``). Loopback only."""
-    MetricsServer(store_path, host=host, port=port).run()
+def serve(
+    store_path: str | Path,
+    *,
+    port: int = DEFAULT_PORT,
+    host: str = DEFAULT_HOST,
+    config: Any = None,
+    recordings_dir: str | Path | None = None,
+    traces_dir: str | Path | None = None,
+) -> None:
+    """Serve the metrics page in the foreground (``fman metrics``). Loopback only. With
+    ``recordings_dir``, the trace view and the failure-step and experiment pages too."""
+    app = None
+    if recordings_dir is not None:
+        app = full_app(
+            store_path, recordings_dir=recordings_dir, traces_dir=traces_dir, config=config
+        )
+    MetricsServer(store_path, host=host, port=port, app=app).run()
 
 
 __all__ = [
@@ -584,9 +825,11 @@ __all__ = [
     "LoopbackHostOnly",
     "MetricsServer",
     "create_app",
+    "full_app",
     "is_loopback",
     "line_chart",
     "metrics_routes",
+    "m4_routes",
     "metrics_url",
     "open_store",
     "parse_filter",

@@ -92,6 +92,22 @@ Wave 6b (wired at the wave's close)
 * #51 (repo profiles): ``policy_for(ticket)`` (here), ``review_skipped(ticket)``
   (``worker_review``) and ``_route_ticket`` (``worker_attempt``) are its three call sites.
 
+Milestone 4 (wired in wave 9, #29)
+----------------------------------
+* #23 router: ``worker_route._route_ticket`` asks the kNN router first (past
+  ``knn_threshold``), then the rules router; the explore decision is stored with the route
+  and read back by ``explore``. ``knn.backfill`` runs once per poll on the local lane.
+* #24 variants: ``ensure_defaults`` at start; the writer loads the champion's prompt name
+  and registers every attempt's variant; the reviewer is the champion's model (when
+  independent of the writer) with the champion's prompt, and every review registers its
+  variant.
+* #27 labels: every user and AI kickback is queued, after its transaction commits, on the
+  single background "local lane" thread (``worker_background``); unlabeled kickbacks are
+  queued again at start, at most ``LABEL_TRIES`` times each.
+* #26 shadow: once a repo has no live work due, a running shadow experiment's challenger
+  reviews each finalized PR attempt on the "shadow lane" thread (never a job slot), under
+  the sandbox, costed to the experiments bucket, posting nothing.
+
 Shutdown: SIGINT/SIGTERM set the stop flag and every running job's cancel event; the
 OpenCode driver aborts its session and kills its process group, verify and the reviewer
 kill their commands, a cut-short attempt is stored as ``superseded``, a cut-short review
@@ -123,6 +139,7 @@ from foreman_inator.tickets import lifecycle
 from foreman_inator.tickets.lifecycle import Action, IllegalTransition
 from foreman_inator.worker_actions import ActionHandlers, Ctx, flag_comment
 from foreman_inator.worker_attempt import AttemptSteps
+from foreman_inator.worker_background import BackgroundSteps
 from foreman_inator.worker_pause import PauseSteps
 from foreman_inator.worker_publish import PublishSteps
 from foreman_inator.worker_queue import JOIN_TIMEOUT, Job, QueueSteps
@@ -146,6 +163,7 @@ class Worker(
     PauseSteps,
     QueueSteps,
     SandboxSteps,
+    BackgroundSteps,
 ):
     def __init__(
         self,
@@ -199,6 +217,10 @@ class Worker(
         self._init_queue()
         self._finalized: set[int] = set()  # review ids whose GitHub side is done here
         self._local = threading.local()
+        #: #23: the embedding model; the proxy must serve it (``Config.proxy_models``).
+        self.embedder = config.embedder()
+        self._init_background()
+        self._ensure_variants()
         self.actions: dict[Action, Callable[[Ctx], None]] = {
             Action.CREATE_TICKET: self._a_create_ticket,
             Action.APPLY_TIER_OVERRIDE: self._a_tier_override,
@@ -240,6 +262,8 @@ class Worker(
             log.info("swept %d stale file lock(s)", swept)
         self._finalized.clear()
         self._sweep.update(self.repos)
+        self._ensure_variants()
+        self.requeue_unlabeled()
         return fixed
 
     def run_once(self) -> None:
@@ -291,6 +315,7 @@ class Worker(
             th.join(max(0.0, deadline - time.monotonic()))
             if th.is_alive():
                 log.warning("job thread %s did not stop in time", th.name)
+        self.stop_background(max(1.0, deadline - time.monotonic()))
 
     # ------------------------------------------------------------------ policy
 
@@ -315,11 +340,6 @@ class Worker(
             explore=self.explore(ticket),
         )
 
-    def explore(self, ticket: Ticket) -> bool:
-        """#23's exploration flag. Nothing explores yet; #23 must store its choice on the
-        ticket (it is read on every decision) and return it here."""
-        return False
-
     # ------------------------------------------------------------------ events
 
     def poll_and_handle(self) -> None:
@@ -342,6 +362,16 @@ class Worker(
         if result is not None:
             for repo, exc in result.errors.items():
                 log.warning("poll of %s failed: %s: %s", repo, type(exc).__name__, exc)
+        self.queue_backfill()  # #23: at most one small embedding batch per poll, in the back
+
+    def after_commit(self, ticket: Ticket, name: str, fn: Callable[[], Any]) -> None:
+        """Run ``fn`` once the poll event's transaction has committed (now, outside one).
+        For background work that must never start inside the poller's transaction."""
+        pending = getattr(self._local, "pending", None)
+        if pending is not None:
+            pending.append((ticket.id, name, fn))
+        else:
+            fn()
 
     def _handle_event(self, event: Any) -> None:
         """One poller event, inside its transaction (``Poller.process``)."""

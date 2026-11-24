@@ -78,7 +78,7 @@ ERROR_DETAIL_BUDGET = 200
 
 PROMPT_VERSION_HEADER = "x-fman-prompt-version"
 
-Source = Literal["override", "classifier", "fallback"]
+Source = Literal["override", "classifier", "fallback", "knn"]  # "knn": #23 (wired in #29)
 
 _SECTION = re.compile(r"^<!-- section: ([a-z_]+) -->$", re.MULTILINE)
 _LABEL = re.compile(r"^(small|normal|large)$", re.IGNORECASE)

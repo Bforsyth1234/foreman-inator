@@ -34,6 +34,7 @@ class SetupResult:
     created_app: bool = False
     checks: list[deps.Check] = field(default_factory=list)
     service: launchd.ServiceResult | None = None
+    nightly: launchd.ServiceResult | None = None  # #29: `fman experiment run --all`
 
 
 def register_app(
@@ -139,11 +140,20 @@ def run_setup(
     result.checks = deps.check_all(cfg, transport=transport, **dep_kw)
     echo("Dependencies:\n" + deps.format_report(result.checks))
 
-    # 4. launchd agent.
+    # 4. launchd agents: the worker, and the nightly experiments run (#29).
     if install_service:
         svc_kw = {k: v for k, v in (("launchctl", launchctl), ("uid", uid)) if v is not None}
         result.service = launchd.install_service(fman=fman_path, agents_dir=agents_dir, **svc_kw)
         echo(result.service.message)
+        ex = cfg.experiments
+        result.nightly = launchd.install_nightly(
+            fman=fman_path,
+            agents_dir=agents_dir,
+            hour=ex.nightly_hour,
+            minute=ex.nightly_minute,
+            **svc_kw,
+        )
+        echo(result.nightly.message)
 
     result.config = cfg
     echo(f"Config written to {paths.config_path()}.")
@@ -192,12 +202,13 @@ def uninstall(
     kw = {k: v for k, v in (("launchctl", launchctl), ("uid", uid)) if v is not None}
     res = launchd.uninstall_service(agents_dir=agents_dir, **kw)
     echo(res.message)
+    echo(launchd.uninstall_nightly(agents_dir=agents_dir, **kw).message)
     return res
 
 
 def setup_command(
     uninstall_service: Annotated[
-        bool, _opt("--uninstall-service", help="Remove the launchd agent and exit.")
+        bool, _opt("--uninstall-service", help="Remove both launchd agents and exit.")
     ] = False,
     org: Annotated[
         str | None, _opt("--org", help="Create the App under this organization.")
@@ -210,7 +221,7 @@ def setup_command(
         _opt("--allowed-user", help="GitHub login allowed to start work (repeatable)."),
     ] = None,
     no_service: Annotated[
-        bool, _opt("--no-service", help="Skip installing the launchd agent.")
+        bool, _opt("--no-service", help="Skip installing the launchd agents.")
     ] = False,
 ) -> None:
     """Register your own GitHub App, check dependencies and install the launchd agent."""

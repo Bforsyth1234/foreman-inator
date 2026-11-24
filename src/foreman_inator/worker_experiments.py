@@ -1,0 +1,530 @@
+"""``fman experiment run | status | promote`` and ``fman replay`` (todo #29).
+
+Experiments are a separate process from the worker (``fman experiment run``, by hand or
+from the nightly launchd agent). It never touches GitHub and never writes the live tables
+(``tickets``, ``attempts``, ``reviews``, ``kickbacks``): replays (#25) write only the
+``experiments`` row and the 005 replay tables; the shadow reviewer (#26) runs inside the
+worker.
+
+Running beside the worker
+-------------------------
+* **Its own model proxy** (``make_proxy``): a second ``ModelProxy`` on another loopback
+  port, with the real ``Spend`` hook, so every replay call is a traced ``llm.call`` in the
+  ``experiments`` bucket (7c). The worker's proxy is never used.
+* **Its own repo mirrors** (``sync_replay_mirror``): replays never run git in the worker's
+  mirror. Each repo gets a bare mirror under ``~/.foreman-inator/replays/mirrors/``, filled
+  from the worker's mirror over git's local transport: the base-branch refs, the attempt
+  branches, and, fetched by sha, every attempt's base and recorded head commit (the worker
+  deletes an attempt's branch once its ticket closes). Reading the worker's mirror is a
+  read; the replay's scratch worktrees and branches live only in the replay mirror, so
+  the worker's sweep of ``scratch-*`` worktrees can never remove a running replay's.
+* **One run at a time**: ``run.lock`` under ``~/.foreman-inator/replays/`` is held with
+  ``flock`` for the whole run; a second ``fman experiment run`` exits at once.
+* **Budgets**: the monthly experiments budget (``spend_caps.experiments_monthly_usd``, the
+  ledger shared with the worker's shadow reviews) and ``[experiments] run_budget_usd`` per
+  replay run; either stops the run cleanly (``replay_runner``), nobody is asked.
+* **Stops**: SIGINT and SIGTERM set the cancel event; the running case side is thrown away
+  and its processes killed; the run is resumed by the next ``run`` or ``run --all``.
+  Killed outright (SIGKILL), a side is stored only once scored, so a resume reruns only
+  unscored sides; nothing live was touched.
+
+Experiments and promotion (SPEC "Promotion rule": wins on replay AND holds live)
+-------------------------------------------------------------------------------
+``run --role R --challenger V`` registers V, starts (or resumes) the replay of the
+current champion against V, and for a reviewer also starts V's shadow experiment at once
+(SPEC: the shadow is "always on once a challenger exists"; only the oldest running one
+gets traffic). ``run --all`` resumes every unfinished replay; it never promotes.
+
+``promote <experiment id | variant>`` is the only way a champion changes:
+
+1. the newest running replay of V must be against the *current* champion, finished, and
+   ``wins``; ``does_not_win`` ends V's experiments as ``rejected``; unfinished or
+   inconclusive changes nothing;
+2. holds live:
+   * reviewer: ``shadow.judge_live`` over at least ``live_min_sample`` paired PRs the user
+     decided: ``holds`` → promote; ``fails`` → ``rejected``; ``insufficient`` → nothing;
+   * writer: there is no live writer traffic yet (traffic split, #34, is unscheduled), so
+     promotion on the replay alone needs ``--replay-only`` and says so in the champion
+     history note; without it nothing changes.
+3. promoting writes a ``champion_history`` row and ends V's running experiments as
+   ``promoted``; the worker uses the new champion from its next attempt or review.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import fcntl
+import logging
+import os
+import signal
+import threading
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from foreman_inator import paths, prompts
+from foreman_inator.config import Config, ConfigError
+from foreman_inator.db.store import Experiment, Store
+from foreman_inator.experiments import replay_runner as rr
+from foreman_inator.experiments import replay_sets as rs
+from foreman_inator.experiments import shadow, variants
+from foreman_inator.runner.worktree import MIRROR_DIRNAME, RepoMirror, WorktreeError, _git
+
+log = logging.getLogger("foreman_inator.experiments")
+
+REPLAYS_DIRNAME = "replays"
+LOCK_NAME = "run.lock"
+KEEP_REF = "refs/fman-keep/"
+
+
+class ExperimentError(RuntimeError):
+    """A request the experiment commands refuse (the message says why and what to do)."""
+
+
+def replays_root(home: Path | None = None) -> Path:
+    root = (home or paths.home()) / REPLAYS_DIRNAME
+    root.mkdir(mode=paths.DIR_MODE, parents=True, exist_ok=True)
+    return root
+
+
+def settings_from(config: Config) -> rr.ReplaySettings:
+    ex = config.experiments
+    return rr.ReplaySettings(
+        set_size=ex.set_size,
+        run_budget_usd=ex.run_budget_usd,
+        writer_timeout_s=ex.writer_timeout_s,
+        verify_timeout_s=ex.verify_timeout_s,
+        review_timeout_s=ex.review_timeout_s,
+        min_cases=ex.min_cases,
+    )
+
+
+# =========================================================================== mirrors
+
+
+def _wanted_commits(store: Store, repo: str, recordings_dir: Path | None) -> list[str]:
+    """Every attempt's base commit and recorded head commit for ``repo``."""
+    out: list[str] = []
+    for t in store.list_tickets(repo=repo):
+        for a in store.list_attempts(t.id):
+            if a.base_commit:
+                out.append(a.base_commit)
+            head = rs._recorded_head(recordings_dir, t.id, a.id)
+            if head:
+                out.append(head)
+    return sorted(set(out))
+
+
+def _has(mirror: Path, sha: str) -> bool:
+    proc = _git(["cat-file", "-e", f"{sha}^{{commit}}"], cwd=mirror, check=False)
+    return proc.returncode == 0
+
+
+def sync_replay_mirror(
+    store: Store,
+    repo: str,
+    *,
+    worker_root: Path,
+    replay_root: Path,
+    recordings_dir: Path | None = None,
+) -> RepoMirror | None:
+    """The replay mirror of ``repo``, brought up to date from the worker's mirror (see the
+    module docstring). None when the worker has no mirror of the repo."""
+    src = Path(worker_root) / repo / MIRROR_DIRNAME
+    if not (src / "HEAD").exists():
+        return None
+    mirror = RepoMirror(replay_root, repo, str(src))
+    m = mirror.mirror_path
+    if not (m / "HEAD").exists():
+        m.mkdir(parents=True, exist_ok=True)
+        _git(["init", "-q", "--bare"], cwd=m)
+        _git(["config", "gc.auto", "0"], cwd=m)
+    _git(["config", "remote.origin.url", str(src)], cwd=m)
+    # Base branches and attempt branches only: the replay's own fman/replay/* branches
+    # are outside both patterns, so --prune never touches them.
+    _git(
+        ["-c", "uploadpack.allowAnySHA1InWant=true", "fetch", "-q", "--prune", "--no-tags",
+         "origin", "+refs/remotes/origin/*:refs/remotes/origin/*",
+         "+refs/heads/fman/issue-*:refs/heads/fman/issue-*"],
+        cwd=m,
+    )  # fmt: skip
+    missing = [s for s in _wanted_commits(store, repo, recordings_dir) if not _has(m, s)]
+    for sha in missing:  # unreachable in the worker's mirror once a branch is deleted
+        if not _has(src, sha):
+            continue
+        _git(
+            ["-c", "uploadpack.allowAnySHA1InWant=true", "fetch", "-q", "--no-tags", str(src),
+             f"{sha}:{KEEP_REF}{sha}"],
+            cwd=m,
+            check=False,
+        )  # fmt: skip
+    mirror.prune()
+    return mirror
+
+
+def mirror_for(
+    store: Store, *, worker_root: Path, replay_root: Path, recordings_dir: Path | None
+) -> Callable[[str], RepoMirror | None]:
+    cache: dict[str, RepoMirror | None] = {}
+
+    def get(repo: str) -> RepoMirror | None:
+        if repo not in cache:
+            try:
+                cache[repo] = sync_replay_mirror(
+                    store,
+                    repo,
+                    worker_root=worker_root,
+                    replay_root=replay_root,
+                    recordings_dir=recordings_dir,
+                )
+            except WorktreeError as exc:
+                log.warning("replay mirror of %s: %s", repo, exc)
+                cache[repo] = None
+        return cache[repo]
+
+    return get
+
+
+# =========================================================================== variants
+
+
+def _role(role: str) -> rr.Role:
+    if role not in variants.ROLES:
+        raise ExperimentError(f"role must be one of {', '.join(variants.ROLES)}")
+    return role  # type: ignore[return-value]
+
+
+def _endpoint(config: Config, model: str) -> Any:
+    try:
+        return config.model(model)
+    except ConfigError as exc:
+        raise ExperimentError(f"{exc}; add it to config.toml first") from None
+
+
+def _variant(
+    config: Config, role: rr.Role, model: str, prompt: str, hash8: str | None
+) -> rr.Variant:
+    try:
+        ref = prompts.load(prompt)
+    except (FileNotFoundError, ValueError) as exc:
+        raise ExperimentError(f"prompt {prompt!r}: {exc}") from None
+    vid = variants.variant_id(model, ref)
+    if hash8 is not None and ref.sha256[:8] != hash8:
+        raise ExperimentError(
+            f"{model}/{prompt}@{hash8} is not the prompt file on disk (now {vid}); an edited "
+            "prompt is a new variant: name it with its new hash, or a new prompt file"
+        )
+    ep = _endpoint(config, model)
+    if role == "writer":
+        return rr.WriterVariant(vid, ep, ref)
+    return rr.ReviewerVariant(vid, ep, prompt)
+
+
+def champion_variant(store: Store, config: Config, role: rr.Role) -> rr.Variant:
+    """The current champion as a runnable variant (its prompt file must be unchanged)."""
+    champ = variants.champion(store, role)
+    if champ is None:
+        variants.ensure_defaults(store, config)
+        champ = variants.champion(store, role)
+    if champ is None:
+        raise ExperimentError(f"no {role} champion (no {role} model is configured)")
+    st = variants.role_status(store, role)
+    if not st.matches:
+        raise ExperimentError(
+            f"the {role} champion {champ.id}'s prompt file {champ.prompt_name}.md changed "
+            "since it was promoted, so the champion cannot be replayed; revert the file, or "
+            "put the change in a new prompt file and run it as the challenger"
+        )
+    return _variant(config, role, champ.model, champ.prompt_name, champ.prompt_hash[:8])
+
+
+def resolve_challenger(store: Store, config: Config, role: rr.Role, spec: str) -> rr.Variant:
+    """``<model>/<prompt>@<hash8>``, ``<model>/<prompt>`` (the file on disk) or ``<model>``
+    (the champion's prompt)."""
+    spec = spec.strip()
+    if "@" in spec:
+        try:
+            p = variants.parse_variant_id(spec)
+        except variants.VariantError as exc:
+            raise ExperimentError(str(exc)) from None
+        return _variant(config, role, p.model, p.prompt_name, p.hash8)
+    if "/" in spec:
+        model, _, prompt = spec.rpartition("/")
+        return _variant(config, role, model, prompt, None)
+    champ = variants.champion(store, role)
+    prompt = champ.prompt_name if champ else variants.default_prompt_name(role)
+    return _variant(config, role, spec, prompt, None)
+
+
+def _register(store: Store, role: rr.Role, v: rr.Variant) -> None:
+    ref = v.template if isinstance(v, rr.WriterVariant) else prompts.load(v.prompt_name)
+    variants.register(store, role, v.endpoint.name, ref)
+
+
+def _variant_from_id(config: Config, role: rr.Role, vid: str) -> rr.Variant:
+    p = variants.parse_variant_id(vid)
+    return _variant(config, role, p.model, p.prompt_name, p.hash8)
+
+
+def ensure_shadow(store: Store, champion: str, challenger: str) -> Experiment:
+    """The running reviewer shadow experiment for this challenger (started if none)."""
+    for e in shadow.running_shadow_experiments(store):
+        if e.challenger_variant == challenger:
+            return e
+    exp = store.create_experiment(
+        role="reviewer", champion_variant=champion, challenger_variant=challenger, mode="shadow"
+    )
+    log.info("experiment %d: shadow reviews by %s started", exp.id, challenger)
+    return exp
+
+
+# =========================================================================== running
+
+
+@dataclass
+class RunEnv:
+    """What ``run_experiment`` and ``run_all`` need (``open_run_env`` builds the real one)."""
+
+    store: Store
+    config: Config
+    deps: rr.ReplayDeps
+    cancel: threading.Event = field(default_factory=threading.Event)
+
+
+def make_proxy(config: Config, store: Store, spend: Any) -> Any:
+    """The experiment process's own model proxy (a free loopback port)."""
+    from foreman_inator.proxy.server import ModelProxy
+
+    return ModelProxy(config.proxy_models(), store=store, spend_hook=spend.hook).start()
+
+
+def build_deps(
+    store: Store,
+    config: Config,
+    *,
+    proxy: Any,
+    spend: Any,
+    driver: Any = None,
+    home: Path | None = None,
+    worker_root: Path | None = None,
+    recordings_dir: Path | None = None,
+) -> rr.ReplayDeps:
+    root = replays_root(home)
+    rec = recordings_dir if recordings_dir is not None else paths.recordings_dir()
+    work = root / "work"
+    work.mkdir(parents=True, exist_ok=True)
+    return rr.ReplayDeps(
+        store=store,
+        proxy=proxy,
+        mirror_for=mirror_for(
+            store,
+            worker_root=worker_root if worker_root is not None else paths.worktrees_dir(),
+            replay_root=root / "mirrors",
+            recordings_dir=rec,
+        ),
+        sandbox=rr.config_sandbox(config),
+        work_dir=work,
+        driver=driver,
+        endpoint_for=config.model,
+        spend=spend,
+        recordings_dir=rec,
+    )
+
+
+def run_experiment(env: RunEnv, role: str, challenger: str) -> rr.Comparison:
+    """Start or resume the replay of the champion against ``challenger`` (and, for a
+    reviewer, its shadow experiment)."""
+    r = _role(role)
+    champ = champion_variant(env.store, env.config, r)
+    chall = resolve_challenger(env.store, env.config, r, challenger)
+    if chall.variant_id == champ.variant_id:
+        raise ExperimentError(f"{chall.variant_id} is the {r} champion")
+    _register(env.store, r, chall)
+    if r == "reviewer":
+        ensure_shadow(env.store, champ.variant_id, chall.variant_id)
+    done = _newest(env.store, r, chall.variant_id, "replay")
+    if done is not None and done.champion_variant == champ.variant_id:
+        c = rr.compare(env.store, done.id, min_cases=env.config.experiments.min_cases)
+        if c.state == "finished":  # already run against this champion: nothing to rerun
+            return c
+    log.info("replay: %s %s against the champion %s", r, chall.variant_id, champ.variant_id)
+    return rr.run_replay(
+        env.deps,
+        role=r,
+        champion=champ,
+        challenger=chall,
+        settings=settings_from(env.config),
+        cancel=env.cancel,
+    )
+
+
+def unfinished_replays(store: Store) -> list[Experiment]:
+    rows = store.query(
+        "SELECT e.id FROM experiments e JOIN replay_runs r ON r.experiment_id = e.id"
+        " WHERE e.mode = 'replay' AND e.status = 'running' AND r.state != 'finished'"
+        " ORDER BY e.id"
+    )
+    return [store.get_experiment(int(r["id"])) for r in rows]
+
+
+def run_all(env: RunEnv, echo: Callable[[str], None] = print) -> list[rr.Comparison]:
+    """``run --all`` (the nightly job): resume every unfinished replay against the current
+    champion. Never promotes."""
+    out: list[rr.Comparison] = []
+    todo = unfinished_replays(env.store)
+    if not todo:
+        echo("No unfinished replays. Start one with `fman experiment run --role R --challenger V`.")
+    for exp in todo:
+        if env.cancel.is_set():
+            break
+        role = _role(exp.role)
+        current = variants.champion(env.store, role)
+        if current is None or current.id != exp.champion_variant:
+            echo(f"#{exp.id}: compares against {exp.champion_variant}, no longer the champion;"
+                 " skipped")  # fmt: skip
+            continue
+        try:
+            champ = champion_variant(env.store, env.config, role)
+            chall = _variant_from_id(env.config, role, exp.challenger_variant)
+        except (ExperimentError, variants.VariantError) as exc:
+            echo(f"#{exp.id}: skipped: {exc}")
+            continue
+        if role == "reviewer":
+            ensure_shadow(env.store, champ.variant_id, chall.variant_id)
+        c = rr.run_replay(
+            env.deps,
+            role=role,
+            champion=champ,
+            challenger=chall,
+            settings=settings_from(env.config),
+            experiment_id=exp.id,
+            cancel=env.cancel,
+        )
+        echo(f"#{exp.id}: {c.state}{f' ({c.stop_reason})' if c.stop_reason else ''}: {c.verdict}")
+        out.append(c)
+        if c.stop_reason in (rr.STOP_EXPERIMENTS_BUDGET, rr.STOP_SANDBOX):
+            break  # every other run would stop the same way
+    return out
+
+
+@contextlib.contextmanager
+def run_lock(home: Path | None = None) -> Iterator[None]:
+    """One ``fman experiment run`` at a time (``flock``; released when the process dies)."""
+    path = replays_root(home) / LOCK_NAME
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise ExperimentError("another `fman experiment run` is running") from None
+        yield
+    finally:
+        os.close(fd)
+
+
+def install_cancel_handlers(cancel: threading.Event) -> dict[int, Any]:
+    """SIGINT and SIGTERM set ``cancel`` (the run stops cleanly). Returns the old ones."""
+
+    def handler(signum: int, _frame: Any) -> None:
+        log.info("experiment run stopping: signal %s", signal.Signals(signum).name)
+        cancel.set()
+
+    return {s: signal.signal(s, handler) for s in (signal.SIGINT, signal.SIGTERM)}
+
+
+def run_command(
+    *,
+    role: str | None,
+    challenger: str | None,
+    all_: bool,
+    echo: Callable[[str], None] = print,
+    proxy_factory: Callable[[Config, Store, Any], Any] | None = None,
+    driver_factory: Callable[[], Any] | None = None,
+    config: Config | None = None,
+) -> int:
+    """``fman experiment run``: its own proxy, its own mirrors, the run lock, clean stops."""
+    from foreman_inator import config as config_mod
+    from foreman_inator.spend import Spend
+
+    if all_ == bool(role or challenger):
+        raise ExperimentError("give --role and --challenger, or --all")
+    if not all_ and not (role and challenger):
+        raise ExperimentError("give both --role and --challenger")
+    cfg = config or config_mod.load()
+    if not paths.db_path().exists():
+        raise ExperimentError("no database yet: run the worker first")
+    with run_lock(), Store(paths.db_path()) as store:
+        spend = Spend(store, cfg)
+        proxy = (proxy_factory or make_proxy)(cfg, store, spend)
+        if driver_factory is None:
+            from foreman_inator.runner.opencode import OpenCodeDriver
+
+            driver_factory = OpenCodeDriver
+        env = RunEnv(store, cfg, build_deps(store, cfg, proxy=proxy, spend=spend,
+                                            driver=driver_factory()))  # fmt: skip
+        old = install_cancel_handlers(env.cancel) if _main_thread() else {}
+        try:
+            if all_:
+                run_all(env, echo)
+            else:
+                c = run_experiment(env, role or "", challenger or "")
+                echo(rr.comparison_note(c))
+                echo(f"Experiment #{c.experiment_id}: `fman experiment status {c.experiment_id}`")
+        finally:
+            for sig, h in old.items():
+                signal.signal(sig, h)
+            with contextlib.suppress(Exception):
+                proxy.stop()
+    if env.cancel.is_set():
+        echo("Stopped; `fman experiment run --all` resumes it.")
+    return 0
+
+
+def _main_thread() -> bool:
+    return threading.current_thread() is threading.main_thread()
+
+
+def _newest(store: Store, role: str, challenger: str, mode: str) -> Experiment | None:
+    found = [
+        e
+        for e in store.list_experiments(role=role, status="running")  # type: ignore[arg-type]
+        if e.mode == mode and e.challenger_variant == challenger
+    ]
+    return found[-1] if found else None
+
+
+# The status, promotion and ``fman replay`` code lives in ``worker_promote`` and
+# ``worker_replay`` (kept under ~500 lines each); re-exported here.
+from foreman_inator.worker_promote import (  # noqa: E402
+    PromoteResult,
+    promote,
+    status_lines,
+    summary,
+)
+from foreman_inator.worker_replay import replay_command, replay_report  # noqa: E402
+
+__all__ = [
+    "ExperimentError",
+    "PromoteResult",
+    "RunEnv",
+    "build_deps",
+    "champion_variant",
+    "ensure_shadow",
+    "install_cancel_handlers",
+    "make_proxy",
+    "mirror_for",
+    "promote",
+    "replay_command",
+    "replay_report",
+    "resolve_challenger",
+    "run_all",
+    "run_command",
+    "run_experiment",
+    "run_lock",
+    "settings_from",
+    "status_lines",
+    "summary",
+    "sync_replay_mirror",
+    "unfinished_replays",
+]

@@ -65,7 +65,7 @@ in the item, and put the shape you rely on behind one small adapter so a
 change touches one file.
 ============================================================ -->
 
-Next ID: #53
+Next ID: #61
 Legend: `[ ]` todo · `[~]` in progress · `[~] live` built, waiting on its live check · `[x]` done (move to DONE.md)
 
 ## Wave plan
@@ -95,8 +95,8 @@ Package root below is `src/foreman_inator/` (written `pkg/`).
 | 6 | A: #21 (alone: the main loop) | `pkg/worker.py`, `pkg/cli.py` (`metrics`), `pkg/pr/publisher.py` (ready-for-review + bot review posting), `tests/test_worker_v2.py` | [x] built; live check open for #21 |
 | 6b | A: #40 · B: #41, #42, #43 (one agent, in order: all three edit the GitHub client and poller) · C: #44 | A `pkg/runner/sandbox.py`; edits `pkg/runner/opencode.py`, `pkg/runner/verify.py`, `pkg/review/checks.py`, `pkg/config.py` · B `pkg/github/client.py`, `tests/fakes/github.py`, `pkg/github/poller.py`, `pkg/tickets/lifecycle.py`, `pkg/tickets/prompt.py`, `pkg/setup/manifest.py`, `pkg/runner/worktree.py`, `pkg/db/store.py`, `pkg/db/migrations/002_*.sql` · C `pkg/tickets/clarify.py`, `pkg/prompts/clarify-v1.md` (+ own tests). Runner at close: `worker.py` wiring for all five; for #44 the `NeedsInfoAnswered` event in `poller.py`/`lifecycle.py` and the Q&A block in `tickets/prompt.py` (after slot B is merged into the wave branch); `pyproject.toml` deps | [x] built and wired; live checks open for #40, #41, #44 |
 | 7 | A: #22 (cross-repo, optional) | bot-inator repo only; nothing in this repo | [ ] |
-| 8 | A: #23 · B: #24 · C: #25 · D: #26 · E: #27 · F: #28 | A `pkg/routing/knn.py`, `pkg/routing/explore.py` · B `pkg/experiments/variants.py`, `pkg/experiments/__init__.py`, `pkg/prompts/__init__.py` · C `pkg/experiments/replay_sets.py`, `pkg/experiments/replay_runner.py` · D `pkg/experiments/shadow.py` · E `pkg/tracing/failure_label.py`, `pkg/prompts/failure-label-v1.md` · F `pkg/tracing/replay.py`, `pkg/metrics/trace_view.py`, `tests/recordings/` (+ own tests). Runner at close: `pyproject.toml` deps | [x] built; wiring is wave 9 |
-| 9 | A: #29 (alone: wiring) | `pkg/worker.py`, `pkg/cli.py` (`experiment`, `replay`), `pkg/metrics/web.py` (new routes and failure-step columns), `tests/test_worker_v3.py` | [ ] |
+| 8 | A: #23 · B: #24 · C: #25 · D: #26 · E: #27 · F: #28 | A `pkg/routing/knn.py`, `pkg/routing/explore.py` · B `pkg/experiments/variants.py`, `pkg/experiments/__init__.py`, `pkg/prompts/__init__.py` · C `pkg/experiments/replay_sets.py`, `pkg/experiments/replay_runner.py` · D `pkg/experiments/shadow.py` · E `pkg/tracing/failure_label.py`, `pkg/prompts/failure-label-v1.md` · F `pkg/tracing/replay.py`, `pkg/metrics/trace_view.py`, `tests/recordings/` (+ own tests). Runner at close: `pyproject.toml` deps | [x] |
+| 9 | A: #29 (alone: wiring) | `pkg/worker.py`, `pkg/cli.py` (`experiment`, `replay`), `pkg/metrics/web.py` (new routes and failure-step columns), `tests/test_worker_v3.py` | [x] built; live check open for #29 |
 | 10 | A: #30 · B: #31 · C: #32 | A `pkg/export.py` · B `pyproject.toml` (metadata, entry points), `.github/workflows/release.yml`, `docs/releasing.md` · C `README.md`, `docs/setup.md`, `docs/how-it-works.md`, `docs/demo.gif` (+ own tests). Runner at close: `cli.py` (`export`) | [ ] |
 | — | #33–#39 | unscheduled (SPEC milestone 5) | open |
 | — | #45–#50 | unscheduled (gap review, 2026-11-23) | open |
@@ -136,6 +136,7 @@ Open (need the user; full steps in each item's DONE.md entry):
 - Optional (#42, #43): a request-changes review with line comments; a conflicting commit on the base of a PR in review.
 
 One combined step list for wave 6b is in DONE.md's #40, #41 and #44 entries.
+- #29 milestone 4: one overnight replay of a prompt change (a new prompt file), then read the comparison. Steps in DONE.md.
 
 ## Completed items (archived to DONE.md)
 
@@ -171,6 +172,7 @@ One combined step list for wave 6b is in DONE.md's #40, #41 and #44 entries.
 #26 — Shadow reviewer [x] · 2026-11-23 · see DONE.md
 #27 — Failure-step labeling [x] · 2026-11-23 · see DONE.md
 #28 — Replay viewer and recorded tickets as worker regression tests [x] · 2026-11-23 · see DONE.md
+#29 — Wiring for milestone 4 [~] live · 2026-11-23 · see DONE.md
 
 ---
 
@@ -225,17 +227,6 @@ Verify: the bot-inator item exists and links to this SPEC.
 Deviations:
 
 ### Milestone 4 — Learning router, experiments, trace analysis
-
-#29 — Wiring for milestone 4 [ ]
-Wave: 9 · Agent: A (alone) · Added: 2026-11-23 · Source: spec
-Ask: Turn on the learning router, experiments and trace analysis in the running worker.
-Files:
-⚬ OWNED: `src/foreman_inator/worker.py`, `src/foreman_inator/cli.py` (`experiment run|status|promote`, `replay <ticket>`), `src/foreman_inator/metrics/web.py` (routes for trace view, failure steps per variant, experiments), `tests/test_worker_v3.py`
-Approach: router picks #23 over #15 past the threshold; every kickback triggers #27; shadow reviewer (#26) runs when a challenger exists; `fman experiment run` drives #25 overnight via launchd calendar interval; promotion follows SPEC's rule (wins on replay and holds live).
-Verify:
-⚬ Scenario test: challenger wins replay, holds in shadow, `promote` switches the champion; a challenger that loses live is rejected.
-Live (user): run one overnight replay of a prompt change; read the comparison.
-Deviations:
 
 ### Release
 
@@ -404,3 +395,23 @@ Idea: likely cause, not confirmed: zsh creates heredoc temp files under `TMPPREF
 #56 — Setup puts every installed repo into config.toml [ ] · Added: 2026-11-23 · Source: assistant (first live run)
 Why: GitHub's install page defaults to "All repositories". `fman setup` then wrote all 141 of the user's repos (87 public) into `repos`, and the worker started with "141 repo(s), polling every 45s": about 11,000 issue listings an hour, at or over the installation's rate limit (not confirmed for this account), and far more repos than the user meant to hand over. There is no command to change the list; it was cut to one repo by rewriting the file through `config.save`.
 Idea: setup shows the count and asks which repos to work on when the installation covers more than a few (default: none until chosen), and says how to narrow the installation on GitHub. Add `fman repo add` / `fman repo remove`. Consider one installation-wide listing per poll instead of one per repo.
+
+### Unscheduled (local model resources, 2026-11-23)
+
+Asked by the user: "should we add the ability for the app to track gpu / memory usage and keep track of how many local models are running at a time?", then "lets add all 4 to the todo.md". GPU utilization % is left out on purpose: on macOS it needs `sudo powermetrics`, which a launchd worker cannot run, and on Apple Silicon the GPU shares system memory, so memory pressure plus Ollama's loaded-model list covers it.
+
+#57 — Global cap on concurrent local-model inference [ ] · Added: 2026-11-23 · Source: user
+Why: `max_parallel_per_repo` (default 1, "one local GPU") is counted per repo, and nothing limits local work across repos. Three watched repos can send three tickets to Ollama at once, each loading `qwen3.8:27b` or `inkling-2-mini`: models get evicted and reloaded, the machine swaps, and attempts slow down or time out. Those runs are then recorded as model failures in the metrics and the kNN router's data.
+Idea: a `max_local_inference` config setting (default 1). The proxy holds one shared semaphore for requests to `local` tier endpoints; cloud tiers are not limited. Time spent waiting for a slot is recorded on the `llm.call` span and not counted against the attempt's timeout. Estimate: about 2 hours with tests.
+
+#58 — Poll Ollama for loaded models [ ] · Added: 2026-11-23 · Source: user
+Why: there is no way to see how many local models are running right now. Ollama's `GET /api/ps` returns each loaded model with `size`, `size_vram` and `expires_at`, which answers that directly with no GPU tooling.
+Idea: a small poller (reuse `setup.deps.ollama_host` for the host) that the worker status and the metrics view read. If Ollama is unreachable, report that instead of zero models. Estimate: about 1 hour.
+
+#59 — Record memory state on each attempt [ ] · Added: 2026-11-23 · Source: user
+Why: a slow or failed local attempt can't be told apart from a starved machine. Without this, resource contention looks like model quality in the metrics and replay sets.
+Idea: at attempt start (and optionally at end), store the loaded models from #58 plus system memory used and memory pressure (`psutil`, or `vm_stat` / `memory_pressure` on macOS) on the attempt's trace. Decide whether it belongs on a span attribute (no schema change) or in an attempt column. Estimate: about 2 hours.
+
+#60 — Resource panel on the metrics page [ ] · Added: 2026-11-23 · Source: user
+Why: makes #57–#59 visible: current loaded models and their memory, system memory used, and local inference slots in use vs. the cap.
+Idea: a panel in `metrics/web.py` fed by #58's poller and the #57 semaphore; per-attempt memory from #59 shown on the attempt view. Depends on #57–#59. Estimate: about 2 hours.

@@ -5,7 +5,8 @@ whether or not the worker is running. Since #21 it also shows which tickets wait
 locks held by other tickets (#19) or on a spend approval (#18), and ends with the cloud
 spend line when given the config. Wave 6b: a ticket waiting on ``needs-info`` (#44) or on
 GitHub CI (#41) says so, and with the config the sandbox line (#40) comes last, loudly
-when the sandbox is off. ``set_verify_command`` saves a repo's verify
+when the sandbox is off. Wave 9: the champion lines (#24, including "PROMPT CHANGED ...
+(not promoted)") and the running experiments count. ``set_verify_command`` saves a repo's verify
 command and lifts the "no verify command" flag from that repo's open tickets, so the
 running worker picks them up on its next pass.
 """
@@ -16,6 +17,7 @@ from collections.abc import Sequence
 
 from foreman_inator.config import Config
 from foreman_inator.db.store import COLUMNS, Attempt, Store, Ticket
+from foreman_inator.experiments import variants
 from foreman_inator.locks import Locks
 from foreman_inator.runner import sandbox
 from foreman_inator.spend import FLAG_SPEND_CAP, Spend
@@ -141,11 +143,25 @@ def render_status(store: Store, *, closed_limit: int = 5, config: Config | None 
         )
     )
     out.append(f"{len(tickets)} ticket(s), {flagged} flagged for you, {waiting} waiting.")
+    out.extend(_champion_lines(store))
     if config is not None:
         out.append(Spend(store, config).summary().status_line())
         line = sandbox.describe(config.sandbox, dict(config.sandbox_network))  # type: ignore[arg-type]
         out.append(f"!!! {line} !!!" if config.sandbox == "off" else line)
     return "\n".join(out)
+
+
+def _champion_lines(store: Store) -> list[str]:
+    """#24: the champion per role, with the "PROMPT CHANGED ... (not promoted)" line when a
+    champion's prompt file was edited since it was promoted; running experiments."""
+    try:
+        lines = [f"Champion {line}" for line in variants.status_lines(store)]
+        running = store.list_experiments(status="running")
+    except Exception as exc:  # an old database without the wave 8 tables
+        return [f"(champions unavailable: {type(exc).__name__})"]
+    if running:
+        lines.append(f"Experiments running: {len(running)} (`fman experiment status` for details)")
+    return lines
 
 
 def set_verify_command(store: Store, repo: str, command: str | None) -> list[int]:

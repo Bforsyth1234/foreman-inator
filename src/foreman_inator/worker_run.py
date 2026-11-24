@@ -160,7 +160,8 @@ def run_worker(*, once: bool = False) -> int:
     api = build_github(cfg, key_path)
     bot = f"{cfg.app_slug}[bot]" if cfg.app_slug else "foreman-inator[bot]"
     spend = Spend(store, cfg)
-    proxy = ModelProxy(cfg, store=store, spend_hook=spend.hook).start()
+    # The embedding model (#23) is served next to the writers but is never a rung.
+    proxy = ModelProxy(cfg.proxy_models(), store=store, spend_hook=spend.hook).start()
     driver = OpenCodeDriver()
     if not once:
         warm_up_opencode(driver, cfg, proxy)
@@ -183,6 +184,7 @@ def run_worker(*, once: bool = False) -> int:
         worker.recover()
         if once:
             worker.run_once()
+            worker.drain_background(timeout=120.0)  # labels and shadows of this pass
         else:
             worker.serve_forever()
     finally:
