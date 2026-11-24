@@ -81,7 +81,7 @@ Package root below is `src/foreman_inator/` (written `pkg/`).
 
 | Wave | Slot: items | Owned files (disjoint within the wave) | Status |
 | :--- | :--- | :--- | :--- |
-| 1 | A: #1 (alone) | `pyproject.toml`, `uv.lock`, `.gitignore`, `LICENSE`, `README.md`, `.pre-commit-config.yaml`, `.github/workflows/ci.yml`, `pkg/__init__.py`, `pkg/cli.py` (skeleton), `pkg/worker.py` (skeleton), `tests/conftest.py`, `tests/fakes/__init__.py` | [ ] |
+| 1 | A: #1 (alone) | `pyproject.toml`, `uv.lock`, `.gitignore`, `LICENSE`, `README.md`, `.pre-commit-config.yaml`, `.github/workflows/ci.yml`, `pkg/__init__.py`, `pkg/cli.py` (skeleton), `pkg/worker.py` (skeleton), `tests/conftest.py`, `tests/fakes/__init__.py` | [x] |
 | 2 | A: #2 · B: #3 · C: #4 · D: #5 · E: #6 · F: #7 | A `pkg/paths.py`, `pkg/config.py` · B `pkg/db/schema.sql`, `pkg/db/store.py`, `pkg/db/__init__.py` · C `pkg/github/app_auth.py`, `pkg/github/client.py`, `pkg/github/__init__.py`, `tests/fakes/github.py` · D `pkg/tracing/otel.py`, `pkg/tracing/recorder.py`, `pkg/tracing/__init__.py` · E `pkg/runner/verify.py`, `tests/fixtures/repos/` · F `pkg/runner/worktree.py`, `pkg/runner/__init__.py` (+ each slot's own `tests/test_<module>.py`). Runner at close: `pyproject.toml` deps | [ ] |
 | 3 | A: #8 · B: #9 · C: #10 · D: #11 · E: #12 · F: #13 | A `pkg/setup/manifest.py`, `pkg/setup/deps.py`, `pkg/setup/launchd.py`, `pkg/setup/__init__.py` · B `pkg/proxy/server.py`, `pkg/proxy/pricing.py`, `pkg/proxy/__init__.py`, `tests/fakes/models.py` · C `pkg/runner/opencode.py`, `tests/fakes/opencode.py` · D `pkg/github/poller.py`, `pkg/tickets/lifecycle.py`, `pkg/tickets/__init__.py` · E `pkg/pr/publisher.py`, `pkg/pr/__init__.py` · F `pkg/prompts/writer-v1.md`, `pkg/tickets/prompt.py` (+ own tests). Runner at close: `cli.py` (`setup`), `pyproject.toml` deps | [ ] |
 | 4 | A: #14 (alone: the main loop) | `pkg/worker.py`, `pkg/cli.py` (`run`, `status`), `tests/test_worker_v1.py`, `tests/fakes/` (additive only) | [ ] |
@@ -114,7 +114,7 @@ milestone 2's in #17 and #21.
 
 ## Completed items (archived to DONE.md)
 
-(none yet)
+#1 — Repo scaffold: package, tooling, CI, secret guards [x] · 2026-11-23 · see DONE.md
 
 ---
 
@@ -145,24 +145,6 @@ All items below were written 2026-11-23 from SPEC.md (user: "write
 todos organized in waves to build this app"). Section = SPEC milestone.
 
 ### Milestone 1 — GitHub App plus a polling worker on one tier
-
-#1 — Repo scaffold: package, tooling, CI, secret guards [ ]
-Wave: 1 · Agent: A · Added: 2026-11-23 · Source: spec
-Ask: A public MIT repo that is safe to push from the first commit.
-DECISIONS (assistant, 2026-11-23):
-1. src layout, package `foreman_inator`, `uv` project, Python ≥3.12.
-2. `.gitignore` is exactly the one in SPEC.md "Open source and distribution".
-3. CI runs on GitHub-hosted runners only (`ubuntu-latest`, `macos-latest`): pytest, ruff, gitleaks. Never `runs-on: self-hosted` (public repo).
-4. `cli.py` and `worker.py` are skeletons (a `typer` app with `--version`; an empty `run()`), so later waves only add to them.
-Files:
-⚬ OWNED: `pyproject.toml`, `uv.lock`, `.gitignore`, `LICENSE`, `README.md`, `.pre-commit-config.yaml`, `.github/workflows/ci.yml`, `src/foreman_inator/__init__.py`, `src/foreman_inator/cli.py`, `src/foreman_inator/worker.py`, `tests/conftest.py`, `tests/fakes/__init__.py`, `tests/test_smoke.py`
-Approach: `uv init --package`, add ruff + pytest config in `pyproject.toml`, entry points `foreman-inator` and `fman` both → `foreman_inator.cli:app`. gitleaks as a pre-commit hook and a CI job. README: one paragraph, "personal project, no promised support", link to SPEC.md. `conftest.py` sets `FOREMAN_INATOR_HOME` to `tmp_path` for every test so nothing touches `~/.foreman-inator`.
-Verify:
-⚬ `uv run fman --version` and `uv run foreman-inator --version` print the version.
-⚬ `uv run pytest -q` and `uv run ruff check .` pass.
-⚬ gitleaks blocks a commit containing a fake `-----BEGIN RSA PRIVATE KEY-----` file (try it in a scratch branch, then delete).
-⚬ `test_smoke.py` asserts `FOREMAN_INATOR_HOME` points inside `tmp_path`; non-vacuous: remove the fixture, test fails.
-Deviations:
 
 #2 — Paths and config: `~/.foreman-inator`, config.toml, Keychain keys [ ]
 Wave: 2 · Agent: A · Added: 2026-11-23 · Source: spec
