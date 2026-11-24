@@ -313,6 +313,34 @@ def test_child_env_points_home_and_caches_into_scratch(tmp_path):
     assert "UV_OFFLINE" not in sb.child_env(_plain_policy(tmp_path, network="allow"), "")
 
 
+def test_child_env_points_linked_git_at_its_own_helpers(tmp_path):
+    """Live run 2026-11-24: Xcode's git finds its helpers (git-remote-https...) relative
+    to the path it was started from, so through the scratch-bin link it looked in
+    ``<scratch>/libexec/git-core`` and every https fetch (uv's git dependencies) failed."""
+    dev = tmp_path / "Developer" / "usr"
+    (dev / "bin").mkdir(parents=True)
+    (dev / "libexec" / "git-core").mkdir(parents=True)
+    (dev / "bin" / "git").write_text("")
+    env = sb.child_env(_plain_policy(tmp_path, shims=(("git", dev / "bin" / "git"),)), "")
+    assert env["GIT_EXEC_PATH"] == str(dev / "libexec" / "git-core")
+    # no helper dir next to the binary: leave git's own lookup alone
+    other = tmp_path / "other" / "bin"
+    other.mkdir(parents=True)
+    (other / "git").write_text("")
+    scratch2 = tmp_path / "s2"
+    pol = _plain_policy(scratch2, shims=(("git", other / "git"),))
+    assert "GIT_EXEC_PATH" not in sb.child_env(pol, "")
+
+
+@pytest.mark.skipif(not sb.xcrun_shims("/usr/bin"), reason="needs macOS with the xcrun git shim")
+def test_linked_xcrun_git_finds_its_https_helper(tmp_path):
+    shims = tuple(s for s in sb.xcrun_shims("/usr/bin") if s[0] == "git")
+    env = {**os.environ, **sb.child_env(_plain_policy(tmp_path, shims=shims), "/usr/bin:/bin")}
+    link = Path(env["PATH"].split(os.pathsep)[0]) / "git"
+    out = subprocess.run([str(link), "--exec-path"], env=env, capture_output=True, text=True)
+    assert (Path(out.stdout.strip()) / "git-remote-https").exists()
+
+
 def test_swift_wrapper_disables_the_nested_sandbox(tmp_path):
     pol = _plain_policy(tmp_path, shims=(("swift", Path("/opt/x/swift")),))
     sb.child_env(pol, "")
