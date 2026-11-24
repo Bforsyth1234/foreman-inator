@@ -926,6 +926,13 @@ def child_env(policy: Policy | None, base_path: str | None = None) -> dict[str, 
             link.chmod(0o755)
         else:
             link.symlink_to(target)
+    # Xcode's git finds its helpers (git-remote-https...) relative to the path it was
+    # started from, which is the link above: it looked in <scratch>/libexec/git-core and
+    # every https fetch failed (uv's git dependencies; live run 2026-11-24).
+    for name, target in policy.shims:
+        helpers = Path(target).parent.parent / "libexec" / "git-core"
+        if name == "git" and helpers.is_dir():
+            env["GIT_EXEC_PATH"] = str(helpers)
     path = os.environ.get("PATH", "") if base_path is None else base_path
     path = scrub_path(path, policy.worker)  # #54: never the worker's own venv
     env["PATH"] = os.pathsep.join([str(bin_dir), path]) if path else str(bin_dir)
