@@ -523,6 +523,7 @@ def test_a_sandboxed_process_cannot_sandbox_itself_again(att):
 
 
 @macos
+@pytest.mark.timeout(600)  # a cold `swift build` on a small, busy CI runner can pass 60 s
 @pytest.mark.parametrize("fixture", ["python", "node", "swift", "makefile"])
 def test_fixture_repos_pass_verify_in_the_sandbox(tmp_path, fixture):
     att = Attempt(tmp_path, fixture)
