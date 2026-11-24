@@ -137,6 +137,24 @@ def warm_up_opencode(driver: Any, cfg: Config, proxy: Any) -> bool:
         shutil.rmtree(state, ignore_errors=True)
 
 
+def repo_count_warning(cfg: Config) -> str | None:
+    """#56: one warning when ``repos`` is larger than ``REPOS_WARN_THRESHOLD`` (setup once
+    wrote every repo of an "All repositories" installation), with the request estimate."""
+    from foreman_inator import config as config_mod
+
+    n = len(cfg.repos)
+    if n <= config_mod.REPOS_WARN_THRESHOLD:
+        return None
+    per_hour = config_mod.listing_requests_per_hour(n, cfg.poll_interval_seconds)
+    return (
+        f"config.toml lists {n} repos (more than {config_mod.REPOS_WARN_THRESHOLD}): about"
+        f" {per_hour:,} GitHub requests an hour for the issue listings alone (one per repo"
+        f" every {cfg.poll_interval_seconds}s; an installation's limit starts at 5,000 an"
+        " hour). Check the list with `fman repo list`, take repos out with `fman repo"
+        " remove OWNER/NAME`, then restart the worker"
+    )
+
+
 def run_worker(*, once: bool = False) -> int:
     """``fman run``: build the real collaborators and work until stopped. Exit code."""
     from foreman_inator import config as config_mod
@@ -147,6 +165,9 @@ def run_worker(*, once: bool = False) -> int:
 
     _setup_logging()
     cfg = config_mod.load()
+    too_many = repo_count_warning(cfg)
+    if too_many:
+        log.warning(too_many)
     key_path = paths.app_key_path()
     if cfg.app_id is None or not cfg.installation_ids or not key_path.exists():
         log.error("no GitHub App configured or installed: run `fman setup` first")
@@ -197,4 +218,10 @@ def run_worker(*, once: bool = False) -> int:
     return 0
 
 
-__all__ = ["build_github", "install_signal_handlers", "run_worker", "warm_up_opencode"]
+__all__ = [
+    "build_github",
+    "install_signal_handlers",
+    "repo_count_warning",
+    "run_worker",
+    "warm_up_opencode",
+]

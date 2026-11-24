@@ -140,6 +140,7 @@ from foreman_inator.tickets.lifecycle import Action, IllegalTransition
 from foreman_inator.worker_actions import ActionHandlers, Ctx, flag_comment
 from foreman_inator.worker_attempt import AttemptSteps
 from foreman_inator.worker_background import BackgroundSteps
+from foreman_inator.worker_install import InstallSteps
 from foreman_inator.worker_pause import PauseSteps
 from foreman_inator.worker_publish import PublishSteps
 from foreman_inator.worker_queue import JOIN_TIMEOUT, Job, QueueSteps
@@ -156,6 +157,7 @@ Policy = Callable[[escalation.History], escalation.Step | None]
 class Worker(
     ActionHandlers,
     RouteSteps,
+    InstallSteps,  # before AttemptSteps: it overrides prepare_worktree (#45)
     AttemptSteps,
     PublishSteps,
     RebaseSteps,
@@ -196,7 +198,11 @@ class Worker(
         self.recordings_dir = Path(recordings_dir)
         self.traces_dir = Path(traces_dir)
         self.publisher = publisher or Publisher(
-            api, store, sandbox_line=sandbox.describe(config.sandbox, dict(config.sandbox_network))
+            api,
+            store,
+            sandbox_line=sandbox.describe(
+                config.sandbox, dict(config.sandbox_network), dict(config.sandbox_install)
+            ),
         )
         #: CI (#41) and base conflicts (#43) on: their handlers are in ``self.actions``.
         self.poller = poller or Poller(api, store, config, ci=True, conflicts=True)

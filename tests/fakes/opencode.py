@@ -35,6 +35,12 @@ finishes (assistant message completed with `tokens_in`/`tokens_out`, `session.id
     fail(message)                     session.error (UnknownError), then idle
     crash(code)                       the process exits at once (out-of-process only)
     spawn_child()                     starts `sleep 600` in the server's process group
+
+Setup failures (#53), as `Script` fields rather than steps (they happen before a prompt):
+`session_status=500` makes `POST /session` fail with that status, `prompt_status=500`
+makes `POST /session/<id>/prompt_async` fail, `startup_exit=4` makes the fake binary exit
+before it listens; `fail_launches=N` limits any of them to the first N server launches
+(0: every launch), so a test can fail once and then succeed.
 """
 
 from __future__ import annotations
@@ -118,6 +124,10 @@ class Script:
     tokens_out: int = 40
     cost: float = 0.0
     ignore_abort: bool = False
+    session_status: int = 0  # #53: POST /session answers this status (0: works)
+    prompt_status: int = 0  # #53: POST /session/<id>/prompt_async answers this status
+    startup_exit: int | None = None  # #53: the binary exits with this code before listening
+    fail_launches: int = 0  # #53: the failures above only on the first N launches (0: all)
 
     def to_json(self) -> str:
         return json.dumps(asdict(self))
@@ -200,6 +210,12 @@ class FakeOpenCodeServer:
         self._httpd: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
         self.url: str | None = None
+        self.launch_index = 1  # which server launch this is (the shim counts them)
+
+    def failing(self) -> bool:
+        """#53: do the scripted setup failures apply to this launch?"""
+        n = self.script.fail_launches
+        return n <= 0 or self.launch_index <= n
 
     @property
     def aborted(self) -> bool:
@@ -532,6 +548,8 @@ def _make_handler(srv: FakeOpenCodeServer) -> type[BaseHTTPRequestHandler]:
             if method == "GET" and parts == ["event"]:
                 return self._sse()
             if method == "POST" and parts == ["session"]:
+                if srv.script.session_status and srv.failing():
+                    return self._json(srv.script.session_status, {"name": "UnknownError"})
                 return self._json(200, srv.create_session(body))
             if method == "GET" and parts == ["session", "status"]:
                 busy = {k: {"type": "busy"} for k, v in srv.sessions.items() if v.busy}
@@ -539,6 +557,8 @@ def _make_handler(srv: FakeOpenCodeServer) -> type[BaseHTTPRequestHandler]:
             if parts[:1] == ["session"] and len(parts) >= 2:
                 sid = parts[1]
                 if method == "POST" and parts[2:] == ["prompt_async"]:
+                    if srv.script.prompt_status and srv.failing():
+                        return self._json(srv.script.prompt_status, {"name": "UnknownError"})
                     if sid not in srv.sessions:
                         raise KeyError(sid)
                     srv.prompt(sid, body)
@@ -668,8 +688,14 @@ def main(argv: list[str] | None = None) -> int:
         "env_names": sorted(os.environ),
     }
     (record / f"launch-{os.getpid()}.json").write_text(json.dumps(launch))
+    script = Script.from_json(Path(args.fake_script).read_text())
+    launch_index = len(list(record.glob("launch-*.json")))
+    failing = script.fail_launches <= 0 or launch_index <= script.fail_launches
+    if script.startup_exit is not None and failing:
+        print("fake opencode: failing to start (scripted)", file=sys.stderr, flush=True)
+        return script.startup_exit
     server = FakeOpenCodeServer(
-        Script.from_json(Path(args.fake_script).read_text()),
+        script,
         directory=os.getcwd(),
         password=os.environ.get("OPENCODE_SERVER_PASSWORD"),
         username=os.environ.get("OPENCODE_SERVER_USERNAME", "opencode"),
@@ -677,6 +703,7 @@ def main(argv: list[str] | None = None) -> int:
         host=args.hostname,
         port=args.port,
     )
+    server.launch_index = launch_index
     url = server.start()
     print(f"opencode server listening on {url}", flush=True)
     try:

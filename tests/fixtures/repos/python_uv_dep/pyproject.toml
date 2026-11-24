@@ -1,0 +1,15 @@
+[project]
+name = "fman-uv-dep-fixture"
+version = "0.0.0"
+requires-python = ">=3.11"
+dependencies = []
+
+[dependency-groups]
+dev = ["pytest", "fmantoydep"]
+
+[tool.uv]
+# The test index (tests/fakes/pkgindex.py) holds only what pytest needs on macOS.
+environments = ["sys_platform == 'darwin'"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

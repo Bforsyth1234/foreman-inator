@@ -96,6 +96,9 @@ Options (see [commands.md](commands.md#fman-setup)):
   unique across GitHub). The default is `foreman-inator-` plus six random hex
   characters, so the bot account is `<that name>[bot]`.
 - `--no-service`: skip the launchd agents.
+- `--repo <owner/name>`: work on exactly these repos, without a question.
+  Repeatable. It replaces the `repos` list in `config.toml`; a repo the App's
+  installation cannot see is not added and setup says so.
 
 What happens, in order:
 
@@ -121,20 +124,37 @@ What happens, in order:
 
 2. **Install it.** If the App has no installation yet, setup opens
    `https://github.com/apps/<app-name>/installations/new` and waits up to 15
-   minutes. Choose **Only select repositories** and pick the
-   repos the worker may work on. Do not choose "All repositories": setup adds
-   every repo the installation covers to `config.toml`, and the worker polls
-   each one (todo #56; there is no command yet to remove repos, so edit the
-   `repos` list in `config.toml` by hand). Setup then prints `Installed on: ...`.
+   minutes. GitHub's page starts on "All repositories". Choose **Only select
+   repositories** and pick the repos the worker may work on: the App can then
+   read and write only those.
+
+3. **Choose the repos to work on.** Setup never adds repos on its own. The
+   worker polls every repo in the `repos` list of `config.toml`, at least one
+   GitHub request per repo every 45 seconds, so the list is yours to choose:
+
+   | The installation covers | What setup does |
+   | --- | --- |
+   | Up to 5 repos you picked with "Only select repositories" | Adds them, and says so. |
+   | More than 5 repos, or "All repositories" | Lists them, numbered, and asks which ones to work on. Type names or numbers separated by commas or spaces, `all` for every one, or press Enter for none yet. Then it prints how to narrow the installation itself (below). |
+   | Any number, and you passed `--repo` | Uses exactly the `--repo` repos. No question. |
+   | Any number, and there is no terminal (setup run from a script) | Adds nothing and says how to add repos. |
+
+   To narrow what the App can see on GitHub, open the installation's settings
+   page, `https://github.com/settings/installations/<installation id>` (for an
+   organization,
+   `https://github.com/organizations/<org>/settings/installations/<installation id>`),
+   and under **Repository access** choose **Only select repositories**. Setup
+   prints the exact URL.
+
    If the App was created before the Checks and Actions permissions were added,
    setup prints how to add them.
 
-3. **Check dependencies.** Setup prints one line per check, `[ok ]` or
+4. **Check dependencies.** Setup prints one line per check, `[ok ]` or
    `[MISSING]`, for git, `opencode`, `ollama` and each tier 1 and 2 model, with
    the command to run for anything missing. It never installs anything itself.
    It does not check `embeddinggemma`.
 
-4. **Install the launchd agents.** Unless you passed `--no-service`, two agents
+5. **Install the launchd agents.** Unless you passed `--no-service`, two agents
    go into `~/Library/LaunchAgents/` and are loaded at once:
 
    | Agent | Runs | When |
@@ -145,9 +165,42 @@ What happens, in order:
 Setup ends with `Config written to ~/.foreman-inator/config.toml.`
 
 Running `fman setup` again is safe: it reuses the App in `config.toml` (when
-`app.pem` is still there), adds new installations and repos, and reinstalls
-the agents. Re-run it after changing `[experiments] nightly_hour`, which is
-read only when the agent is installed.
+`app.pem` is still there), adds new installations, and reinstalls the agents.
+It leaves the `repos` list exactly as it is: a repo you removed stays removed,
+and repos the installation can see but the list does not have are counted as
+available, not added. If nothing else changed, `config.toml` is not rewritten.
+Re-run it after changing `[experiments] nightly_hour`, which is read only when
+the agent is installed.
+
+### Changing the repos later
+
+```bash
+fman repo list                  # the repos the worker polls
+fman repo list --available      # also the ones the installation can see but are not listed
+fman repo add <owner/name> ...
+fman repo remove <owner/name> ...
+```
+
+`fman repo add` checks that the App's installation can see each repo, because
+the worker would only get errors polling one it cannot see. If one is not
+visible, nothing is added and the command prints the installation's settings
+URL, where **Repository access** adds the repo (`--no-check` skips the check).
+`fman repo remove` deletes nothing: the repo's tickets stay in the database
+and nothing on GitHub changes. After a restart the worker stops polling that
+repo and starts no work on its tickets. Add the repo back to pick them up
+again.
+
+The worker reads `config.toml` only when it starts, so restart it after either
+command (both print this):
+
+```bash
+launchctl kickstart -k gui/$(id -u)/com.foreman-inator.worker
+```
+
+When the list has more than 20 repos, the worker's log starts with a warning
+that gives the count and about how many GitHub requests an hour the issue
+listings alone take (143 repos is about 11,440 an hour; an installation's limit
+starts at 5,000 an hour).
 
 ### What lands in `~/.foreman-inator/`
 
@@ -284,8 +337,8 @@ its draft PR, and add `agent` again (a new ticket).
 `fman status` reads the database only, so it works whether or not the worker
 is running. It lists tickets under TODO, IN PROGRESS, TESTING (waiting for
 your review), DONE and DROPPED (`--closed N` sets how many closed ones to
-show), then a summary line, the champion lines, the cloud spend line and the
-sandbox line.
+show), then a summary line, the champion lines, the repo count line, the
+cloud spend line and the sandbox line.
 
 | Line | Meaning | What to do |
 | --- | --- | --- |
@@ -294,6 +347,7 @@ sandbox line.
 | `WAITING: GitHub CI on the PR head` | Local checks passed; the worker waits for the PR's CI. | Nothing. With no CI after 2 minutes it continues; still pending after 30 minutes, it continues with a note. A red job sends the change back with the job's log. |
 | `WAITING: needs-info: answer the question on the issue, or remove the label` | The bot asked questions on a vague issue. | Answer in a comment, or remove `needs-info`. |
 | `FLAGGED: <reason>` | The ticket was handed to you. The reason starts with a code, for example `checks_failed`, `kickback_cap`, `ai_kickback_cap`, `kickback_wrong`, `reviewer_handover`, `no_reviewer`, `review_skipped`, `rebase_cap`, `no_verify_command`, `sandbox_unavailable`, `interrupted`, `publish_failed`. The same explanation is on the issue. | Review the PR if there is one. For `no_verify_command`, run `fman repo set-verify`. Otherwise fix the cause and start the ticket over. |
+| `Repos: N in config.toml (fman repo list).` | How many repos the worker polls. Above 20 it adds the hourly GitHub request estimate. | `fman repo remove <owner/name>` for any you do not want worked on, then restart the worker. |
 | `Sandbox: on (sandbox-exec).` | Model-written code runs sandboxed. | Nothing. |
 | `!!! Sandbox: OFF (sandbox = "off" in config): model-written code runs unsandboxed. !!!` | `sandbox = "off"` is set. | Set it back to `"on"` unless you accept the risk. |
 | `cloud spend: $X of $5.00 today, $Y of $50.00 this month; experiments ...` | Spend against the caps. | Change the caps in `[spend_caps]`. |

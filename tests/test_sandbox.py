@@ -634,3 +634,176 @@ def test_opencode_with_unavailable_sandbox_raises_and_starts_nothing(att):
     finally:
         sb.set_backend(old)
     assert fake.launches() == []
+
+
+# ------------------------------------------- #54: the worker's own Python environment
+
+
+def _uv_run_env(base: dict[str, str] | None = None) -> dict[str, str]:
+    """An environment like the one `uv run fman run` gives the worker (observed with uv
+    0.9.29): its venv's bin first on PATH, VIRTUAL_ENV, UV and UV_RUN_RECURSION_DEPTH;
+    plus the other activation variables a user's shell may carry."""
+    env = dict(os.environ if base is None else base)
+    venv = sys.prefix
+    env["PATH"] = os.pathsep.join([f"{venv}/bin", env.get("PATH", "/usr/bin:/bin")])
+    env.update({
+        "VIRTUAL_ENV": venv, "VIRTUAL_ENV_PROMPT": "foreman-inator", "UV": "/x/uv",
+        "UV_RUN_RECURSION_DEPTH": "1", "UV_PROJECT_ENVIRONMENT": f"{venv}",
+        "PYTHONPATH": f"{venv}/lib", "PYTHONHOME": venv, "CONDA_PREFIX": "/opt/conda",
+        "CONDA_DEFAULT_ENV": "base", "UV_ACTIVE": "1",
+    })  # fmt: skip
+    return env
+
+
+LEAKS = ("VIRTUAL_ENV", "VIRTUAL_ENV_PROMPT", "UV", "UV_RUN_RECURSION_DEPTH",
+         "UV_PROJECT_ENVIRONMENT", "PYTHONPATH", "PYTHONHOME", "CONDA_PREFIX",
+         "CONDA_DEFAULT_ENV", "UV_ACTIVE")  # fmt: skip
+
+
+def _venv_on(path: str) -> bool:
+    venv = Path(sys.prefix).resolve()
+    return any(e and Path(e).resolve().is_relative_to(venv) for e in path.split(os.pathsep))
+
+
+def test_worker_paths_name_the_workers_own_venv_and_checkout():
+    found = sb.worker_paths()
+    assert Path(sys.prefix).resolve() in found  # the test runs in foreman-inator's venv
+    checkout = Path(__file__).resolve().parents[1]
+    assert checkout in found  # an editable install: the source checkout
+    assert Path.home().resolve() not in found and Path("/") not in found
+
+
+def test_scrub_drops_activation_vars_and_the_venv_bin(att):
+    env = _uv_run_env()
+    for scrubbed in (sb.scrub_worker_env(env), sb.apply_env(env, att.policy()),
+                     sb.apply_env(env, None), sb.apply_env(env, Policy(
+                         worktree=att.wt.path, scratch=att.scratch, mode="off"))):  # fmt: skip
+        assert not set(LEAKS) & set(scrubbed), set(LEAKS) & set(scrubbed)
+        assert not _venv_on(scrubbed["PATH"]), scrubbed["PATH"]
+        assert "/usr/bin" in scrubbed["PATH"].split(os.pathsep)
+
+
+def test_verify_and_opencode_env_drop_it_with_the_sandbox_off(monkeypatch, tmp_path):
+    from foreman_inator.runner import opencode
+
+    monkeypatch.setattr(os, "environ", _uv_run_env())
+    env = verify._child_env(None)
+    assert not set(LEAKS) & set(env) and not _venv_on(env["PATH"])
+    server = opencode.server_env(
+        os.environ, config_file=tmp_path / "c", config_home=tmp_path, data_home=tmp_path,
+        state_home=tmp_path, cache_home=tmp_path, password="pw",
+    )  # fmt: skip
+    assert not set(LEAKS) & set(server) and not _venv_on(server["PATH"])
+
+
+def test_toolchain_discovery_never_opens_the_workers_env(tmp_path):
+    home = tmp_path / "home"
+    checkout = home / "dev/foreman-inator"
+    venv = checkout / ".venv"
+    tool = home / ".local/share/uv/tools/foreman-inator"
+    local_bin = home / ".local/bin"
+    for d in (venv / "bin", tool / "bin", local_bin):
+        d.mkdir(parents=True)
+    for v in (venv, tool):
+        (v / "pyvenv.cfg").write_text("home = /usr\n")
+        (v / "bin/fman").write_text("")
+    (local_bin / "fman").symlink_to(tool / "bin/fman")  # `uv tool install foreman-inator`
+    path = os.pathsep.join([str(venv / "bin"), str(local_bin), "/usr/bin"])
+    worker = (checkout, tool)
+    found = set(sb.toolchain_reads(path, home, exclude=worker))
+    assert not any(p.is_relative_to(checkout.resolve()) or p.is_relative_to(tool.resolve())
+                   for p in found), found  # fmt: skip
+    assert local_bin.resolve() in found  # the user's other tools stay
+    before = set(sb.toolchain_reads(path, home))
+    assert venv.resolve() in before and tool.resolve() in before  # what #54 found
+    # an explicit absolute interpreter is still the caller's choice
+    assert venv.resolve() in set(sb.toolchain_reads("", home, argv0=str(venv / "bin/fman"),
+                                                    exclude=worker))  # fmt: skip
+    # a bare name is looked up without the worker's dirs
+    assert venv.resolve() not in set(sb.toolchain_reads(path, home, argv0="fman",
+                                                        exclude=worker))  # fmt: skip
+
+
+def test_profile_denies_the_workers_env(att):
+    pol = att.policy()
+    text = sb.render_profile(pol)
+    venv = Path(sys.prefix).resolve()
+    assert venv in pol.worker
+    assert not any(t.is_relative_to(venv) or venv.is_relative_to(t) for t in pol.toolchains)
+    deny_reads = text.split("(allow file-read*)\n")[1].split("\n")[0]
+    assert f'(subpath "{venv}")' in deny_reads
+
+
+@macos
+@pytest.mark.parametrize("mode", ["on", "off"])
+def test_uv_run_environment_does_not_reach_verify(att, monkeypatch, mode):
+    """Started like `uv run fman run`: inside verify (and so the writer's shell, which
+    gets the same env scrub) VIRTUAL_ENV is gone, python3 is not the worker's, and the
+    worker's venv and checkout are not readable (sandbox on)."""
+    monkeypatch.setattr(os, "environ", _uv_run_env())
+    venv = Path(sys.prefix).resolve()
+    checkout = Path(__file__).resolve().parents[1]
+    cmd = verify.VerifyCommand.from_override(
+        'echo "VE=${VIRTUAL_ENV:-unset} UVD=${UV_RUN_RECURSION_DEPTH:-unset}"; '
+        "echo PY=$(command -v python3); "
+        f"cat {venv / 'pyvenv.cfg'} >/dev/null && echo VENV-READ''ABLE; "
+        f"cat {checkout / 'pyproject.toml'} >/dev/null && echo CHECKOUT-READ''ABLE; "
+        "echo end"
+    )
+    pol = att.policy() if mode == "on" else Policy(
+        worktree=att.wt.path, scratch=att.scratch, mode="off")  # fmt: skip
+    res = verify.run(cmd, att.wt.path, timeout=60, output_path=att.tmp / "env.log", sandbox=pol)
+    log = res.output_path.read_text()
+    assert "VE=unset UVD=unset" in log, log
+    py = log.split("\nPY=")[1].split("\n")[0].strip()
+    assert py and not Path(py).resolve().is_relative_to(venv) and str(venv) not in py, log
+    if mode == "on":
+        assert "VENV-READABLE" not in log and "CHECKOUT-READABLE" not in log, log
+        assert log.count("Operation not permitted") == 2, log
+
+
+# ------------------------------------------------------------------ #55: here-documents
+
+
+def test_child_env_points_every_shell_temp_into_scratch(att):
+    env = sb.child_env(att.policy())
+    tmp = Path(env["TMPDIR"])
+    assert tmp.is_relative_to(att.scratch.resolve())
+    assert env["TMPPREFIX"] == str(tmp / "zsh")  # zsh: heredocs, =(...)
+    assert env["TMP"] == env["TEMP"] == env["TMPDIR"]
+
+
+HEREDOC = (
+    "cat > made.txt <<'EOF'\nfrom a heredoc\nEOF\n"
+    "cat made.txt\n"
+    "python3 - <<'EOF'\nprint('py', 6 * 7)\nEOF\n"
+    "cat <<< here-string\n"
+)
+
+
+@macos
+@pytest.mark.parametrize(
+    "argv",
+    [[os.environ.get("SHELL") or "/bin/zsh", "-l", "-c"],  # what OpenCode's bash tool runs
+     ["/bin/zsh", "-l", "-c"], ["/bin/zsh", "-c"], ["/bin/bash", "-l", "-c"], ["/bin/bash", "-c"]],
+    ids=["login-SHELL", "zsh-l", "zsh", "bash-l", "bash"],
+)  # fmt: skip
+def test_heredocs_work_in_the_sandboxed_shell(att, argv):
+    pol = att.policy()
+    out = subprocess.run(sb.wrap([*argv, HEREDOC], pol), cwd=att.wt.path,
+                         env=sb.apply_env(os.environ, pol), capture_output=True, text=True,
+                         timeout=60)  # fmt: skip
+    assert out.returncode == 0, out.stderr
+    assert "can't create temp file" not in out.stderr
+    assert out.stdout.splitlines()[-3:] == ["from a heredoc", "py 42", "here-string"], out.stdout
+    assert (att.wt.path / "made.txt").read_text() == "from a heredoc\n"
+
+
+@macos
+def test_heredoc_in_plain_sh(att):
+    pol = att.policy()
+    script = "cat <<'EOF'\nsh heredoc\nEOF\n"
+    out = subprocess.run(sb.wrap(["/bin/sh", "-c", script], pol), cwd=att.wt.path,
+                         env=sb.apply_env(os.environ, pol), capture_output=True, text=True,
+                         timeout=60)  # fmt: skip
+    assert out.returncode == 0 and out.stdout == "sh heredoc\n", out.stderr

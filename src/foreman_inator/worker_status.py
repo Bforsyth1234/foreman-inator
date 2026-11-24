@@ -145,10 +145,25 @@ def render_status(store: Store, *, closed_limit: int = 5, config: Config | None 
     out.append(f"{len(tickets)} ticket(s), {flagged} flagged for you, {waiting} waiting.")
     out.extend(_champion_lines(store))
     if config is not None:
+        out.append(repos_line(config))
         out.append(Spend(store, config).summary().status_line())
-        line = sandbox.describe(config.sandbox, dict(config.sandbox_network))  # type: ignore[arg-type]
+        line = sandbox.describe(
+            config.sandbox, dict(config.sandbox_network), dict(config.sandbox_install)
+        )  # type: ignore[arg-type]
         out.append(f"!!! {line} !!!" if config.sandbox == "off" else line)
     return "\n".join(out)
+
+
+def repos_line(config: Config) -> str:
+    """#56: how many repos the worker polls, loudly when more than the warning threshold."""
+    from foreman_inator.config import REPOS_WARN_THRESHOLD, listing_requests_per_hour
+
+    n = len(config.repos)
+    line = f"Repos: {n} in config.toml (`fman repo list`)"
+    if n > REPOS_WARN_THRESHOLD:
+        per_hour = listing_requests_per_hour(n, config.poll_interval_seconds)
+        line += f": about {per_hour:,} GitHub requests an hour; `fman repo remove` trims it"
+    return line + "."
 
 
 def _champion_lines(store: Store) -> list[str]:
@@ -178,4 +193,4 @@ def set_verify_command(store: Store, repo: str, command: str | None) -> list[int
     return cleared
 
 
-__all__ = ["render_status", "set_verify_command"]
+__all__ = ["render_status", "repos_line", "set_verify_command"]

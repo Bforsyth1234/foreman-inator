@@ -104,7 +104,12 @@ EXTRA_COLUMNS: dict[str, list[str]] = {
     "kickbacks": ["failure_step_index"],
     "reviews": ["created_at", "shadow"],
     "variants": ["created_at"],
-    "repo_settings": ["verify_prompted_at", "updated_at"],
+    "repo_settings": [
+        "verify_prompted_at",
+        "updated_at",
+        # migration 006 (#45)
+        "install_command",
+    ],
     "champion_history": ["id", "role", "variant_id", "set_at", "note"],
     "poll_cursors": ["repo", "name", "value", "updated_at"],
     "spend_ledger": [
@@ -673,6 +678,18 @@ def test_repo_settings(store: Store) -> None:
     assert store.mark_verify_prompted("me/toy") is False
     s = store.set_verify_command("me/toy", "make check")
     assert s.verify_command == "make check" and s.verify_prompted_at is not None
+    assert s.install_command is None
+
+
+def test_repo_install_command(store: Store) -> None:
+    """#45: saved like the verify command; None clears it; the two do not touch."""
+    s = store.set_install_command("me/toy", "uv sync --frozen")
+    assert s.install_command == "uv sync --frozen" and s.verify_command is None
+    store.set_verify_command("me/toy", "make check")
+    s = store.get_repo_settings("me/toy")
+    assert s.install_command == "uv sync --frozen" and s.verify_command == "make check"
+    assert store.set_install_command("me/toy", None).install_command is None
+    assert store.get_repo_settings("me/toy").verify_command == "make check"
 
 
 def test_poll_cursors(store: Store) -> None:

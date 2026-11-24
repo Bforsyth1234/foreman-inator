@@ -12,6 +12,9 @@ current text. `fman --version` prints the version.
 | [`fman status`](#fman-status) | Tickets by column with their current attempt, flags and PR numbers. |
 | [`fman metrics`](#fman-metrics) | Serve the metrics page on 127.0.0.1. |
 | [`fman approve-spend`](#fman-approve-spend) | Allow one more cloud attempt (and its review) of a ticket past the spend caps. |
+| [`fman repo add`](#fman-repo-add) | Add repos to the list the worker polls. |
+| [`fman repo remove`](#fman-repo-remove) | Take repos out of the list the worker polls. |
+| [`fman repo list`](#fman-repo-list) | The repos in `config.toml`, marking any the installation no longer covers. |
 | [`fman repo set-verify`](#fman-repo-set-verify) | Save the command that verifies a repo. |
 | [`fman experiment run`](#fman-experiment-run) | Replay the champion against a challenger on past tickets. |
 | [`fman experiment status`](#fman-experiment-status) | Champions, running and ended experiments with their results. |
@@ -22,7 +25,9 @@ current text. `fman --version` prints the version.
 ## `fman setup`
 
 Register your own GitHub App, check dependencies and install the launchd
-agents. Safe to run again. Step by step: [setup.md](setup.md#2-run-fman-setup).
+agents. Safe to run again. Repos are never added on their own: on a first run
+setup asks which ones to work on (or takes `--repo`), and a re-run leaves the
+`repos` list as it is. Step by step: [setup.md](setup.md#2-run-fman-setup).
 
 | Option | Meaning |
 | --- | --- |
@@ -31,6 +36,7 @@ agents. Safe to run again. Step by step: [setup.md](setup.md#2-run-fman-setup).
 | `--app-name <name>` | App name (unique on GitHub, at most 34 characters). |
 | `--allowed-user <login>` | GitHub login allowed to start work. Repeatable. |
 | `--no-service` | Skip installing the launchd agents. |
+| `--repo <owner/name>` | A repo to work on. Repeatable. Replaces the `repos` list, with no question. |
 
 ## `fman config set-key`
 
@@ -55,7 +61,7 @@ for you; do not run a second one beside it.
 ## `fman status`
 
 Tickets by column with their current attempt, flags, waits and PR numbers,
-then the spend and sandbox lines. Read-only; works with the worker stopped.
+then the repo count, spend and sandbox lines. Read-only; works with the worker stopped.
 What each line means: [setup.md](setup.md#6-reading-fman-status).
 
 | Option | Meaning |
@@ -80,6 +86,46 @@ fman approve-spend <ticket>
 Allow one more cloud attempt (and its review) of the ticket past the spend
 caps, up to one daily cap's worth. `<ticket>` is the ticket id from
 `fman status`, not the issue number.
+
+## `fman repo add`
+
+```bash
+fman repo add <owner/name> [<owner/name> ...]
+```
+
+Add repos to the list the worker polls (`repos` in `config.toml`). Each one is
+checked against what the App's installation can see. If any is not visible,
+nothing is added, and the command prints the installation's settings URL to
+grant access there. Without App credentials (before `fman setup`) the check is
+skipped, and the command says so. Restart the worker afterwards: the command
+prints the `launchctl kickstart` line.
+
+| Option | Meaning |
+| --- | --- |
+| `--no-check` | Add without checking that the App's installation can see it. |
+
+## `fman repo remove`
+
+```bash
+fman repo remove <owner/name> [<owner/name> ...]
+```
+
+Take repos out of the list the worker polls. Their tickets stay in the
+database and nothing on GitHub changes. Once restarted, the worker stops
+polling the repo and starts no work on its tickets. The command prints how
+many open tickets each removed repo has, and the restart line. It exits 1 when
+none of the names was in the list.
+
+## `fman repo list`
+
+The repos in `config.toml`. When the App credentials are present, it marks
+any repo the installation no longer covers (polling it fails) and counts the
+repos the installation can see that are not listed. Read-only.
+
+| Option | Meaning |
+| --- | --- |
+| `--available` | Also list the repos the installation can see but not configured. |
+| `--no-check` | Do not ask GitHub what the installation covers. |
 
 ## `fman repo set-verify`
 

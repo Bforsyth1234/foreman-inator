@@ -534,7 +534,12 @@ def make_cases(root: Path) -> None:
     work = root / ".work"
     shutil.rmtree(work, ignore_errors=True)
     work.mkdir(parents=True)
-    store = Store(work / "store.db", clock=_Clock())
+    clock = _Clock()
+    store = Store(work / "store.db", clock=clock)
+    # Each migration's applied_at ticks the clock; pin the time after migrating to what
+    # the checked-in cases were generated with (5 migrations), so a new migration (006,
+    # #45) does not shift every timestamp in them.
+    clock.t = datetime(2026, 1, 5, 9, 5, tzinfo=UTC)
     try:
         with tracing.capture_spans(traces):
             for build in (_escalation_ticket, _hostile_ticket):
