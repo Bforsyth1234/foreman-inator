@@ -1,0 +1,66 @@
+"""Metrics (todo #20): SQL queries per SPEC metric and the local metrics page.
+
+``queries`` holds one function per metric; ``web`` holds the Starlette app and
+``serve`` (import it explicitly: ``from foreman_inator.metrics.web import serve``).
+``trace_view`` (#28) is added later.
+"""
+
+from foreman_inator.metrics.queries import (
+    BUCKETS,
+    Duration,
+    FilterOptions,
+    KickbackStats,
+    Mean,
+    MetricsFilter,
+    PipelineCost,
+    Rate,
+    RecentTicket,
+    Report,
+    ReviewerRow,
+    TrendPoint,
+    WriterRow,
+    ai_kickbacks_per_ticket,
+    cost_per_accepted_ticket,
+    escalation_rate,
+    filter_options,
+    first_try_accept_rate,
+    kickbacks_per_ticket,
+    local_share,
+    recent_tickets,
+    report,
+    reviewer_miss_rate,
+    router_hit_rate,
+    time_to_accept,
+    trend,
+    writer_reviewer_vs_strong_writer,
+)
+
+__all__ = [
+    "BUCKETS",
+    "Duration",
+    "FilterOptions",
+    "KickbackStats",
+    "Mean",
+    "MetricsFilter",
+    "PipelineCost",
+    "Rate",
+    "RecentTicket",
+    "Report",
+    "ReviewerRow",
+    "TrendPoint",
+    "WriterRow",
+    "ai_kickbacks_per_ticket",
+    "cost_per_accepted_ticket",
+    "escalation_rate",
+    "filter_options",
+    "first_try_accept_rate",
+    "kickbacks_per_ticket",
+    "local_share",
+    "recent_tickets",
+    "report",
+    "reviewer_miss_rate",
+    "router_hit_rate",
+    "time_to_accept",
+    "trend",
+    "writer_reviewer_vs_strong_writer",
+]
