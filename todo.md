@@ -95,7 +95,7 @@ Package root below is `src/foreman_inator/` (written `pkg/`).
 | 6 | A: #21 (alone: the main loop) | `pkg/worker.py`, `pkg/cli.py` (`metrics`), `pkg/pr/publisher.py` (ready-for-review + bot review posting), `tests/test_worker_v2.py` | [x] built; live check open for #21 |
 | 6b | A: #40 · B: #41, #42, #43 (one agent, in order: all three edit the GitHub client and poller) · C: #44 | A `pkg/runner/sandbox.py`; edits `pkg/runner/opencode.py`, `pkg/runner/verify.py`, `pkg/review/checks.py`, `pkg/config.py` · B `pkg/github/client.py`, `tests/fakes/github.py`, `pkg/github/poller.py`, `pkg/tickets/lifecycle.py`, `pkg/tickets/prompt.py`, `pkg/setup/manifest.py`, `pkg/runner/worktree.py`, `pkg/db/store.py`, `pkg/db/migrations/002_*.sql` · C `pkg/tickets/clarify.py`, `pkg/prompts/clarify-v1.md` (+ own tests). Runner at close: `worker.py` wiring for all five; for #44 the `NeedsInfoAnswered` event in `poller.py`/`lifecycle.py` and the Q&A block in `tickets/prompt.py` (after slot B is merged into the wave branch); `pyproject.toml` deps | [x] built and wired; live checks open for #40, #41, #44 |
 | 7 | A: #22 (cross-repo, optional) | bot-inator repo only; nothing in this repo | [ ] |
-| 8 | A: #23 · B: #24 · C: #25 · D: #26 · E: #27 · F: #28 | A `pkg/routing/knn.py`, `pkg/routing/explore.py` · B `pkg/experiments/variants.py`, `pkg/experiments/__init__.py`, `pkg/prompts/__init__.py` · C `pkg/experiments/replay_sets.py`, `pkg/experiments/replay_runner.py` · D `pkg/experiments/shadow.py` · E `pkg/tracing/failure_label.py`, `pkg/prompts/failure-label-v1.md` · F `pkg/tracing/replay.py`, `pkg/metrics/trace_view.py`, `tests/recordings/` (+ own tests). Runner at close: `pyproject.toml` deps | [ ] |
+| 8 | A: #23 · B: #24 · C: #25 · D: #26 · E: #27 · F: #28 | A `pkg/routing/knn.py`, `pkg/routing/explore.py` · B `pkg/experiments/variants.py`, `pkg/experiments/__init__.py`, `pkg/prompts/__init__.py` · C `pkg/experiments/replay_sets.py`, `pkg/experiments/replay_runner.py` · D `pkg/experiments/shadow.py` · E `pkg/tracing/failure_label.py`, `pkg/prompts/failure-label-v1.md` · F `pkg/tracing/replay.py`, `pkg/metrics/trace_view.py`, `tests/recordings/` (+ own tests). Runner at close: `pyproject.toml` deps | [x] built; wiring is wave 9 |
 | 9 | A: #29 (alone: wiring) | `pkg/worker.py`, `pkg/cli.py` (`experiment`, `replay`), `pkg/metrics/web.py` (new routes and failure-step columns), `tests/test_worker_v3.py` | [ ] |
 | 10 | A: #30 · B: #31 · C: #32 | A `pkg/export.py` · B `pyproject.toml` (metadata, entry points), `.github/workflows/release.yml`, `docs/releasing.md` · C `README.md`, `docs/setup.md`, `docs/how-it-works.md`, `docs/demo.gif` (+ own tests). Runner at close: `cli.py` (`export`) | [ ] |
 | — | #33–#39 | unscheduled (SPEC milestone 5) | open |
@@ -164,6 +164,12 @@ One combined step list for wave 6b is in DONE.md's #40, #41 and #44 entries.
 #42 — Inline review comments reach the next attempt [x] · 2026-11-23 · see DONE.md
 #43 — Handle a PR that conflicts with its base branch [x] · 2026-11-23 · see DONE.md
 #44 — Ask before guessing: clarifying questions on a vague issue [~] live · 2026-11-23 · see DONE.md
+#23 — Nearest-neighbor start rule and 10% exploration [x] · 2026-11-23 · see DONE.md
+#24 — Variants and prompt versioning [x] · 2026-11-23 · see DONE.md
+#25 — Replay sets: writer replay and reviewer replay [x] · 2026-11-23 · see DONE.md
+#26 — Shadow reviewer [x] · 2026-11-23 · see DONE.md
+#27 — Failure-step labeling [x] · 2026-11-23 · see DONE.md
+#28 — Replay viewer and recorded tickets as worker regression tests [x] · 2026-11-23 · see DONE.md
 
 ---
 
@@ -218,76 +224,6 @@ Verify: the bot-inator item exists and links to this SPEC.
 Deviations:
 
 ### Milestone 4 — Learning router, experiments, trace analysis
-
-#23 — Nearest-neighbor start rule and 10% exploration [ ]
-Wave: 8 · Agent: A · Added: 2026-11-23 · Source: spec
-Ask: The router learns from accepted tickets.
-DECISIONS (spec, 2026-11-23): after ~50 accepted tickets, embed the request, take the 10 most similar finished tickets, start at the cheapest tier accepted for most; ~10% start one tier lower, marked `explore`.
-Files:
-⚬ OWNED: `src/foreman_inator/routing/knn.py`, `src/foreman_inator/routing/explore.py`, `tests/test_knn.py`
-Approach: local embedding model via Ollama through the proxy; vectors in SQLite (`sqlite-vec` if available, else numpy brute force — fine at this scale). `route_reason` lists matched ticket IDs. Falls back to #15 below the threshold.
-Verify:
-⚬ Synthetic history where small tickets were always accepted on tier 1 → new similar ticket routes to tier 1.
-⚬ Exploration rate is ~10% over 1,000 seeded draws and never goes below tier 1.
-Deviations:
-
-#24 — Variants and prompt versioning [ ]
-Wave: 8 · Agent: B · Added: 2026-11-23 · Source: spec
-Ask: Every attempt and review knows exactly which model + prompt made it.
-DECISIONS (spec, 2026-11-23): variant = model + prompt version; one champion per role; prompts are versioned files.
-Files:
-⚬ OWNED: `src/foreman_inator/experiments/variants.py`, `src/foreman_inator/experiments/__init__.py`, `src/foreman_inator/prompts/__init__.py`, `tests/test_variants.py`
-Approach: variant id = `<model>/<prompt-name>@<prompt_hash[:8]>` using `fde_kit.prompts.prompt_hash`; `champion(role)`, `set_champion(role, variant)` with a history row.
-Verify:
-⚬ Editing a prompt file creates a new variant id; the old one stays queryable.
-Deviations:
-
-#25 — Replay sets: writer replay and reviewer replay [ ]
-Wave: 8 · Agent: C · Added: 2026-11-23 · Source: user ("test the prompts / models … for both the reviewers and the agents")
-Ask: Compare a challenger to the champion on past tickets, overnight, with none of the user's time.
-DECISIONS (spec, 2026-11-23): writer replay scores on passing the merged PR's tests, cost, time; reviewer replay scores catches vs false kickbacks against the user's merges and kickbacks; rebuild from the latest ~100 merges monthly; tier 3 replays use the experiments budget.
-Files:
-⚬ OWNED: `src/foreman_inator/experiments/replay_sets.py`, `src/foreman_inator/experiments/replay_runner.py`, `tests/test_replay_sets.py`
-Approach: build cases from merged tickets (issue, base commit, merged PR's test files); run each through the normal attempt path in throwaway worktrees with no GitHub writes; write results to `experiments`. Consider fde-kit's eval runner for scoring and reports.
-Verify:
-⚬ A fake champion/challenger pair with known outcomes produces the expected comparison.
-⚬ Replays never call the GitHub write API; non-vacuous: allow a write, the fake GitHub records it and the test fails.
-Deviations:
-
-#26 — Shadow reviewer [ ]
-Wave: 8 · Agent: D · Added: 2026-11-23 · Source: spec
-Ask: Test a reviewer on live PRs without changing anything the user sees.
-DECISIONS (spec, 2026-11-23): challenger reviews every live PR next to the champion; only the champion's verdict counts; both scored against the user's eventual merge or kickback.
-Files:
-⚬ OWNED: `src/foreman_inator/experiments/shadow.py`, `tests/test_shadow.py`
-Approach: `shadow_review(attempt)` runs the challenger with the same inputs, stores its review row with `variant_id`, posts nothing. Scoring job joins reviews to final outcomes.
-Verify:
-⚬ Shadow verdicts are stored and never posted; non-vacuous: post them, fake GitHub sees a second review, test fails.
-Deviations:
-
-#27 — Failure-step labeling [ ]
-Wave: 8 · Agent: E · Added: 2026-11-23 · Source: user ("see where model made a miss")
-Ask: For every kickback, which step went wrong.
-DECISIONS (spec, 2026-11-23): labels: misread_issue, missed_file, wrong_edit, ignored_failure, weak_tests, reviewer_miss.
-Files:
-⚬ OWNED: `src/foreman_inator/tracing/failure_label.py`, `src/foreman_inator/prompts/failure-label-v1.md`, `tests/test_failure_label.py`
-Approach: build a compact trace summary (files read, edits, test results, review checks) from the recording; a local model picks one label + the step index; `reviewer_miss` is set by rule (user kicked back a reviewer-approved PR), not by the model.
-Verify:
-⚬ Hand-made recordings for each label get the expected label (allow the model call to be faked).
-⚬ `reviewer_miss` is rule-based; non-vacuous: route it through the model, the rule test fails.
-Deviations:
-
-#28 — Replay viewer and recorded tickets as worker regression tests [ ]
-Wave: 8 · Agent: F · Added: 2026-11-23 · Source: user ("add replays to this like the fde kit")
-Ask: Step through any run; check worker changes against real past runs without model calls.
-DECISIONS (spec, 2026-11-23): replay uses no model calls; regression tests run recorded tickets through new router/escalation/review logic.
-Files:
-⚬ OWNED: `src/foreman_inator/tracing/replay.py`, `src/foreman_inator/metrics/trace_view.py`, `tests/recordings/` (a few anonymized recordings), `tests/test_replay.py`
-Approach: replay = fde-kit-style exact playback of `llm` and `tool` rows into the trace view (a timeline per attempt). Regression = feed recorded outcomes into #15/#16/#17-check logic and diff the decisions against what was recorded. Known limit: OpenCode's own loop can't be re-executed from a recording; fork-from-failure (#36) restarts a fresh session at the failure commit instead.
-Verify:
-⚬ Replaying a recording reproduces its span tree exactly.
-⚬ A deliberate escalation-rule change shows up as a decision diff on the recorded set; non-vacuous: no-op the diff, test fails.
-Deviations:
 
 #29 — Wiring for milestone 4 [ ]
 Wave: 9 · Agent: A (alone) · Added: 2026-11-23 · Source: spec

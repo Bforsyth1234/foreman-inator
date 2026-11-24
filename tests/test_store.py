@@ -120,6 +120,47 @@ EXTRA_COLUMNS: dict[str, list[str]] = {
     "spend_approvals": ["id", "ticket_id", "approved_at", "consumed_at"],
     "file_locks": ["repo", "path", "ticket_id", "acquired_at"],
     "schema_migrations": ["version", "name", "applied_at"],
+    # migration 004 (#23)
+    "ticket_embeddings": ["ticket_id", "model", "dims", "vector", "text_sha256", "created_at"],
+    # migration 005 (#25)
+    "replay_sets": ["id", "role", "built_at", "max_merges", "case_count", "skipped_count"],
+    "replay_cases": [
+        "id",
+        "set_id",
+        "role",
+        "ticket_id",
+        "attempt_id",
+        "repo",
+        "status",
+        "skip_reason",
+        "data",
+        "created_at",
+    ],
+    "replay_runs": [
+        "experiment_id",
+        "set_id",
+        "role",
+        "state",
+        "stop_reason",
+        "started_at",
+        "updated_at",
+    ],
+    "replay_results": [
+        "id",
+        "experiment_id",
+        "case_id",
+        "side",
+        "variant_id",
+        "status",
+        "verdict",
+        "score",
+        "tokens_in",
+        "tokens_out",
+        "cost_usd",
+        "seconds",
+        "detail",
+        "created_at",
+    ],
 }
 
 # Enum values copied from SPEC.md "Data model".
