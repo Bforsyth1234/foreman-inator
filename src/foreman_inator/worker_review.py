@@ -10,8 +10,9 @@ pushed" (``testing``) and "PR marked ready for your review":
    before the ``review:skip`` hand-over too, so nothing is marked ready on a red or an
    undecided run (7a).
 2. ``review:skip`` by an allowed user → hand-over (the PR is marked ready, no review).
-3. ``pick_reviewer`` (#17): a reviewer of another model family than the writer (7f);
-   none → hand-over.
+3. ``champion_reviewer`` (#24, wave 9): the reviewer champion's model when it is of
+   another family than the writer, else ``pick_reviewer`` (#17) (7f), with the champion's
+   prompt; none → hand-over. The stored row's variant is registered (``variants``).
 4. ``_launch_review`` → ``review_change`` inside the ticket's trace: one ``review`` span
    with five ``review.check`` children. Nothing is stored while it runs.
 5. Cut short (shutdown) → nothing is stored; the review runs again. A cloud call refused
@@ -44,7 +45,12 @@ import threading
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
 
+from fde_kit.prompts import PromptRef
+
+from foreman_inator import prompts
+from foreman_inator.config import ConfigError
 from foreman_inator.db.store import Attempt, Review, Ticket
+from foreman_inator.experiments import variants
 from foreman_inator.github.client import IssueEvent
 from foreman_inator.github.poller import REVIEW_SKIP_LABEL
 from foreman_inator.pr.publisher import Handover, PublishError, pr_head_branch
@@ -138,7 +144,7 @@ class ReviewSteps:
             return
         writer = self._endpoint_named(att)
         try:
-            reviewer = rv.pick_reviewer(self.config, writer)
+            reviewer, prompt_name = self.champion_reviewer(writer)
         except rv.ReviewError as exc:
             self.hand_over(t, f"{FLAG_NO_REVIEWER}: {exc}", ready=True, attempt=att)
             return
@@ -156,6 +162,7 @@ class ReviewSteps:
                 attempt_id=att.id,
                 ticket_id=t.id,
                 store=None,  # stored below, unless the review was cut short or refused
+                prompt_name=prompt_name,
                 verify_override=settings.verify_command if settings else None,
                 recordings_dir=self.recordings_dir,
                 timeout=self.review_timeout or rv.DEFAULT_TIMEOUT_S,
@@ -173,11 +180,20 @@ class ReviewSteps:
                 # A base conflict (#43) or a kickback moved it while the review ran.
                 log.info("ticket %d: left testing during the AI review; verdict dropped", t.id)
                 return
+            variants.register(  # #24: every reviews.variant_id has a variants row
+                self.store,
+                "reviewer",
+                outcome.reviewer_model,
+                PromptRef(name=outcome.prompt_name, sha256=outcome.prompt_hash, text=""),
+            )
             outcome = rv.record_outcome(self.store, att.id, outcome)
             if outcome.verdict == "request_changes":
                 self.store.set_attempt_outcome(att.id, "kicked_back")
             self._commit(t.id, AIReviewed(t.id, outcome.verdict))  # type: ignore[arg-type, attr-defined]
         assert outcome.review is not None
+        self.remember_champion(att.id, outcome)  # type: ignore[attr-defined]  # shadow (#26)
+        if outcome.kickback is not None:
+            self.queue_label(t.repo, outcome.kickback.id)  # type: ignore[attr-defined]  # #27
         log.info(
             "ticket %d: AI review %d of attempt %d: %s",
             t.id,
@@ -215,6 +231,29 @@ class ReviewSteps:
                 self._update_body(ctx.ticket, att)  # type: ignore[arg-type]
             self._run_actions(ctx, plan.actions)  # type: ignore[attr-defined]
         self._finalized.add(review.id)
+
+    def champion_reviewer(self, writer: Any) -> tuple[Any, str]:
+        """#24: the reviewer champion's model, when it is of another family than the
+        writer (7f), else ``pick_reviewer``'s choice; with the champion's prompt (the
+        packaged default when there is no champion or its file is gone). Raises
+        ``ReviewError`` when no independent reviewer exists."""
+        champ = variants.champion(self.store, "reviewer")
+        prompt_name = rv.REVIEWER_PROMPT_NAME
+        reviewer = None
+        if champ is not None:
+            try:
+                prompts.load(champ.prompt_name)
+                prompt_name = champ.prompt_name
+            except (FileNotFoundError, ValueError):
+                log.warning("reviewer champion's prompt %s is missing; using the default",
+                            champ.prompt_name)  # fmt: skip
+            try:
+                candidate = self.config.model(champ.model)
+                rv.check_independent(candidate, writer)
+                reviewer = candidate
+            except (ConfigError, rv.FamilyConflict):
+                reviewer = None
+        return reviewer or rv.pick_reviewer(self.config, writer), prompt_name
 
     # ------------------------------------------------------------------ ready + hand-over
 

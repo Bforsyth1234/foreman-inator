@@ -122,7 +122,7 @@ Each ticket starts on the cheapest tier that seems likely to work and moves up o
 **Start rule** (gets smarter as data grows):
 
 1. **v1, rules:** small local model classifies the request as small, normal, or large → tier 1, 2, or 3.
-2. **After about 50 accepted tickets, nearest neighbors:** embed the request, find the 10 most similar finished tickets, and start at the cheapest tier that was accepted for most of them. `route_reason` records which tickets it matched.
+2. **After about 50 accepted tickets, nearest neighbors:** embed the request, find the 10 most similar finished tickets, and start at the cheapest tier that was accepted for most of them. A ticket you kicked back on the tier that was finally accepted counts one tier up, because that tier cost you a review. One the AI reviewer kicked back there counts half for that tier and half for the tier above, because it cost time and a review call but none of your time. `route_reason` records which tickets it matched.
 3. **After a few hundred, a classifier**, and LoRA fine-tuning only if it beats the classifier on held-out tickets.
 
 A `tier:N` label on the issue overrides the router for that ticket, and the override is recorded in `route_reason`.

@@ -225,6 +225,15 @@ def failing() -> Script:
     return Script([edit("feature.py", "def feature():\n    return 0\n"), say("Tried.")])
 
 
+def _is_label_call(body: dict[str, Any]) -> bool:
+    """The failure labeler (#27) shares the router's token limit; its system prompt says
+    what it is."""
+    return any(
+        "Decide which step of the attempt went wrong" in str(m.get("content", ""))
+        for m in body.get("messages") or []
+    )
+
+
 # --------------------------------------------------------------------------- the env
 
 
@@ -262,6 +271,11 @@ class Env:
         if verify is not None:
             self.store.set_verify_command(REPO, verify)
         config_kw.setdefault("sandbox", "off")
+        # Wave 9 defaults: no exploration (ticket ids 3 and 8 would explore at 10%, which
+        # would change the wave 6 scenarios) and no failure labels (an extra local model
+        # call per kickback, on a background thread); tests/test_worker_v3.py turns them on.
+        config_kw.setdefault("explore_rate", 0.0)
+        config_kw.setdefault("failure_labels", False)
         self.config = Config(
             app_id=1,
             allowed_users=(USER,),
@@ -280,10 +294,16 @@ class Env:
         self.route_calls = 0
         self.clarify_reply = "clear"
         self.clarify_calls = 0
+        #: #27: the failure labeler's answer (a str, or fn(request body) -> str).
+        self.label_reply: Any = "no label"
+        self.label_calls = 0
+        #: #26/#29: reviewer replies by the upstream model id (fn(request body) -> reply),
+        #: checked before ``review_replies``.
+        self.review_by_model: dict[str, Any] = {}
         self.models.responder = self.responder
         self.spend = Spend(self.store, self.config, approval_usd=approval_usd)
         self.proxy = ModelProxy(
-            self.config,
+            self.config.proxy_models(),  # the embedding model too (#23)
             store=self.store,
             transport=self.models.transport,
             spend_hook=self.spend.hook,
@@ -301,11 +321,17 @@ class Env:
         if body.get("max_tokens") == clarify.MAX_TOKENS:
             self.clarify_calls += 1
             return self.clarify_reply
+        if body.get("max_tokens") == ROUTER_MAX_TOKENS and _is_label_call(body):
+            self.label_calls += 1
+            return self.label_reply(body) if callable(self.label_reply) else self.label_reply
         if body.get("max_tokens") == ROUTER_MAX_TOKENS:
             self.route_calls += 1
             return self.route_label
         if body.get("max_tokens") == MODEL_MAX_TOKENS:
             self.review_calls += 1
+            by_model = self.review_by_model.get(body.get("model"))
+            if by_model is not None:
+                return by_model(body)
             return self.review_replies.popleft() if self.review_replies else APPROVE
         return None
 
@@ -367,6 +393,10 @@ class Env:
     def issue_comments(self, n: int = 1) -> list[str]:
         bot = self.gh.bot_login()
         return [c.body for c in self.gh._item(REPO, n).comments if c.author == bot]
+
+    def drain(self) -> None:
+        """Wait for the worker's background lanes (labels, backfill, shadows: #29)."""
+        assert self.worker.drain_background(timeout=60), "background work did not finish"
 
     def close(self) -> None:
         self.worker.shutdown(timeout=30)

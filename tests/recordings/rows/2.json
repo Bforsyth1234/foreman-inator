@@ -84,7 +84,7 @@
   "routed_tier": 2,
   "source": "issue",
   "title": "Escape the title <script>alert(\"pwned\")</script><b>bold</b><img src=x onerror=alert(1)>",
-  "trace_id": "e48e3812987a1caa0688fe99ace7a3bc"
+  "trace_id": "141f34c15630de18785176b491c93991"
  },
  "uncounted": []
 }

@@ -430,6 +430,13 @@ def render_comment(
 # --------------------------------------------------------------------------- the review
 
 
+#: Checks 1-4 of a review already run on the same change: (tests, coverage, revert,
+#: run_app), as ``ReviewOutcome`` carries them (#29; the shadow reviewer reuses them).
+Precomputed = tuple[
+    "C.TestsCheck", "C.CoverageCheck | None", "C.RevertCheck | None", "C.RunAppCheck | None"
+]
+
+
 def review_change(
     *,
     issue: IssueText,
@@ -451,8 +458,15 @@ def review_change(
     model_client: ReviewModel | None = None,
     cancel: Event | None = None,
     clock: Callable[[], float] = time.monotonic,
+    precomputed: Precomputed | None = None,
 ) -> ReviewOutcome:
     """Review ``change`` against ``issue``. See the module docstring for the policy.
+
+    ``precomputed`` (#29, the shadow reviewer): results of checks 1-4 already run on this
+    exact change (``(tests, coverage, revert, run_app)`` of another review's outcome).
+    They are reused instead of run again (each check span says ``check.reused``); the
+    head scratch worktree is still made for the diff, and the verdict policy (hard
+    findings first, then check 5) is unchanged.
 
     Call it inside ``tracing.ticket_span(ticket_id, trace_id=...)`` so the ``review`` span
     joins the ticket's trace. ``proxy`` is the running ``ModelProxy`` (its ``context()``
@@ -486,6 +500,7 @@ def review_change(
         client=model_client or ProxyReviewModel(),
         cancel=cancel,
         clock=clock,
+        precomputed=precomputed,
     )
     recorder = None
     if recordings_dir is not None and ticket_id is not None:
@@ -659,17 +674,22 @@ class _Run:
         changed = ranged.changed_files()
         names = tracing.REVIEW_CHECKS
 
+        pre = self.precomputed
         # 1. tests
         with self.check_span(names[0]) as s:
-            command = verify.detect(head.path, self.verify_override, python=self.python)
-            self.tests = C.check_tests(
-                head.path,
-                command,
-                timeout=self.budget(names[0]),
-                output_path=self.work / "verify.log",
-                cancel=self.cancel,
-            )
-            self.report(s, names[0], self.tests)
+            if pre is not None:
+                self.tests = pre[0]
+                self.reused(s, names[0], self.tests)
+            else:
+                command = verify.detect(head.path, self.verify_override, python=self.python)
+                self.tests = C.check_tests(
+                    head.path,
+                    command,
+                    timeout=self.budget(names[0]),
+                    output_path=self.work / "verify.log",
+                    cancel=self.cancel,
+                )
+                self.report(s, names[0], self.tests)
         if self.tests.status == "timed_out":
             self.left(names[0])  # out of the whole bound -> _OutOfTime
             for n in names[1:]:
@@ -690,6 +710,9 @@ class _Run:
             for n in names[1:]:
                 self.skip(n, "empty change")
             return self.finish("request_changes", "incomplete", "The change is empty.", shadow)
+
+        if pre is not None:
+            return self._execute_reused(shadow, diff, changed)
 
         # 2. changed-line coverage
         with self.check_span(names[1]) as s:
@@ -740,6 +763,27 @@ class _Run:
             )
             self.report(s, names[3], self.run_app)
 
+        return self._verdict(shadow, diff, changed)
+
+    def _execute_reused(self, shadow: bool, diff: str, changed: Sequence[str]) -> ReviewOutcome:
+        """Checks 2-4 from ``precomputed`` (check 1 was taken by ``_execute``)."""
+        names = tracing.REVIEW_CHECKS
+        _, self.coverage, self.revert, self.run_app = self.precomputed
+        results = (self.coverage, self.revert, self.run_app)
+        for name, result in zip(names[1:4], results, strict=True):
+            if result is None:
+                self.skip(name, "not run by the review it was reused from")
+                continue
+            with self.check_span(name) as s:
+                self.reused(s, name, result)
+        return self._verdict(shadow, diff, changed)
+
+    def reused(self, s: Any, name: str, result: Any) -> None:
+        s.set_attribute("check.reused", True)
+        self.report(s, name, result)
+
+    def _verdict(self, shadow: bool, diff: str, changed: Sequence[str]) -> ReviewOutcome:
+        names = tracing.REVIEW_CHECKS
         self.findings = C.hard_findings(self.tests, self.coverage, self.revert, self.run_app)
         if self.findings:
             self.skip(names[4], "a hard check failed: " + self.findings[0].check)

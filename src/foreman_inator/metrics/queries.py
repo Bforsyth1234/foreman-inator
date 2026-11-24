@@ -661,11 +661,110 @@ def report(store: Store, filt: MetricsFilter | None = None, *, bucket: Bucket = 
     )
 
 
+# --- failure steps per variant (#27, wired in #29) -------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class FailureSteps:
+    """Kickbacks charged to one writer variant's visible attempts, by failure step."""
+
+    variant_id: str
+    steps: dict[str, int]  # failure step -> kickbacks
+    unlabeled: int  # failure_step still NULL (not labeled yet, or no answer)
+
+    @property
+    def labeled(self) -> int:
+        return sum(self.steps.values())
+
+    @property
+    def total(self) -> int:
+        return self.labeled + self.unlabeled
+
+    @property
+    def unlabeled_share(self) -> Rate:
+        return Rate(self.unlabeled, self.total)
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewerMisses:
+    """``reviewer_miss`` labels per reviewer variant, over its judged approvals."""
+
+    variant_id: str
+    misses: int  # approvals whose attempt you kicked back, labeled reviewer_miss
+    approvals: int  # non-shadow approvals with a known result
+
+    @property
+    def rate(self) -> Rate:
+        return Rate(self.misses, self.approvals)
+
+
+def failure_steps_by_variant(store: Store, filt: MetricsFilter | None = None) -> list[FailureSteps]:
+    """SPEC "Tracing": failure steps per variant, for writer variants.
+
+    Implemented: every kickback (yours and the AI reviewer's) on a visible attempt of a
+    scoped ticket (failed explore and rebase attempts are invisible, dropped tickets left
+    out; the model filter is the attempt's model), grouped by the attempt's
+    ``variant_id`` (its model name when an old row has none) and ``failure_step``.
+    ``reviewer_miss`` is charged to the reviewer (``reviewer_misses_by_variant``), so it is
+    left out here; a kickback with no label yet counts as unlabeled."""
+    sql = (
+        "WITH "
+        + _SCOPE_VIS
+        + """
+SELECT COALESCE(v.variant_id, v.model) AS variant, k.failure_step AS step, COUNT(*) AS n
+FROM kickbacks k JOIN vis v ON v.id = k.attempt_id
+WHERE (:model IS NULL OR v.model = :model)
+  AND (k.failure_step IS NULL OR k.failure_step != 'reviewer_miss')
+GROUP BY variant, step
+ORDER BY variant
+"""
+    )
+    by: dict[str, tuple[dict[str, int], list[int]]] = {}
+    for r in store.query(sql, _p(filt)):
+        steps, unl = by.setdefault(r["variant"], ({}, [0]))
+        if r["step"] is None:
+            unl[0] += int(r["n"])
+        else:
+            steps[r["step"]] = int(r["n"])
+    return [FailureSteps(v, dict(sorted(st.items())), u[0]) for v, (st, u) in sorted(by.items())]
+
+
+def reviewer_misses_by_variant(
+    store: Store, filt: MetricsFilter | None = None
+) -> list[ReviewerMisses]:
+    """``reviewer_miss`` per reviewer variant: non-shadow ``approve`` reviews whose attempt
+    has a known result (accepted or kicked back), and how many of them carry a
+    ``reviewer_miss`` label (#27 sets it by rule on your kickback after an approve). The
+    model filter is the reviewer model. Shadow reviews never count."""
+    sql = (
+        "WITH "
+        + _SCOPE_VIS
+        + """
+SELECT COALESCE(r.variant_id, r.reviewer_model) AS variant, COUNT(*) AS approvals,
+    COALESCE(SUM(EXISTS (SELECT 1 FROM kickbacks k WHERE k.attempt_id = a.id
+                         AND k.failure_step = 'reviewer_miss')), 0) AS misses
+FROM reviews r
+JOIN attempts a ON a.id = r.attempt_id
+JOIN scope s ON s.id = a.ticket_id
+WHERE r.shadow = 0 AND r.verdict = 'approve'
+  AND a.outcome IN ('accepted', 'kicked_back')
+  AND (:model IS NULL OR r.reviewer_model = :model)
+GROUP BY variant
+ORDER BY variant
+"""
+    )
+    return [
+        ReviewerMisses(r["variant"], int(r["misses"]), int(r["approvals"]))
+        for r in store.query(sql, _p(filt))
+    ]
+
+
 __all__ = [
     "BUCKETS",
     "LOCAL_TIERS",
     "Bucket",
     "Duration",
+    "FailureSteps",
     "FilterOptions",
     "KickbackStats",
     "Mean",
@@ -674,12 +773,14 @@ __all__ = [
     "Rate",
     "RecentTicket",
     "Report",
+    "ReviewerMisses",
     "ReviewerRow",
     "TrendPoint",
     "WriterRow",
     "ai_kickbacks_per_ticket",
     "cost_per_accepted_ticket",
     "escalation_rate",
+    "failure_steps_by_variant",
     "filter_options",
     "first_try_accept_rate",
     "kickbacks_per_ticket",
@@ -687,6 +788,7 @@ __all__ = [
     "recent_tickets",
     "report",
     "reviewer_miss_rate",
+    "reviewer_misses_by_variant",
     "router_hit_rate",
     "time_to_accept",
     "trend",

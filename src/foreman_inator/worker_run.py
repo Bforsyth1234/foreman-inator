@@ -90,15 +90,20 @@ def install_signal_handlers(worker: Worker) -> dict[int, Any]:
 
 
 def warm_up_opencode(driver: Any, cfg: Config, proxy: Any) -> bool:
-    """Start one ``opencode serve`` in a throwaway directory, wait until it listens, stop
-    it. OpenCode installs its plugins into the shared state directory on its first start;
+    """Start one ``opencode serve`` in a throwaway directory, open one session, stop it.
+    OpenCode installs its plugins into the shared state directory on its first start;
     two first starts at once can race. Never raises: a failure is only logged (the
-    first real attempt then reports the problem)."""
+    first real attempt then reports the problem).
+
+    The session matters: OpenCode writes into the shared config dir
+    (``config/opencode/.gitignore``) on its first *session*, not on start. A sandboxed
+    attempt (#40) has that dir read-only, so without this every attempt on a fresh
+    install failed with ``POST /session: 500`` (seen live 2026-11-23, OpenCode 1.18.7)."""
     import secrets
     import shutil
     import tempfile
 
-    from foreman_inator.runner.opencode import OpenCodeServer, build_config
+    from foreman_inator.runner.opencode import OpenCodeServer, OpenCodeSession, build_config
 
     state = driver.state_root / "attempts" / f"warm-up-{secrets.token_hex(3)}"
     try:
@@ -115,7 +120,12 @@ def warm_up_opencode(driver: Any, cfg: Config, proxy: Any) -> bool:
                 base_env=driver.base_env,
             )
             try:
-                server.start()
+                url = server.start()
+                api = OpenCodeSession(url, directory=work, auth=server.auth)
+                try:
+                    api.create("foreman-inator warm-up")
+                finally:
+                    api.close()
             finally:
                 server.stop()
         log.info("opencode warm-up done")
@@ -150,7 +160,8 @@ def run_worker(*, once: bool = False) -> int:
     api = build_github(cfg, key_path)
     bot = f"{cfg.app_slug}[bot]" if cfg.app_slug else "foreman-inator[bot]"
     spend = Spend(store, cfg)
-    proxy = ModelProxy(cfg, store=store, spend_hook=spend.hook).start()
+    # The embedding model (#23) is served next to the writers but is never a rung.
+    proxy = ModelProxy(cfg.proxy_models(), store=store, spend_hook=spend.hook).start()
     driver = OpenCodeDriver()
     if not once:
         warm_up_opencode(driver, cfg, proxy)
@@ -173,6 +184,7 @@ def run_worker(*, once: bool = False) -> int:
         worker.recover()
         if once:
             worker.run_once()
+            worker.drain_background(timeout=120.0)  # labels and shadows of this pass
         else:
             worker.serve_forever()
     finally:

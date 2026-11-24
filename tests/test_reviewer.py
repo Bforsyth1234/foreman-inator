@@ -299,6 +299,7 @@ def test_reviewer_signature_cannot_take_writer_reasoning():
         "issue", "change", "writer", "reviewer", "proxy", "attempt_id", "ticket_id", "store",
         "shadow", "bucket", "prompt_name", "verify_override", "recordings_dir", "timeout",
         "check_timeout", "python", "model_client", "cancel", "clock",
+        "precomputed",  # #29: another review's checks 1-4 on the same change (no writer text)
     }  # fmt: skip
     assert [f.name for f in R.dataclasses.fields(ReviewInput)] == [
         "issue",
@@ -433,6 +434,45 @@ def test_review_span_has_one_child_per_check_and_the_verdict(make_pr, run, model
     assert checks == list(tracing.REVIEW_CHECKS)
     assert [s.name for s in kids].count("llm.call") == 1
     assert all(s.attributes.get("check.status") for s in kids if s.name == "review.check")
+
+
+def _pre(out):
+    return (out.tests, out.coverage, out.revert, out.run_app)
+
+
+def test_precomputed_checks_are_reused_and_only_the_diff_is_read(make_pr, run, models, monkeypatch):
+    """#29 (shadow reviewer): another review's checks 1-4 on the same change are reused:
+    no check command runs, each check span says so, and check 5 still asks the model."""
+    change = make_pr(GOOD)
+    models.queue_reply(APPROVE)
+    first = run(change)
+
+    def boom(*a, **k):
+        raise AssertionError("a check ran again")
+
+    for name in ("check_tests", "check_coverage", "check_revert", "check_run_app"):
+        monkeypatch.setattr(R.C, name, boom)
+    rename = {"verdict": "request_changes", "tag": "style", "note": "Rename."}
+    models.queue_reply(json.dumps(rename))
+    with tracing.capture_spans() as exp:
+        out = run(change, precomputed=_pre(first))
+    assert (out.verdict, out.tag) == ("request_changes", "style")
+    assert (out.tests, out.coverage, out.revert, out.run_app) == _pre(first)
+    assert out.model_calls == 1 and len(models.requests) == 2
+    checks = [s for s in exp.get_finished_spans() if s.name == "review.check"]
+    assert [s.attributes["review.check"] for s in checks] == list(tracing.REVIEW_CHECKS)
+    assert [s.attributes.get("check.reused") for s in checks] == [True] * 4 + [None]
+    _no_scratch_left(change)
+
+
+def test_precomputed_hard_finding_still_wins_without_the_model(make_pr, run, models, monkeypatch):
+    change = make_pr(VACUOUS)
+    first = run(change)
+    assert first.verdict == "request_changes" and models.requests == []
+    monkeypatch.setattr(R.C, "check_revert", lambda *a, **k: pytest.fail("revert ran again"))
+    out = run(change, precomputed=_pre(first))
+    assert (out.verdict, out.tag, out.read_diff) == ("request_changes", "incomplete", "skipped")
+    assert models.requests == []  # a reused hard finding is never put to the model either
 
 
 def test_skipped_checks_still_get_spans(make_pr, run):

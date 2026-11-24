@@ -19,6 +19,16 @@ Layout (every key optional; missing keys take the defaults below)::
     router_timeout_seconds = 30
     sandbox = "on"       # on | off: model-written code runs under sandbox-exec (#40)
     clarify = true       # ask on a vague issue before working on it (#44)
+    embedding_model = "embeddinggemma"   # kNN router (#23); local, never a writer rung
+    knn_threshold = 50   # accepted tickets before the kNN start rule replaces the rules
+    explore_rate = 0.10  # share of tickets started one tier lower (#23)
+    failure_labels = true  # label every kickback's failure step (#27), local model
+
+    [experiments]        # replays (#25) and the shadow reviewer (#26), wave 9 (#29)
+    run_budget_usd = 2.0
+    min_cases = 10       # replay cases scored on both sides before a verdict
+    live_min_sample = 30 # paired, user-decided PRs before "holds live" is judged
+    nightly_hour = 2     # the launchd agent runs `fman experiment run --all` then
 
     [sandbox_network]    # per repo: "allow" opens outbound network for its verify + checks
     "you/project" = "none"
@@ -164,7 +174,27 @@ class SpendCaps:
     experiments_monthly_usd: float = 10.0
 
 
+@dataclass(frozen=True)
+class ExperimentSettings:
+    """``[experiments]`` in config.toml (#29): replays (#25) and the shadow reviewer (#26).
+
+    The monthly experiments budget stays ``spend_caps.experiments_monthly_usd``."""
+
+    set_size: int = 100  # latest merges a replay set is built from
+    run_budget_usd: float = 2.0  # cloud spend one replay run may use (inside the budget)
+    writer_timeout_s: float = 20 * 60.0  # one writer replay side (OpenCode)
+    verify_timeout_s: float = 10 * 60.0  # scoring one writer side (the merged tests)
+    review_timeout_s: float = 30 * 60.0  # one replayed review
+    min_cases: int = 10  # cases scored on both sides before a replay verdict
+    live_min_sample: int = 30  # paired, user-decided PRs before the shadow is judged
+    shadow: bool = True  # run a running shadow experiment's challenger on live PRs
+    shadow_timeout_s: float = 15 * 60.0  # one shadow review, checks and model call
+    nightly_hour: int = 2  # local time of the nightly `fman experiment run --all`
+    nightly_minute: int = 0
+
+
 OLLAMA_URL = "http://127.0.0.1:11434/v1"
+DEFAULT_EMBEDDING_MODEL = "embeddinggemma"
 
 
 def default_models() -> tuple[ModelEndpoint, ...]:
@@ -235,6 +265,24 @@ class Config:
     #: on as written; if not, the worker asks on the issue (``needs-info``) and waits for
     #: an allowed user. False turns the check off.
     clarify: bool = True
+    #: #23 nearest-neighbour router. The embedding model is served by the proxy next to
+    #: the writer models but is never a writer rung (``embedder()``). Local by default
+    #: (7c): a non-loopback ``embedding_base_url`` needs ``allow_cloud_embedder = true``,
+    #: https and ``embedding_api_key_ref``.
+    embedding_model: str = DEFAULT_EMBEDDING_MODEL
+    embedding_base_url: str = OLLAMA_URL
+    allow_cloud_embedder: bool = False
+    embedding_api_key_ref: str | None = None
+    knn_threshold: int = 50  # accepted tickets before kNN replaces the rules router
+    knn_k: int = 10  # neighbours that vote
+    knn_timeout_seconds: float = 5.0  # one route-time embedding call, wall clock
+    #: #23: share of tickets that start one tier below the router's pick (0 turns it off).
+    explore_rate: float = 0.10
+    #: #27: label each kickback's failure step with a small local model, in the background.
+    failure_labels: bool = True
+    failure_label_timeout_seconds: float = 30.0
+    allow_cloud_labeler: bool = False
+    experiments: ExperimentSettings = field(default_factory=ExperimentSettings)
 
     def __post_init__(self) -> None:
         if isinstance(self.sandbox_network, Mapping):
@@ -262,6 +310,26 @@ class Config:
 
     def is_allowed_user(self, login: str) -> bool:
         return login.lower() in {u.lower() for u in self.allowed_users}
+
+    def embedder(self) -> ModelEndpoint:
+        """The embedding model as a proxy endpoint (#23). Add it to the proxy's model list
+        (``proxy_models``); never to ``models`` or the escalation ladder."""
+        host = urlparse(self.embedding_base_url).hostname or ""
+        local = _is_loopback(host)
+        return ModelEndpoint(
+            name=self.embedding_model,
+            tier=1,  # a placeholder: the proxy ignores it, and it is never a rung
+            kind="local" if local else "cloud",
+            model=self.embedding_model,
+            base_url=self.embedding_base_url,
+            family="embedding",
+            api_key_ref=None if local else self.embedding_api_key_ref,
+        )
+
+    def proxy_models(self) -> tuple[ModelEndpoint, ...]:
+        """Every model the worker's proxy serves: the writers and reviewers, plus the
+        embedding model."""
+        return (*self.models, self.embedder())
 
     def sandbox_network_for(self, repo: str) -> str:
         """``"allow"`` or ``"none"``: the verify/check network for ``repo`` (#40)."""
@@ -296,6 +364,7 @@ def _validate(cfg: Config) -> None:
             raise ConfigError(
                 f"sandbox_network.{repo} must be one of {', '.join(SANDBOX_NETWORKS)}"
             )
+    _validate_learning(cfg)
     names = [m.name for m in cfg.models]
     if len(set(names)) != len(names):
         raise ConfigError("model names must be unique")
@@ -307,6 +376,49 @@ def _validate(cfg: Config) -> None:
     for name in cfg.reviewer_models:
         if name not in names:
             raise ConfigError(f"reviewer_models names unknown model {name!r}")
+
+
+def _validate_learning(cfg: Config) -> None:
+    """#23, #27 and ``[experiments]`` (#29)."""
+    if not cfg.embedding_model.strip() or cfg.embedding_model in {m.name for m in cfg.models}:
+        raise ConfigError("embedding_model must be set and differ from every writer model name")
+    url = urlparse(cfg.embedding_base_url)
+    if url.scheme not in ("http", "https") or not url.hostname:
+        raise ConfigError("embedding_base_url must be an http(s) URL")
+    if not _is_loopback(url.hostname):
+        if not cfg.allow_cloud_embedder:
+            raise ConfigError(
+                "embedding_base_url is not on localhost: the embedding model stays local "
+                "(set allow_cloud_embedder = true to send issue text to it)"
+            )
+        if url.scheme != "https" or not cfg.embedding_api_key_ref:
+            raise ConfigError("a cloud embedding model needs https and embedding_api_key_ref")
+    if cfg.embedding_api_key_ref is not None:
+        parse_key_ref(cfg.embedding_api_key_ref)
+    for name in ("knn_threshold", "knn_k"):
+        if getattr(cfg, name) < 1:
+            raise ConfigError(f"{name} must be >= 1")
+    for name in ("knn_timeout_seconds", "failure_label_timeout_seconds"):
+        if not 0 < getattr(cfg, name) <= 600:
+            raise ConfigError(f"{name} must be > 0 and <= 600")
+    if not 0.0 <= cfg.explore_rate <= 1.0:
+        raise ConfigError("explore_rate must be between 0 and 1")
+    for name in ("allow_cloud_embedder", "failure_labels", "allow_cloud_labeler"):
+        if not isinstance(getattr(cfg, name), bool):
+            raise ConfigError(f"{name} must be true or false")
+    ex = cfg.experiments
+    for name in ("set_size", "min_cases", "live_min_sample"):
+        if getattr(ex, name) < 1:
+            raise ConfigError(f"experiments.{name} must be >= 1")
+    for name in ("writer_timeout_s", "verify_timeout_s", "review_timeout_s", "shadow_timeout_s"):
+        if getattr(ex, name) <= 0:
+            raise ConfigError(f"experiments.{name} must be > 0")
+    if ex.run_budget_usd < 0:
+        raise ConfigError("experiments.run_budget_usd must be >= 0")
+    if not 0 <= ex.nightly_hour <= 23 or not 0 <= ex.nightly_minute <= 59:
+        raise ConfigError("experiments.nightly_hour must be 0-23 and nightly_minute 0-59")
+    if not isinstance(ex.shadow, bool):
+        raise ConfigError("experiments.shadow must be true or false")
 
 
 def _validate_model(m: ModelEndpoint) -> None:
@@ -437,6 +549,7 @@ def from_dict(data: Mapping[str, Any]) -> Config:
             _typed(k, str, "sandbox_network"): _typed(v, str, f"sandbox_network.{k}")
             for k, v in nets.items()
         }
+    _learning_from_dict(data, kw)
     if "spend_caps" in data:
         caps = _typed(data["spend_caps"], dict, "spend_caps")
         _check_keys(caps, {f.name for f in fields(SpendCaps)}, "spend_caps")
@@ -447,6 +560,40 @@ def from_dict(data: Mapping[str, Any]) -> Config:
         raw_models = _typed(data["models"], list, "models")
         kw["models"] = tuple(_model_from_dict(m, f"models[{i}]") for i, m in enumerate(raw_models))
     return Config(**kw)
+
+
+_LEARNING_TYPES: dict[str, Any] = {
+    "embedding_model": str,
+    "embedding_base_url": str,
+    "allow_cloud_embedder": bool,
+    "embedding_api_key_ref": str,
+    "knn_threshold": int,
+    "knn_k": int,
+    "knn_timeout_seconds": float,
+    "explore_rate": float,
+    "failure_labels": bool,
+    "failure_label_timeout_seconds": float,
+    "allow_cloud_labeler": bool,
+}
+
+
+def _field_value(value: Any, typ: Any, where: str) -> Any:
+    if typ is float:
+        return float(_typed(value, (int, float), where))
+    return _typed(value, typ, where)
+
+
+def _learning_from_dict(data: Mapping[str, Any], kw: dict[str, Any]) -> None:
+    for key, typ in _LEARNING_TYPES.items():
+        if key in data:
+            kw[key] = _field_value(data[key], typ, key)
+    if "experiments" in data:
+        raw = _typed(data["experiments"], dict, "experiments")
+        types = {f.name: f.type for f in fields(ExperimentSettings)}
+        _check_keys(raw, set(types), "experiments")
+        kw["experiments"] = ExperimentSettings(
+            **{k: _field_value(v, types[k], f"experiments.{k}") for k, v in raw.items()}
+        )
 
 
 def to_dict(cfg: Config) -> dict[str, Any]:
@@ -467,6 +614,12 @@ def to_dict(cfg: Config) -> dict[str, Any]:
     out["clarify"] = cfg.clarify
     if cfg.sandbox_network:
         out["sandbox_network"] = dict(cfg.sandbox_network)
+    for key in _LEARNING_TYPES:
+        if getattr(cfg, key) is not None:
+            out[key] = getattr(cfg, key)
+    out["experiments"] = {
+        f.name: getattr(cfg.experiments, f.name) for f in fields(ExperimentSettings)
+    }
     out["spend_caps"] = {f.name: getattr(cfg.spend_caps, f.name) for f in fields(SpendCaps)}
     out["models"] = [
         {
@@ -505,6 +658,7 @@ __all__ = [
     "KEY_REF_PREFIX",
     "Config",
     "ConfigError",
+    "ExperimentSettings",
     "ModelEndpoint",
     "SpendCaps",
     "default_models",

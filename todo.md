@@ -65,7 +65,7 @@ in the item, and put the shape you rely on behind one small adapter so a
 change touches one file.
 ============================================================ -->
 
-Next ID: #53
+Next ID: #61
 Legend: `[ ]` todo · `[~]` in progress · `[~] live` built, waiting on its live check · `[x]` done (move to DONE.md)
 
 ## Wave plan
@@ -95,13 +95,14 @@ Package root below is `src/foreman_inator/` (written `pkg/`).
 | 6 | A: #21 (alone: the main loop) | `pkg/worker.py`, `pkg/cli.py` (`metrics`), `pkg/pr/publisher.py` (ready-for-review + bot review posting), `tests/test_worker_v2.py` | [x] built; live check open for #21 |
 | 6b | A: #40 · B: #41, #42, #43 (one agent, in order: all three edit the GitHub client and poller) · C: #44 | A `pkg/runner/sandbox.py`; edits `pkg/runner/opencode.py`, `pkg/runner/verify.py`, `pkg/review/checks.py`, `pkg/config.py` · B `pkg/github/client.py`, `tests/fakes/github.py`, `pkg/github/poller.py`, `pkg/tickets/lifecycle.py`, `pkg/tickets/prompt.py`, `pkg/setup/manifest.py`, `pkg/runner/worktree.py`, `pkg/db/store.py`, `pkg/db/migrations/002_*.sql` · C `pkg/tickets/clarify.py`, `pkg/prompts/clarify-v1.md` (+ own tests). Runner at close: `worker.py` wiring for all five; for #44 the `NeedsInfoAnswered` event in `poller.py`/`lifecycle.py` and the Q&A block in `tickets/prompt.py` (after slot B is merged into the wave branch); `pyproject.toml` deps | [x] built and wired; live checks open for #40, #41, #44 |
 | 7 | A: #22 (cross-repo, optional) | bot-inator repo only; nothing in this repo | [ ] |
-| 8 | A: #23 · B: #24 · C: #25 · D: #26 · E: #27 · F: #28 | A `pkg/routing/knn.py`, `pkg/routing/explore.py` · B `pkg/experiments/variants.py`, `pkg/experiments/__init__.py`, `pkg/prompts/__init__.py` · C `pkg/experiments/replay_sets.py`, `pkg/experiments/replay_runner.py` · D `pkg/experiments/shadow.py` · E `pkg/tracing/failure_label.py`, `pkg/prompts/failure-label-v1.md` · F `pkg/tracing/replay.py`, `pkg/metrics/trace_view.py`, `tests/recordings/` (+ own tests). Runner at close: `pyproject.toml` deps | [x] built; wiring is wave 9 |
-| 9 | A: #29 (alone: wiring) | `pkg/worker.py`, `pkg/cli.py` (`experiment`, `replay`), `pkg/metrics/web.py` (new routes and failure-step columns), `tests/test_worker_v3.py` | [ ] |
+| 8 | A: #23 · B: #24 · C: #25 · D: #26 · E: #27 · F: #28 | A `pkg/routing/knn.py`, `pkg/routing/explore.py` · B `pkg/experiments/variants.py`, `pkg/experiments/__init__.py`, `pkg/prompts/__init__.py` · C `pkg/experiments/replay_sets.py`, `pkg/experiments/replay_runner.py` · D `pkg/experiments/shadow.py` · E `pkg/tracing/failure_label.py`, `pkg/prompts/failure-label-v1.md` · F `pkg/tracing/replay.py`, `pkg/metrics/trace_view.py`, `tests/recordings/` (+ own tests). Runner at close: `pyproject.toml` deps | [x] |
+| 9 | A: #29 (alone: wiring) | `pkg/worker.py`, `pkg/cli.py` (`experiment`, `replay`), `pkg/metrics/web.py` (new routes and failure-step columns), `tests/test_worker_v3.py` | [x] built; live check open for #29 |
 | 10 | A: #30 · B: #31 · C: #32 | A `pkg/export.py` · B `pyproject.toml` (metadata, entry points), `.github/workflows/release.yml`, `docs/releasing.md` · C `README.md`, `docs/setup.md`, `docs/how-it-works.md`, `docs/demo.gif` (+ own tests). Runner at close: `cli.py` (`export`) | [ ] |
 | — | #33–#39 | unscheduled (SPEC milestone 5) | open |
 | — | #45–#50 | unscheduled (gap review, 2026-11-23) | open |
 | — | #51 | unscheduled (user request, 2026-11-23); proposed as its own wave after 6b | open |
 | — | #52 | unscheduled (user request, 2026-11-23); after 6b, can share a wave with #51 (disjoint files) | open |
+| — | #53–#56 | unscheduled (first live run, 2026-11-23); #45 gained live evidence in the same run | open |
 
 ### Runner decisions on open questions (assistant defaults, 2026-11-23)
 
@@ -135,6 +136,7 @@ Open (need the user; full steps in each item's DONE.md entry):
 - Optional (#42, #43): a request-changes review with line comments; a conflicting commit on the base of a PR in review.
 
 One combined step list for wave 6b is in DONE.md's #40, #41 and #44 entries.
+- #29 milestone 4: one overnight replay of a prompt change (a new prompt file), then read the comparison. Steps in DONE.md.
 
 ## Completed items (archived to DONE.md)
 
@@ -170,6 +172,7 @@ One combined step list for wave 6b is in DONE.md's #40, #41 and #44 entries.
 #26 — Shadow reviewer [x] · 2026-11-23 · see DONE.md
 #27 — Failure-step labeling [x] · 2026-11-23 · see DONE.md
 #28 — Replay viewer and recorded tickets as worker regression tests [x] · 2026-11-23 · see DONE.md
+#29 — Wiring for milestone 4 [~] live · 2026-11-23 · see DONE.md
 
 ---
 
@@ -225,17 +228,6 @@ Deviations:
 
 ### Milestone 4 — Learning router, experiments, trace analysis
 
-#29 — Wiring for milestone 4 [ ]
-Wave: 9 · Agent: A (alone) · Added: 2026-11-23 · Source: spec
-Ask: Turn on the learning router, experiments and trace analysis in the running worker.
-Files:
-⚬ OWNED: `src/foreman_inator/worker.py`, `src/foreman_inator/cli.py` (`experiment run|status|promote`, `replay <ticket>`), `src/foreman_inator/metrics/web.py` (routes for trace view, failure steps per variant, experiments), `tests/test_worker_v3.py`
-Approach: router picks #23 over #15 past the threshold; every kickback triggers #27; shadow reviewer (#26) runs when a challenger exists; `fman experiment run` drives #25 overnight via launchd calendar interval; promotion follows SPEC's rule (wins on replay and holds live).
-Verify:
-⚬ Scenario test: challenger wins replay, holds in shadow, `promote` switches the champion; a challenger that loses live is rejected.
-Live (user): run one overnight replay of a prompt change; read the comparison.
-Deviations:
-
 ### Release
 
 #30 — `fman export --redact` [ ]
@@ -289,6 +281,7 @@ write the full item from the template before scheduling one.
 #45 — Install dependencies in a fresh worktree before verify [ ] · Added: 2026-11-23 · Source: assistant (gap review)
 Why: no install step exists anywhere in the code (no `npm ci`, `uv sync` or `swift package resolve`), so a new worktree has no `node_modules` or venv and verify can fail for reasons unrelated to the change.
 Idea: detect an install command next to the verify command, save it per repo like `fman repo set-verify`, run it once per worktree. Needs network, so decide it together with #40's `sandbox_network`.
+Live evidence (2026-11-23, first live run, `Bforsyth1234/fman-playground`, ticket 2, attempt 11): with the sandbox on, verify ran `uv run pytest` and failed with "Network connectivity is disabled, but the requested data wasn't found in the cache" (`~/.foreman-inator/traces/2/attempt-11-verify.log`). The sandbox moves `UV_CACHE_DIR` into an empty scratch dir and the repo had no `sandbox_network = "allow"`, so nothing could be installed. The change itself was correct. The writer hit the same wall in its own bash tool and spent most of 18.6 minutes and 585k input tokens trying to get pytest to run. This now blocks every repo with dependencies, so it is no longer only a gap-review idea. Options seen: a read-only shared package cache inside the sandbox, an install step that runs with network before the sandboxed verify, or telling the user to set `sandbox_network` when verify fails this way.
 
 #46 — Metrics: attempt minutes and review count next to dollars [ ] · Added: 2026-11-23 · Source: assistant (gap review; user asked "why wouldnt local llms be priced at 0")
 Why: local models cost $0 per token (correct), so "cost per accepted ticket" shows a local model that took 3 attempts and 2 reviews as free.
@@ -382,3 +375,43 @@ Verify:
 ⚬ Non-vacuous: price cache reads at the full input rate and the cost test fails; drop `cache_read_input_tokens` from the sum and the `tokens_in` test fails; send `Authorization: Bearer` instead of `x-api-key` and the header test fails.
 Live (user): one real Claude writer attempt on a toy repo: from the second model call on, `cache_read_input_tokens` is above zero in the trace, and the attempt's cost is below the same token count at the uncached rate. One real GLM attempt on the Coding Plan endpoint: note whether `cached_tokens` is ever above zero, since the docs do not say caching applies there.
 Deviations:
+
+### Unscheduled (first live run, 2026-11-23)
+
+Found by the first real ticket: issue #1 on the private test repo `Bforsyth1234/fman-playground` ("Fix typo in README"), tier 1 `inkling-2-mini`, sandbox on, worker started with `uv run fman run`. One more problem from the same run is already fixed in the working tree: `warm_up_opencode` now opens one session, because OpenCode writes `config/opencode/.gitignore` into the shared config dir on its first session and a sandboxed attempt has that dir read-only (every attempt on a fresh install failed with `POST /session: 500`).
+
+#53 — A setup failure must flag the ticket, not climb the ladder [ ] · Added: 2026-11-23 · Source: assistant (first live run)
+Why: ticket 1 made 10 attempts in 20 seconds, two on every model up to `claude-fable`, and was then handed to the user. Each attempt ended in about 1 second with 0 tokens: the OpenCode session could not be opened (`POST /session: 500`), the driver returned `status="errored"`, and the worker treated that as failed checks and escalated. No model was ever called. With API keys stored, the cloud tiers would have been tried for a failure no model can fix, and all 10 rows count as `failed_checks` against their models in the metrics.
+Idea: tell "the attempt could not run" (server did not start, session not opened, 0 model calls) apart from "the change failed its checks". The first kind flags the ticket once with the error, makes no further attempt, and is left out of the per-model metrics, like `FLAG_SANDBOX` already does for a missing sandbox backend.
+
+#54 — The sandboxed child inherits the worker's PATH and VIRTUAL_ENV [ ] · Added: 2026-11-23 · Source: assistant (first live run)
+Why: the worker was started with `uv run fman run`, which puts `foreman-inator/.venv/bin` first on PATH and sets `VIRTUAL_ENV`. Both reached the sandboxed writer and verify: inside the attempt `which python3` was foreman-inator's own venv, `uv` warned that `VIRTUAL_ENV` "does not match the project environment path", and the model listed that venv's `site-packages` while looking for pytest. The attempt reads files outside its worktree and can run the worker's interpreter, so a repo's checks may pass or fail because of what foreman-inator itself has installed.
+Idea: `sandbox.child_env` drops `VIRTUAL_ENV` (and other tool-activation variables) and removes the worker's own venv from PATH. Decide whether reads under the worker's checkout should be denied by the profile as well.
+
+#55 — Heredocs fail in the sandboxed bash tool [ ] · Added: 2026-11-23 · Source: assistant (first live run)
+Why: the model's `python3 - <<'EOF'` and `cat > file <<'EOF'` commands both failed with "zsh:1: can't create temp file for here document: operation not permitted". Heredocs are how local models most often write files from the shell; this one fell back to `sed` and the write tool after two lost turns.
+Idea: likely cause, not confirmed: zsh creates heredoc temp files under `TMPPREFIX` (default `/tmp/zsh`), not `TMPDIR`, and the profile denies `/tmp`. Set `TMPPREFIX` into the scratch dir in `sandbox.child_env`, and add a sandbox test that runs a heredoc.
+
+#56 — Setup puts every installed repo into config.toml [ ] · Added: 2026-11-23 · Source: assistant (first live run)
+Why: GitHub's install page defaults to "All repositories". `fman setup` then wrote all 141 of the user's repos (87 public) into `repos`, and the worker started with "141 repo(s), polling every 45s": about 11,000 issue listings an hour, at or over the installation's rate limit (not confirmed for this account), and far more repos than the user meant to hand over. There is no command to change the list; it was cut to one repo by rewriting the file through `config.save`.
+Idea: setup shows the count and asks which repos to work on when the installation covers more than a few (default: none until chosen), and says how to narrow the installation on GitHub. Add `fman repo add` / `fman repo remove`. Consider one installation-wide listing per poll instead of one per repo.
+
+### Unscheduled (local model resources, 2026-11-23)
+
+Asked by the user: "should we add the ability for the app to track gpu / memory usage and keep track of how many local models are running at a time?", then "lets add all 4 to the todo.md". GPU utilization % is left out on purpose: on macOS it needs `sudo powermetrics`, which a launchd worker cannot run, and on Apple Silicon the GPU shares system memory, so memory pressure plus Ollama's loaded-model list covers it.
+
+#57 — Global cap on concurrent local-model inference [ ] · Added: 2026-11-23 · Source: user
+Why: `max_parallel_per_repo` (default 1, "one local GPU") is counted per repo, and nothing limits local work across repos. Three watched repos can send three tickets to Ollama at once, each loading `qwen3.8:27b` or `inkling-2-mini`: models get evicted and reloaded, the machine swaps, and attempts slow down or time out. Those runs are then recorded as model failures in the metrics and the kNN router's data.
+Idea: a `max_local_inference` config setting (default 1). The proxy holds one shared semaphore for requests to `local` tier endpoints; cloud tiers are not limited. Time spent waiting for a slot is recorded on the `llm.call` span and not counted against the attempt's timeout. Estimate: about 2 hours with tests.
+
+#58 — Poll Ollama for loaded models [ ] · Added: 2026-11-23 · Source: user
+Why: there is no way to see how many local models are running right now. Ollama's `GET /api/ps` returns each loaded model with `size`, `size_vram` and `expires_at`, which answers that directly with no GPU tooling.
+Idea: a small poller (reuse `setup.deps.ollama_host` for the host) that the worker status and the metrics view read. If Ollama is unreachable, report that instead of zero models. Estimate: about 1 hour.
+
+#59 — Record memory state on each attempt [ ] · Added: 2026-11-23 · Source: user
+Why: a slow or failed local attempt can't be told apart from a starved machine. Without this, resource contention looks like model quality in the metrics and replay sets.
+Idea: at attempt start (and optionally at end), store the loaded models from #58 plus system memory used and memory pressure (`psutil`, or `vm_stat` / `memory_pressure` on macOS) on the attempt's trace. Decide whether it belongs on a span attribute (no schema change) or in an attempt column. Estimate: about 2 hours.
+
+#60 — Resource panel on the metrics page [ ] · Added: 2026-11-23 · Source: user
+Why: makes #57–#59 visible: current loaded models and their memory, system memory used, and local inference slots in use vs. the cap.
+Idea: a panel in `metrics/web.py` fed by #58's poller and the #57 semaphore; per-attempt memory from #59 shown on the attempt view. Depends on #57–#59. Estimate: about 2 hours.

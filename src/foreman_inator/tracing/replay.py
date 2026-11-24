@@ -32,7 +32,9 @@ recording, the ordered steps (prompt, model turns with tokens and cost, tool cal
 input and bounded output, verify, review checks, the verdict, kickbacks), each with its
 ``row_index``: the 0-based index into ``RunRecord.rows`` (the header is not a row; for
 every row but the result, ``row_index == seq - 1``). A kickback's
-``failure_step_index`` (#27) is read as that index into the judged attempt's recording.
+``failure_step_index`` (#27) is the 1-based position of the row after the header (the
+row's ``seq``; ``failure_label.step_row``), so it marks the step whose
+``row_index == failure_step_index - 1`` (reconciled in wave 9, #29).
 
 **Regression.** ``regress(rows)`` takes a ticket's recorded store rows (``TicketRows``:
 attempts, kickbacks, reviews, routed tier, the ladder, uncounted attempts, plus the
@@ -696,7 +698,7 @@ def timeline(
                 if k.failure_step and k.failure_step_index is not None:
                     steps = [
                         replace(s, failure_step=k.failure_step)
-                        if s.row_index == k.failure_step_index and s.kind != "result"
+                        if s.row_index == k.failure_step_index - 1 and s.kind != "result"
                         else s
                         for s in steps
                     ]

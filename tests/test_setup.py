@@ -300,11 +300,14 @@ def test_full_setup_flow(tmp_path, pem):
     assert all(c.ok for c in result.checks), result.checks
 
     plist = tmp_path / "LaunchAgents" / launchd.PLIST_NAME
+    nightly = tmp_path / "LaunchAgents" / launchd.NIGHTLY_PLIST_NAME  # #29, next to it
     assert lc.calls == [
         ["bootout", f"gui/501/{launchd.LABEL}"],
         ["bootstrap", "gui/501", str(plist)],
+        ["bootout", f"gui/501/{launchd.NIGHTLY_LABEL}"],
+        ["bootstrap", "gui/501", str(nightly)],
     ]
-    assert result.service.loaded
+    assert result.service.loaded and result.nightly.loaded
 
 
 def test_rerun_reuses_app_and_keeps_entries(tmp_path, pem):
@@ -450,7 +453,10 @@ def test_uninstall_boots_out_and_removes_plist(tmp_path):
     assert (agents / launchd.PLIST_NAME).exists()
     lc.calls.clear()
     res = uninstall(echo=lambda s: None, launchctl=lc, agents_dir=agents, uid=501)
-    assert lc.calls == [["bootout", f"gui/501/{launchd.LABEL}"]]
+    assert lc.calls == [  # the nightly experiments agent (#29) goes with it
+        ["bootout", f"gui/501/{launchd.LABEL}"],
+        ["bootout", f"gui/501/{launchd.NIGHTLY_LABEL}"],
+    ]
     assert not (agents / launchd.PLIST_NAME).exists()
     assert "removed" in res.message
     again = uninstall(echo=lambda s: None, launchctl=lc, agents_dir=agents, uid=501)

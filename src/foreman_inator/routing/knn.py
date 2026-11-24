@@ -18,18 +18,29 @@ The neighbour rule (exact)
    return None (fall back).
 3. **Nearest.** Rank the pool by cosine similarity to the new ticket, highest first;
    equal similarities go to the older ticket (lower id). Take the first ``k`` (default 10).
-4. **Votes.** Each neighbour votes once for the tier of its *accepted attempt*: the tier
-   where it was finally accepted. So a neighbour accepted only after escalation counts
-   at the tier it escalated to; an ``explore`` attempt accepted one tier down counts at
-   that lower tier (that is what exploration is for); a failed ``explore`` start counts
-   nothing (the ticket counts where it was later accepted). Kickbacks before acceptance
-   do not change the vote: a neighbour kicked back on tier 1 and then accepted on tier
-   1 counts as tier 1. Votes are not weighted by similarity.
+4. **Votes.** Each neighbour votes once, for the tier of its *accepted attempt* (the tier
+   where it was finally accepted) when that tier was accepted cleanly. So a neighbour
+   accepted only after escalation counts at the tier it escalated to; an ``explore``
+   attempt accepted one tier down counts at that lower tier (that is what exploration is
+   for); a failed ``explore`` start counts nothing (the ticket counts where it was later
+   accepted). **A user kickback on the accepted tier moves the vote up one tier** (user
+   decision, 2026-11-23: a kickback costs review time, so a tier that is only accepted
+   after one is not the cheapest tier that works): a neighbour the user kicked back on
+   tier 1 and then accepted on tier 1 votes for tier 2. The top tier has nowhere to move
+   to and votes for itself. **An AI reviewer kickback on the accepted tier splits the
+   vote** (user decision, 2026-11-23: it costs wall-clock time and one more cloud review
+   call, but none of the user's time): half a vote for the accepted tier and half for the
+   tier above. A user kickback on the same tier wins over it (one whole vote up), and on
+   the top tier the vote stays whole. Only kickbacks on an attempt of the accepted tier
+   count: kickbacks on a lower tier are already paid for by the escalation (two reviewer
+   kickbacks escalate, so the split covers the one-kickback case). Votes are not weighted
+   by similarity.
 5. **Pick.** The tier with the most votes; a tie goes to the cheapest (lowest) of the
    tied tiers. That tier then goes through ``rules.resolve_tier`` (a tier with no model
    configured is skipped upward, as in #15).
 
-What it learns from: where tickets were finally accepted (step 4), measured against the
+What it learns from: where tickets were finally accepted and whether the user had to kick
+them back there first (step 4), measured against the
 router's own pick (``tickets.routed_tier``, step 1). It never reads an attempt's start
 tier, so neither an exploration start nor a profile-shifted start is learned as a pick.
 #51 must therefore keep ``routed_tier`` the router's own (unshifted) pick.
@@ -79,7 +90,6 @@ import operator
 import sys
 import threading
 from array import array
-from collections import Counter
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -350,41 +360,94 @@ def pool_size(store: Any, *, model: str, dims: int | None = None, exclude: int =
     return int(store.query(sql, params)[0]["n"])
 
 
+TOP_TIER = max(rules.TIERS)
+
+
 @dataclass(frozen=True, slots=True)
 class Neighbour:
     ticket_id: int
     similarity: float
     accepted_tier: int
+    kicked_back: bool = False  # the user kicked it back on the accepted tier first
+    reviewer_kicked: bool = False  # the AI reviewer kicked it back on the accepted tier
+
+    @property
+    def vote_tier(self) -> int:
+        """Step 4: the accepted tier, or one tier up when the user kicked it back there."""
+        if self.kicked_back:
+            return min(self.accepted_tier + 1, TOP_TIER)
+        return self.accepted_tier
+
+    @property
+    def split(self) -> bool:
+        """Step 4: an AI reviewer kickback (and no user kickback) below the top tier."""
+        return self.reviewer_kicked and not self.kicked_back and self.accepted_tier < TOP_TIER
+
+    def votes(self) -> tuple[tuple[int, float], ...]:
+        """Step 4: ``(tier, weight)`` pairs, weights summing to 1."""
+        if self.split:
+            return ((self.accepted_tier, 0.5), (self.accepted_tier + 1, 0.5))
+        return ((self.vote_tier, 1.0),)
+
+
+# Step 4: did the user kick the ticket back on an attempt of the tier it was accepted on?
+_KICKED_BACK = """
+    EXISTS (SELECT 1 FROM kickbacks k JOIN attempts x ON x.id = k.attempt_id
+            WHERE x.ticket_id = t.id AND x.tier = a.tier AND k."by" = 'user')
+"""
+_REVIEWER_KICKED = _KICKED_BACK.replace("'user'", "'reviewer'")
 
 
 def load_pool(
     store: Any, *, model: str, dims: int, exclude: int = -1
-) -> list[tuple[int, int, array]]:
-    """``(ticket_id, accepted_tier, vector)`` for every ticket in the pool."""
+) -> list[tuple[int, int, array, bool, bool]]:
+    """``(ticket_id, accepted_tier, vector, kicked_back, reviewer_kicked)`` for every
+    ticket in the pool."""
     rows = store.query(
-        "SELECT t.id AS id, a.tier AS tier, e.vector AS vector "
+        "SELECT t.id AS id, a.tier AS tier, e.vector AS vector,"
+        + _KICKED_BACK
+        + " AS kicked,"
+        + _REVIEWER_KICKED
+        + " AS reviewer_kicked "
         + _POOL_FROM
         + " AND e.dims = :dims ORDER BY t.id",
         {"model": model, "exclude": exclude, "dims": dims},
     )
-    return [(int(r["id"]), int(r["tier"]), unpack(r["vector"])) for r in rows]
+    return [
+        (
+            int(r["id"]),
+            int(r["tier"]),
+            unpack(r["vector"]),
+            bool(r["kicked"]),
+            bool(r["reviewer_kicked"]),
+        )
+        for r in rows
+    ]
 
 
 def nearest(
-    query: Sequence[float], pool: Iterable[tuple[int, int, Sequence[float]]], k: int = DEFAULT_K
+    query: Sequence[float], pool: Iterable[Sequence[Any]], k: int = DEFAULT_K
 ) -> list[Neighbour]:
-    """Step 3: the ``k`` most similar, highest similarity first, ties to the lower id."""
-    scored = [Neighbour(tid, cosine(query, vec), tier) for tid, tier, vec in pool]
+    """Step 3: the ``k`` most similar, highest similarity first, ties to the lower id.
+    A pool row is ``(ticket_id, accepted_tier, vector)`` or ``load_pool``'s five fields."""
+    scored = [
+        Neighbour(tid, cosine(query, vec), tier, *(bool(x) for x in rest[:2]))
+        for tid, tier, vec, *rest in pool
+    ]
     scored.sort(key=lambda n: (-n.similarity, n.ticket_id))
     return scored[: max(0, k)]
 
 
-def pick_tier(neighbours: Sequence[Neighbour]) -> tuple[int, int]:
-    """Steps 4-5: ``(tier, votes)``: the accepted tier most neighbours share; a tie goes to
-    the cheapest tied tier. Raises ValueError for no neighbours."""
+def pick_tier(neighbours: Sequence[Neighbour]) -> tuple[int, float]:
+    """Steps 4-5: ``(tier, votes)``: the tier with the most votes (``Neighbour.votes``, so
+    a count that may end in .5); a tie goes to the cheapest tied tier. Raises ValueError
+    for no neighbours."""
     if not neighbours:
         raise ValueError("no neighbours to vote")
-    votes = Counter(n.accepted_tier for n in neighbours)
+    votes: dict[int, float] = {}
+    for n in neighbours:
+        for tier, weight in n.votes():
+            votes[tier] = votes.get(tier, 0.0) + weight  # halves are exact floats
     best = max(votes.values())
     tier = min(t for t, v in votes.items() if v == best)
     return tier, best
@@ -481,12 +544,22 @@ def _route_knn(
         found = nearest(vec, pool, k)
         wanted, votes = pick_tier(found)
         tier, note, has_model = resolve_tier(wanted, configured_tiers(models))
-        listed = ", ".join(f"#{n.ticket_id} t{n.accepted_tier}" for n in found[:REASON_NEIGHBOURS])
+        listed = ", ".join(_listed(n) for n in found[:REASON_NEIGHBOURS])
         if len(found) > REASON_NEIGHBOURS:
             listed += f", +{len(found) - REASON_NEIGHBOURS} more"
+        moved = sum(1 for n in found if n.vote_tier == wanted != n.accepted_tier)
+        halves = sum(1 for n in found if n.split and wanted in dict(n.votes()))
+        tally = f"tier {wanted} accepted for {votes:g} of {len(found)}"
+        notes = []
+        if moved:
+            notes.append(f"{moved} moved up after a user kickback")
+        if halves:
+            notes.append(f"{halves} half votes after an AI reviewer kickback")
+        if notes:
+            tally = f"tier {wanted} voted by {votes:g} of {len(found)} ({'; '.join(notes)})"
         reason = (
             f"knn: {len(found)} nearest of {len(pool)} accepted tickets ({embedder.name}): "
-            f"{listed}; tier {wanted} accepted for {votes} of {len(found)} -> tier {wanted}"
+            f"{listed}; {tally} -> tier {wanted}"
         )
         if note:
             reason += f"; {note}"
@@ -509,6 +582,17 @@ def _route_knn(
             span.set_attribute(key, value)
     log.info("knn router: ticket %s -> tier %d (%s)", tid, tier, reason)
     return result
+
+
+def _listed(n: Neighbour) -> str:
+    """One neighbour in ``route_reason``: ``#12 t1``, ``#12 t1 kicked back>t2`` when a
+    user kickback moved its vote, or ``#12 t1 ai kickback>half t2`` when a reviewer
+    kickback split it. No ", " inside: ``matched_tickets`` splits on it."""
+    if n.split:
+        return f"#{n.ticket_id} t{n.accepted_tier} ai kickback>half t{n.accepted_tier + 1}"
+    if n.vote_tier != n.accepted_tier:
+        return f"#{n.ticket_id} t{n.accepted_tier} kicked back>t{n.vote_tier}"
+    return f"#{n.ticket_id} t{n.accepted_tier}"
 
 
 def _fallback(span: Any, why: str) -> None:

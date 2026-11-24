@@ -24,6 +24,10 @@ escalation gives a step (#16)                      attempt     ``may_start``, ex
                                                                hand-over
 =================================================  ==========  =========================
 
+Background work (wave 9): when a repo has no job running and none due, the shadow
+reviews it owes the running challenger are queued on the shadow lane
+(``worker_background``), which runs beside the job slots and never takes one.
+
 A ticket whose lock gate fails *waits*: no attempt is counted and nothing is flagged; it
 starts as soon as the holder releases. Per repo at most ``config.max_parallel_per_repo``
 jobs run at once (one per ticket); mirror operations stay serialised per repo
@@ -240,6 +244,9 @@ class QueueSteps:
                     break
                 job = self.next_job(repo, exclude=busy | started)
                 if job is None:
+                    if not busy and not self._running_in(repo):
+                        # Nothing live runs or is due: background work may go (#26).
+                        self.queue_shadows(repo)  # type: ignore[attr-defined]
                     break
                 started.add(job.ticket_id)
                 run = _Running(job)

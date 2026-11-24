@@ -18,6 +18,9 @@ Wave 6b: ``RECORD_CI`` → ``attempts.ci_status`` (#41; a red run's job log is s
 retry prompt and the attempt counts as failed checks); ``START_REBASE`` → a pending
 rebase (#43, ``worker_rebase``); a user kickback stores ``ReviewSubmitted.kickback_note``,
 the review body plus its line comments (#42).
+
+Wave 9 (#29): a user kickback queues its failure-step label (#27) on the background lane
+once the poll event's transaction has committed (``Worker.after_commit``).
 """
 
 from __future__ import annotations
@@ -198,8 +201,15 @@ class ActionHandlers:
             return
         tag = ev.kickback_tag if ev.kickback_tag in lifecycle.KICKBACK_TAGS else None
         note = ev.kickback_note or None  # #42: the body plus the review's line comments
-        self.store.record_kickback(att.id, by="user", tag=tag, note=note)
+        kickback = self.store.record_kickback(att.id, by="user", tag=tag, note=note)
         self.store.set_attempt_outcome(att.id, "kicked_back")
+        repo = ctx.ticket.repo
+        # #27: label it in the background, only once this poll transaction committed.
+        self.after_commit(  # type: ignore[attr-defined]
+            ctx.ticket,
+            "failure_label",
+            lambda: self.queue_label(repo, kickback.id),  # type: ignore[attr-defined]
+        )
         if ctx.ticket.flag_reason:
             # The user asked for changes on a handed-over PR: that is new work, not a loop.
             ctx.ticket = self.store.clear_flag(ctx.ticket.id)

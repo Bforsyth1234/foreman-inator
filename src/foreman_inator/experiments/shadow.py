@@ -262,9 +262,14 @@ def shadow_review(
     model_client: rv.ReviewModel | None = None,
     cancel: Event | None = None,
     clock: Callable[[], float] = time.monotonic,
+    precomputed: tuple[Any, Any, Any, Any] | None = None,
 ) -> ShadowResult:
     """Review ``change`` with the challenger, store the row as ``shadow=1``, post nothing.
-    Never raises ``Exception``; see the module docstring for every rule."""
+    Never raises ``Exception``; see the module docstring for every rule.
+
+    ``precomputed`` (#29): the champion's results of checks 1-4 on this same change,
+    passed through to ``review_change`` so the challenger only reads the diff (check 5);
+    checks 1-4 are plain code, the same for every reviewer."""
     t0 = clock()
     repo: str | None = None
     try:
@@ -308,6 +313,8 @@ def shadow_review(
             kw["check_timeout"] = check_timeout
         if python is not None:
             kw["python"] = python
+        if precomputed is not None:
+            kw["precomputed"] = precomputed
         try:
             outcome = launch(**kw)
         except rv.FamilyConflict as exc:

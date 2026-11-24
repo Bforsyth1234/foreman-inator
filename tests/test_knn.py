@@ -108,7 +108,9 @@ def spans():
 _issue = iter(range(1, 1_000_000))
 
 
-def accepted(store, title, request, tiers, *, routed=None, triggers=None, kickback_first=False):
+def accepted(
+    store, title, request, tiers, *, routed=None, triggers=None, kickback_first=False, by="user"
+):
     """A ticket whose attempts ran on ``tiers`` (in order) and whose last was accepted."""
     t = store.create_ticket(
         repo="me/toy",
@@ -127,7 +129,7 @@ def accepted(store, title, request, tiers, *, routed=None, triggers=None, kickba
         last = a
     if kickback_first:  # kicked back on the same tier, then accepted there
         store.set_attempt_outcome(last.id, "kicked_back")
-        store.record_kickback(last.id, by="user", tag="incomplete", note="more")
+        store.record_kickback(last.id, by=by, tag="incomplete", note="more")
         last = store.add_attempt(t.id, model=f"m{last.tier}", tier=last.tier, trigger="kickback")
     store.set_accepted_attempt(t.id, last.id)
     store.set_column(t.id, "done")
@@ -146,10 +148,10 @@ LARGE = [
 ]
 
 
-def history(store, n_small=30, n_large=30):
+def history(store, n_small=30, n_large=30, *, small_kicked_back=False):
     for i in range(n_small):
         title, body = SMALL[i % len(SMALL)]
-        accepted(store, title, body, [1])
+        accepted(store, title, body, [1], kickback_first=small_kicked_back)
     for i in range(n_large):
         title, body = LARGE[i % len(LARGE)]
         accepted(store, title, body, [3])
@@ -403,7 +405,15 @@ def test_nearest_orders_by_similarity_then_older_ticket():
 
 def _pool_tiers(store):
     vec_dims = store.query("SELECT dims FROM ticket_embeddings LIMIT 1")[0]["dims"]
-    return {tid: tier for tid, tier, _ in knn.load_pool(store, model=EMB.name, dims=vec_dims)}
+    return {tid: tier for tid, tier, *_ in knn.load_pool(store, model=EMB.name, dims=vec_dims)}
+
+
+def _pool_votes(store):
+    """Ticket id -> the tier it votes for (step 4), through ``nearest``."""
+    dims = store.query("SELECT dims FROM ticket_embeddings LIMIT 1")[0]["dims"]
+    pool = knn.load_pool(store, model=EMB.name, dims=dims)
+    query = knn.normalise([1.0] * dims)
+    return {n.ticket_id: n.vote_tier for n in knn.nearest(query, pool, k=len(pool))}
 
 
 def test_escalated_neighbour_counts_at_its_accepted_tier(store, proxy):
@@ -412,11 +422,116 @@ def test_escalated_neighbour_counts_at_its_accepted_tier(store, proxy):
     assert _pool_tiers(store) == {t.id: 2}
 
 
-def test_kickback_before_acceptance_counts_at_the_accepted_tier(store, proxy):
+def test_user_kickback_on_the_accepted_tier_moves_the_vote_up_one_tier(store, proxy):
+    """Kicked back by the user on tier 1, then accepted on tier 1: tier 1 cost a review, so
+    the ticket votes for tier 2 (it is still recorded as accepted on tier 1)."""
     t = accepted(store, "Fix typo", "teh", [1], kickback_first=True)
+    clean = accepted(store, "Fix typo", "teh", [1])
     fill_vectors(store, proxy)
     assert len(store.list_attempts(t.id)) == 2
-    assert _pool_tiers(store) == {t.id: 1}
+    assert _pool_tiers(store) == {t.id: 1, clean.id: 1}
+    assert _pool_votes(store) == {t.id: 2, clean.id: 1}
+
+
+def _pool_splits(store):
+    dims = store.query("SELECT dims FROM ticket_embeddings LIMIT 1")[0]["dims"]
+    pool = knn.load_pool(store, model=EMB.name, dims=dims)
+    query = knn.normalise([1.0] * dims)
+    return {n.ticket_id: n.votes() for n in knn.nearest(query, pool, k=len(pool))}
+
+
+def test_reviewer_kickback_on_the_accepted_tier_splits_the_vote(store, proxy):
+    """One AI reviewer kickback on tier 1, then accepted on tier 1: half a vote each for
+    tiers 1 and 2. It is not a whole move up (that is only for the user's kickbacks)."""
+    t = accepted(store, "Fix typo", "teh", [1], kickback_first=True, by="reviewer")
+    clean = accepted(store, "Fix typo", "teh", [1])
+    fill_vectors(store, proxy)
+    assert _pool_votes(store) == {t.id: 1, clean.id: 1}
+    assert _pool_splits(store) == {t.id: ((1, 0.5), (2, 0.5)), clean.id: ((1, 1.0),)}
+
+
+def test_user_kickback_wins_over_a_reviewer_kickback(store, proxy):
+    t = accepted(store, "Fix typo", "teh", [1], kickback_first=True, by="reviewer")
+    store.record_kickback(store.list_attempts(t.id)[0].id, by="user", tag="wrong", note="no")
+    fill_vectors(store, proxy)
+    assert _pool_splits(store) == {t.id: ((2, 1.0),)}
+
+
+def test_reviewer_kickback_on_a_lower_or_the_top_tier_keeps_the_vote_whole(store, proxy):
+    low = accepted(store, "Fix typo", "teh", [1, 2])
+    store.record_kickback(store.list_attempts(low.id)[0].id, by="reviewer", note="no")
+    top = accepted(store, "Refactor all", "x", [3], kickback_first=True, by="reviewer")
+    fill_vectors(store, proxy)
+    assert _pool_splits(store) == {low.id: ((2, 1.0),), top.id: ((3, 1.0),)}
+
+
+def test_pick_tier_counts_half_votes():
+    def ai(*tiers):
+        return [Neighbour(200 + i, 0.5, t, False, True) for i, t in enumerate(tiers)]
+
+    assert pick_tier(ai(1) * 10) == (1, 5.0)  # 5 v 5: tie goes to the cheaper tier
+    assert pick_tier(ai(1) * 9 + nb(2)) == (2, 5.5)  # one clean tier 2 tips it
+    assert pick_tier(ai(1) * 9 + nb(1)) == (1, 5.5)
+    assert pick_tier(ai(1, 1) + nb(1, 1, 1, 1, 1, 1, 1, 1)) == (1, 9.0)  # stray ones change nothing
+
+
+def test_reviewer_kickbacks_show_in_the_route_reason(store, proxy):
+    for i in range(30):
+        title, body = SMALL[i % len(SMALL)]
+        accepted(store, title, body, [1], kickback_first=True, by="reviewer")
+    for i in range(30):
+        title, body = SMALL[i % len(SMALL)]
+        accepted(store, title, body, [2])
+    fill_vectors(store, proxy)
+    t = new_ticket(store, "Fix typo in README intro", "The README intro says teh.")
+    r = route_knn(t, store=store, config=CONFIG, proxy=proxy, embedder=EMB, k=20)
+    assert r is not None and "+10 more" in r.reason  # the reason lists the first 10
+    assert " t1 ai kickback>half t2" in r.reason
+    assert r.tier == 2
+    assert "half votes after an AI reviewer kickback) -> tier 2" in r.reason
+
+
+def test_user_kickback_on_a_lower_tier_does_not_move_the_vote(store, proxy):
+    """Kicked back on tier 1, escalated, accepted cleanly on tier 2: votes tier 2, not 3."""
+    t = accepted(store, "Fix typo", "teh", [1, 2])
+    first = store.list_attempts(t.id)[0]
+    store.set_attempt_outcome(first.id, "kicked_back")
+    store.record_kickback(first.id, by="user", tag="wrong", note="no")
+    fill_vectors(store, proxy)
+    assert _pool_votes(store) == {t.id: 2}
+
+
+def test_user_kickback_on_the_top_tier_still_votes_the_top_tier(store, proxy):
+    t = accepted(store, "Refactor all", "everything", [3], kickback_first=True)
+    fill_vectors(store, proxy)
+    assert _pool_votes(store) == {t.id: 3}
+
+
+def test_pick_tier_counts_a_kicked_back_neighbour_one_tier_up():
+    def kb(*tiers):
+        return [Neighbour(100 + i, 0.5, t, True) for i, t in enumerate(tiers)]
+
+    assert pick_tier(nb(1, 1, 1, 1) + kb(1, 1, 1, 1, 1, 1)) == (2, 6)  # most needed a kickback
+    assert pick_tier(nb(1, 1, 1, 1, 1) + kb(1, 1, 1, 1, 1)) == (1, 5)  # tie → cheapest
+    assert pick_tier(nb(1, 1, 1, 1, 1, 1) + kb(1, 1, 1, 1)) == (1, 6)  # most were clean
+    assert pick_tier(kb(3, 3)) == (3, 2)  # nowhere above the top tier
+    assert Neighbour(1, 1.0, 2).vote_tier == 2 and Neighbour(1, 1.0, 2, True).vote_tier == 3
+
+
+def test_tier_that_needed_user_kickbacks_routes_similar_ticket_one_tier_up(store, proxy, spans):
+    history(store, small_kicked_back=True)
+    fill_vectors(store, proxy)
+    t = new_ticket(store, "Fix typo in README intro", "The README intro says teh.")
+    r = route_knn(t, store=store, config=CONFIG, proxy=proxy, embedder=EMB)
+    assert r is not None
+    assert (r.tier, r.source, r.requested_tier) == (2, "knn", 2)
+    ids = knn.matched_tickets(r)
+    assert len(ids) == 10
+    for tid in ids:
+        assert f"#{tid} t1 kicked back>t2" in r.reason
+    assert "tier 2 voted by 10 of 10 (10 moved up after a user kickback) -> tier 2" in r.reason
+    (route_s,) = [s for s in spans.get_finished_spans() if s.name == "route"]
+    assert list(route_s.attributes["route.matched_tickets"]) == ids
 
 
 def test_explore_start_counts_where_accepted(store, proxy):
