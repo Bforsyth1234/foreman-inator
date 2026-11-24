@@ -31,6 +31,11 @@ Readings shared by every metric (SPEC leaves these open; also listed in the item
   keeping a finished change mergeable after the base branch moved, not the model's
   answer to the issue. A rebase attempt that passes counts like any other, and every
   rebase attempt's cost stays in the ticket's spend (cost per accepted ticket).
+* **Set-aside attempts** (#53): an attempt the worker set aside, listed in the store's
+  ``worker:uncounted:<ticket>`` cursor (an attempt that could not run because its setup
+  failed, one paused at a spend cap, one restarted after a lock yield), is invisible the
+  same way, whatever its trigger: escalation does not count it (``Worker.history``), so
+  no model metric counts it either. Its cost stays in the ticket's spend.
 * **A ticket's start attempt** is its first visible attempt (lowest id). Ticket-level
   metrics are attributed to the start attempt's model: the model filter on a ticket
   metric means "tickets started on this model". Attempt-level metrics (kickbacks per
@@ -206,7 +211,7 @@ class FilterOptions:
 
 # scope: non-dropped tickets in the repo/date filter.
 # vis:   attempts that count against their model (failed explore and rebase attempts
-#        removed).
+#        and the worker's set-aside attempts removed).
 _SCOPE_VIS = """
 scope AS (
     SELECT t.* FROM tickets t
@@ -219,6 +224,11 @@ vis AS (
     SELECT a.* FROM attempts a JOIN scope s ON s.id = a.ticket_id
     WHERE NOT (a."trigger" = 'explore' AND a.outcome IN ('failed_checks', 'kicked_back'))
       AND NOT (a."trigger" = 'rebase' AND a.outcome IN ('failed_checks', 'superseded'))
+      AND NOT (a.outcome = 'superseded' AND EXISTS (
+          SELECT 1 FROM poll_cursors pc,
+              json_each(CASE WHEN json_valid(pc.value) THEN pc.value ELSE '[]' END) j
+          WHERE pc.repo = s.repo AND pc.name = 'worker:uncounted:' || a.ticket_id
+            AND j.value = a.id))
 )"""
 
 # started: one row per scoped ticket with a visible start attempt on the filter model.

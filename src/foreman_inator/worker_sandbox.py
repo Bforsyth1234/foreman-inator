@@ -19,6 +19,16 @@ Launch point                           Policy                        Network
 Scratch dirs live under ``~/.foreman-inator/sandbox/<key>`` (mode 700) and are removed
 after the launch. ``warm_up_opencode`` stays unsandboxed (it runs no model code).
 
+#45 (dependency install): unless the repo has ``sandbox_install = "off"``, every launch's
+scratch ``cache`` dir starts as a copy-on-write snapshot of the repo's package cache
+(``~/.foreman-inator/cache/<owner>/<name>``, ``runner.install``), and the cache itself is
+readable, so ``uv run``/``npm`` resolve offline; nothing a launch writes reaches the shared
+cache. Verify and review policies also carry an ``InstallPlan``: a reviewer's scratch
+worktree is installed (offline, under the review's policy) before its first check runs
+there; an attempt's worktree was installed by ``worker_install.prepare_worktree`` and is
+skipped by its marker. #54: every policy denies the worker's own venv and checkout, and
+every launch's environment drops the worker's ``VIRTUAL_ENV``/PATH entries.
+
 Fail closed: ``sandbox_ready`` is asked before an attempt row is written or a review
 starts. With ``sandbox = "on"`` and no usable backend (not macOS, no ``sandbox-exec``) it
 returns the backend's message; the caller hands the ticket to the user with
@@ -36,7 +46,7 @@ from typing import Any
 
 from foreman_inator import paths
 from foreman_inator.db.store import Ticket
-from foreman_inator.runner import sandbox
+from foreman_inator.runner import install, sandbox
 
 log = logging.getLogger("foreman_inator.worker")
 
@@ -50,7 +60,11 @@ class SandboxSteps:
 
     def sandbox_line(self) -> str:
         """The line ``fman status`` and the PR description show (decision 5)."""
-        return sandbox.describe(self.config.sandbox, dict(self.config.sandbox_network))
+        return sandbox.describe(
+            self.config.sandbox,
+            dict(self.config.sandbox_network),
+            dict(self.config.sandbox_install),
+        )
 
     def sandbox_ready(self, worktree: Path | str) -> str | None:
         """None when launches may go ahead; else why not (``SandboxUnavailable``)."""
@@ -69,17 +83,39 @@ class SandboxSteps:
         """The policy for one launch: ``wt_path`` read/write, its own scratch dir, and the
         network the launch point gets (writer: none but the proxy port, which the
         OpenCode driver fills in from the proxy URL)."""
+        plan = None if writer else self._install_plan(t)
         if self.config.sandbox == "off":  # no discovery work: every launch runs as is
             return sandbox.Policy(
-                worktree=Path(wt_path), scratch=paths.home() / "sandbox" / key, mode="off"
+                worktree=Path(wt_path),
+                scratch=paths.home() / "sandbox" / key,
+                mode="off",
+                install=plan,
             )
         scratch = self._sandbox_scratch(key)
         network = "none" if writer else self.config.sandbox_network_for(t.repo)
+        reads: list[Path] = []
+        if self.config.sandbox_install_for(t.repo) == "on":
+            cache = install.cache_root(t.repo)
+            install.snapshot(cache, scratch / "cache")
+            reads.append(cache)  # read-only: uv's cache keeps absolute links into it
         return sandbox.Policy.create(
             wt_path,
             scratch,
             mode=self.config.sandbox,
             network=network,  # type: ignore[arg-type]
+            reads=reads,
+            install=plan,
+        )
+
+    def _install_plan(self, t: Ticket) -> install.InstallPlan | None:
+        """#45: what a verify or review launch installs first in a worktree that has not
+        been installed yet (None: ``sandbox_install = "off"`` for the repo)."""
+        if self.config.sandbox_install_for(t.repo) == "off":
+            return None
+        settings = self.store.get_repo_settings(t.repo)  # type: ignore[attr-defined]
+        return install.InstallPlan(
+            override=settings.install_command if settings else None,
+            timeout=self.config.install_timeout_seconds,
         )
 
     def _sandbox_scratch(self, key: str) -> Path:

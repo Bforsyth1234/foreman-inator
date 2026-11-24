@@ -20,6 +20,10 @@ Shapes relied on (rule 12, read 2026-11-23):
 - ``GET /installation/repositories`` (installation token) -> ``total_count``,
   ``repositories[].full_name``.
   https://docs.github.com/en/rest/apps/installations#list-repositories-accessible-to-the-app-installation
+- ``GET /app/installations/{id}`` (App JWT) -> ``permissions``, ``repository_selection``
+  (``all`` | ``selected``), ``account.login``, ``account.type``, ``html_url`` (read
+  2026-11-24). GitHub's install page defaults to "All repositories" (seen live, #56).
+  https://docs.github.com/en/rest/apps/apps#get-an-installation-for-the-authenticated-app
 
 Everything GitHub-shaped lives in this file, so a change in the flow touches only it.
 The browser opener, the HTTP transport, the clock and sleep are injectable for tests.
@@ -323,12 +327,72 @@ def missing_permissions(granted: dict[str, str]) -> dict[str, str]:
     }
 
 
-def installation_permissions(auth: AppAuth, installation_id: int) -> dict[str, str]:
-    """``GET /app/installations/{id}`` (App JWT) -> the permissions that installation has
-    granted. https://docs.github.com/en/rest/apps/apps#get-an-installation-for-the-authenticated-app
-    (read 2026-11-23)."""
+@dataclass(frozen=True)
+class InstallationDetails:
+    """What ``GET /app/installations/{id}`` says about one installation (#41, #56)."""
+
+    id: int
+    permissions: dict[str, str]
+    #: "all" (GitHub's default on the install page) or "selected" (the user picked the
+    #: repos one by one); "" when GitHub did not say.
+    repository_selection: str = ""
+    account: str = ""
+    account_type: str = ""  # "User" or "Organization"
+    html_url: str = ""  # the installation's settings page (Repository access is there)
+
+
+def installation_details(auth: AppAuth, installation_id: int) -> InstallationDetails:
+    """``GET /app/installations/{id}`` (App JWT). Fields relied on: ``permissions``,
+    ``repository_selection`` (``all`` | ``selected``), ``account.login``, ``account.type``,
+    ``html_url``. https://docs.github.com/en/rest/apps/apps#get-an-installation-for-the-authenticated-app
+    (read 2026-11-23 for #41, 2026-11-24 for #56)."""
     data = auth._request("GET", f"/app/installations/{int(installation_id)}")
-    return {str(k): str(v) for k, v in (data.get("permissions") or {}).items()}
+    account = data.get("account") or {}
+    return InstallationDetails(
+        id=int(installation_id),
+        permissions={str(k): str(v) for k, v in (data.get("permissions") or {}).items()},
+        repository_selection=str(data.get("repository_selection") or ""),
+        account=str(account.get("login") or account.get("slug") or ""),
+        account_type=str(account.get("type") or ""),
+        html_url=str(data.get("html_url") or ""),
+    )
+
+
+def installation_permissions(auth: AppAuth, installation_id: int) -> dict[str, str]:
+    """The permissions that installation has granted (see ``installation_details``)."""
+    return installation_details(auth, installation_id).permissions
+
+
+def installation_settings_url(installation_id: int, *, org: str | None = None) -> str:
+    """The installation's settings page, where "Repository access" chooses between
+    "All repositories" and "Only select repositories". GitHub's own ``html_url`` is
+    preferred when known; this is its form for a personal account (``org=None``) or an
+    organization."""
+    owner = f"/organizations/{quote(org, safe='')}" if org else ""
+    return f"{GITHUB_URL}{owner}/settings/installations/{int(installation_id)}"
+
+
+def repository_access_text(details: Sequence[InstallationDetails | int]) -> str:
+    """How to narrow (or widen) which repos an installation can see, on GitHub."""
+    urls: list[str] = []
+    for d in details:
+        if isinstance(d, InstallationDetails):
+            org = d.account if d.account_type == "Organization" else None
+            urls.append(d.html_url or installation_settings_url(d.id, org=org))
+        else:
+            urls.append(installation_settings_url(d))
+    lines = [
+        "To change which repos the App can see, open the installation's settings, under"
+        " 'Repository access' choose 'Only select repositories', pick the repos and"
+        " 'Save':"
+    ]
+    lines += [f"  {u}" for u in urls] or [f"  {GITHUB_URL}/settings/installations"]
+    if not all(isinstance(d, InstallationDetails) and d.account_type for d in details):
+        lines.append(
+            "  (an installation on an organization is at"
+            f" {GITHUB_URL}/organizations/<org>/settings/installations/<id>)"
+        )
+    return "\n".join(lines)
 
 
 def permissions_upgrade_text(
@@ -399,12 +463,17 @@ def add_allowed_users(cfg: Config, users: Sequence[str]) -> Config:
     return replace(cfg, allowed_users=_merge(cfg.allowed_users, list(users)))
 
 
-def apply_installations(cfg: Config, installations: list[Installation], repos: list[str]) -> Config:
-    """Record installation ids and repos (existing entries are kept, new ones appended)."""
+def apply_installations(
+    cfg: Config, installations: list[Installation], repos: Sequence[str] = ()
+) -> Config:
+    """Record installation ids (existing entries kept, new ones appended), and append
+    ``repos`` when given. Since #56 ``fman setup`` passes no repos here: which repos the
+    worker works on is the user's choice (``setup.choose_repos``), never everything the
+    installation can see."""
     return replace(
         cfg,
         installation_ids=_merge(cfg.installation_ids, [i.id for i in installations]),
-        repos=_merge(cfg.repos, repos),
+        repos=_merge(cfg.repos, list(repos)),
     )
 
 
@@ -413,6 +482,7 @@ __all__ = [
     "PERMISSIONS",
     "AppCredentials",
     "CallbackServer",
+    "InstallationDetails",
     "ManifestFlowError",
     "add_allowed_users",
     "apply_app",
@@ -421,11 +491,14 @@ __all__ = [
     "convert_code",
     "default_app_name",
     "install_url",
+    "installation_details",
     "installation_permissions",
     "installation_repos",
+    "installation_settings_url",
     "missing_permissions",
     "new_app_url",
     "permissions_upgrade_text",
+    "repository_access_text",
     "start_page",
     "wait_for_installations",
 ]

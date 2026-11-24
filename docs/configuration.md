@@ -21,7 +21,7 @@ as `"keychain:foreman-inator/<name>"`.
 | `app_slug` | none | Your App's slug; the bot account is `<slug>[bot]`. Written by `fman setup`. |
 | `installation_ids` | `[]` | The App's installations. Written by `fman setup`. |
 | `allowed_users` | `[]` | GitHub logins whose labels, reviews and answers count (case-insensitive). Empty means no label starts work. |
-| `repos` | `[]` | Repos to poll, as `"owner/name"`. Setup adds every repo of the installation; remove the ones you do not want worked on. |
+| `repos` | `[]` | Repos to poll, as `"owner/name"`. Setup adds only the repos you choose; change the list with `fman repo add` and `fman repo remove`. |
 | `poll_interval_seconds` | `45` | Seconds between polls. At least 5. |
 | `reviewer_models` | `["claude-opus", "glm"]` | AI reviewer preference order, by model `name`. The first whose `family` differs from the writer's is used. Each name must be in `[[models]]`. |
 | `max_parallel_per_repo` | `1` | Tickets of one repo worked at the same time, as far as file locks permit. 1 to 16. 1 suits one local GPU. |

@@ -430,6 +430,14 @@ _FLAG_TEXT = {
         'sandbox, or set `sandbox = "off"` in config.toml only if you accept running '
         "model-written code unsandboxed."
     ),
+    "setup_failed": (
+        "foreman-inator could not start work on this issue: a setup step failed before "
+        "any model was asked to write code (the coding agent's server or session could "
+        "not start, the worktree could not be prepared, or the repository's dependencies "
+        "could not be installed). No model can fix that, so no other model was tried "
+        "and no model was charged. Fix the cause on the worker's Mac; the worker's log "
+        "has the details."
+    ),
     lifecycle.FLAG_REBASE_CAP: (
         "The pull request still conflicts with its base branch after the rebase attempts "
         "foreman-inator makes, so the conflict goes to you."

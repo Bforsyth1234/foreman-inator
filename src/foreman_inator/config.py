@@ -33,6 +33,9 @@ Layout (every key optional; missing keys take the defaults below)::
     [sandbox_network]    # per repo: "allow" opens outbound network for its verify + checks
     "you/project" = "none"
 
+    [sandbox_install]    # per repo (#45): "off" skips the dependency-install step
+    "you/project" = "on" # (default on: sandboxed, network to ports 443/80 for base files)
+
     [spend_caps]
     daily_usd = 5.0
     monthly_usd = 50.0
@@ -72,6 +75,7 @@ MIN_POLL_SECONDS = 5
 MAX_PARALLEL_PER_REPO = 16
 SANDBOX_MODES = ("on", "off")
 SANDBOX_NETWORKS = ("none", "allow")
+SANDBOX_INSTALLS = ("on", "off")
 
 Kind = Literal["local", "cloud"]
 
@@ -261,6 +265,15 @@ class Config:
     #: Stored as sorted ``(repo, network)`` pairs so Config stays hashable; a dict is
     #: accepted and converted.
     sandbox_network: tuple[tuple[str, str], ...] = ()
+    #: #45, per repo ("owner/name" -> "on" | "off"): "on" (the default for every repo)
+    #: installs a fresh worktree's dependencies before the writer starts, sandboxed, with
+    #: outbound network to ports 443/80 only while the worktree holds the base branch's
+    #: own files (offline after any model edit); "off" skips the step (no network at all
+    #: for that repo; verify then needs the dependencies some other way). Sorted pairs,
+    #: like ``sandbox_network``.
+    sandbox_install: tuple[tuple[str, str], ...] = ()
+    #: #45: bound on one dependency install (the step fails, and the ticket is flagged).
+    install_timeout_seconds: float = 900.0
     #: #44: before a ticket is routed, a small local model checks the issue can be worked
     #: on as written; if not, the worker asks on the issue (``needs-info``) and waits for
     #: an allowed user. False turns the check off.
@@ -285,9 +298,10 @@ class Config:
     experiments: ExperimentSettings = field(default_factory=ExperimentSettings)
 
     def __post_init__(self) -> None:
-        if isinstance(self.sandbox_network, Mapping):
-            pairs = tuple(sorted(self.sandbox_network.items()))
-            object.__setattr__(self, "sandbox_network", pairs)
+        for name in ("sandbox_network", "sandbox_install"):
+            value = getattr(self, name)
+            if isinstance(value, Mapping):
+                object.__setattr__(self, name, tuple(sorted(value.items())))
         _validate(self)
 
     def model(self, name: str) -> ModelEndpoint:
@@ -336,6 +350,12 @@ class Config:
         lowered = {k.lower(): v for k, v in self.sandbox_network}
         return lowered.get(repo.lower(), "none")
 
+    def sandbox_install_for(self, repo: str) -> str:
+        """``"on"`` (default) or ``"off"``: whether ``repo``'s worktrees get the
+        dependency-install step (#45)."""
+        lowered = {k.lower(): v for k, v in self.sandbox_install}
+        return lowered.get(repo.lower(), "on")
+
 
 # --------------------------------------------------------------------------- validation
 
@@ -364,6 +384,15 @@ def _validate(cfg: Config) -> None:
             raise ConfigError(
                 f"sandbox_network.{repo} must be one of {', '.join(SANDBOX_NETWORKS)}"
             )
+    for repo, inst in cfg.sandbox_install:
+        if not re.match(r"^[\w.-]+/[\w.-]+$", repo):
+            raise ConfigError(f"sandbox_install: repo {repo!r} must look like 'owner/name'")
+        if inst not in SANDBOX_INSTALLS:
+            raise ConfigError(
+                f"sandbox_install.{repo} must be one of {', '.join(SANDBOX_INSTALLS)}"
+            )
+    if not 0 < cfg.install_timeout_seconds <= 24 * 3600:
+        raise ConfigError("install_timeout_seconds must be > 0 and <= 86400")
     _validate_learning(cfg)
     names = [m.name for m in cfg.models]
     if len(set(names)) != len(names):
@@ -543,12 +572,16 @@ def from_dict(data: Mapping[str, Any]) -> Config:
         kw["sandbox"] = _typed(data["sandbox"], str, "sandbox")
     if "clarify" in data:
         kw["clarify"] = _typed(data["clarify"], bool, "clarify")
-    if "sandbox_network" in data:
-        nets = _typed(data["sandbox_network"], dict, "sandbox_network")
-        kw["sandbox_network"] = {
-            _typed(k, str, "sandbox_network"): _typed(v, str, f"sandbox_network.{k}")
-            for k, v in nets.items()
-        }
+    for table in ("sandbox_network", "sandbox_install"):
+        if table in data:
+            raw = _typed(data[table], dict, table)
+            kw[table] = {
+                _typed(k, str, table): _typed(v, str, f"{table}.{k}") for k, v in raw.items()
+            }
+    if "install_timeout_seconds" in data:
+        kw["install_timeout_seconds"] = float(
+            _typed(data["install_timeout_seconds"], (int, float), "install_timeout_seconds")
+        )
     _learning_from_dict(data, kw)
     if "spend_caps" in data:
         caps = _typed(data["spend_caps"], dict, "spend_caps")
@@ -614,6 +647,9 @@ def to_dict(cfg: Config) -> dict[str, Any]:
     out["clarify"] = cfg.clarify
     if cfg.sandbox_network:
         out["sandbox_network"] = dict(cfg.sandbox_network)
+    if cfg.sandbox_install:
+        out["sandbox_install"] = dict(cfg.sandbox_install)
+    out["install_timeout_seconds"] = cfg.install_timeout_seconds
     for key in _LEARNING_TYPES:
         if getattr(cfg, key) is not None:
             out[key] = getattr(cfg, key)
@@ -630,6 +666,19 @@ def to_dict(cfg: Config) -> dict[str, Any]:
         for m in cfg.models
     ]
     return out
+
+
+#: #56: above this many repos, the worker's startup log warns and setup says so. Each
+#: configured repo costs at least one issue listing per poll (80 an hour at the default
+#: 45 s), so 20 repos are about 1,600 requests an hour while idle: a third of an
+#: installation's 5,000-an-hour floor, and more repos than one person reviews PRs for.
+REPOS_WARN_THRESHOLD = 20
+
+
+def listing_requests_per_hour(repos: int, poll_interval_seconds: float) -> int:
+    """GitHub requests an hour spent on the per-repo issue listing alone (one per repo
+    per poll; ``github/poller.py`` adds more per open ticket)."""
+    return round(repos * 3600 / max(1.0, float(poll_interval_seconds)))
 
 
 def load(path: Path | None = None) -> Config:
@@ -656,6 +705,7 @@ def save(cfg: Config, path: Path | None = None) -> Path:
 __all__ = [
     "KEYCHAIN_SERVICE",
     "KEY_REF_PREFIX",
+    "REPOS_WARN_THRESHOLD",
     "Config",
     "ConfigError",
     "ExperimentSettings",
@@ -664,6 +714,7 @@ __all__ = [
     "default_models",
     "from_dict",
     "key_ref",
+    "listing_requests_per_hour",
     "load",
     "parse_key_ref",
     "resolve_key",

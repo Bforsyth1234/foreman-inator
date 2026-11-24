@@ -217,10 +217,12 @@ def server_env(
     cache_home: Path,
     password: str,
 ) -> dict[str, str]:
-    """The `opencode serve` environment: the user's env minus credentials, plus isolation."""
+    """The `opencode serve` environment: the user's env minus credentials and minus the
+    worker's own Python environment (#54: its venv on PATH, VIRTUAL_ENV and the other
+    activation variables, sandboxed or not), plus isolation."""
     env = {
         k: v
-        for k, v in base.items()
+        for k, v in sandbox_mod.scrub_worker_env(base).items()
         if not _SECRET_NAME.search(k) and not k.startswith(_DROP_PREFIXES) and k not in _DROP_NAMES
     }
     env.update(

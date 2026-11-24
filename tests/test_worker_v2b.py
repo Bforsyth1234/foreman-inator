@@ -111,9 +111,9 @@ def test_sandbox_on_line_in_status(tmp_path: Path) -> None:
         from foreman_inator.config import Config
 
         cfg = Config(sandbox_network={"a/b": "allow"})
-        assert render_status(store, config=cfg).splitlines()[-1] == (
-            "Sandbox: on (sandbox-exec); network open for a/b."
-        )
+        line = render_status(store, config=cfg).splitlines()[-1]
+        assert line.startswith("Sandbox: on (sandbox-exec); network open for a/b.")
+        assert "Dependency install: sandboxed" in line  # the install sentence (#45)
     finally:
         store.close()
 

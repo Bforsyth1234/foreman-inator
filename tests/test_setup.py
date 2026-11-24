@@ -65,6 +65,13 @@ class FakeGitHub:
         self.installation_polls = 0
         self.installed_after = 2  # the App shows up on the second poll
         self.pulled = pulled if pulled is not None else ["inkling-2-mini:latest", "qwen3.8:27b"]
+        # /installation/repositories pages; three repos picked one by one by default (#56)
+        self.pages = [["octocat/one", "octocat/two"], ["octocat/three"]]
+        self.selection = "selected"
+
+    def set_repos(self, names: list[str], selection: str = "all") -> None:
+        self.pages = [names[i : i + 100] for i in range(0, len(names), 100)] or [[]]
+        self.selection = selection
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
@@ -103,13 +110,25 @@ class FakeGitHub:
             return httpx.Response(
                 201, json={"token": "ghs_fake", "expires_at": "2099-01-01T00:00:00Z"}
             )
+        if path == "/app/installations/77" and request.method == "GET":
+            return httpx.Response(
+                200,
+                json={
+                    "id": 77,
+                    "permissions": dict(manifest.PERMISSIONS),
+                    "repository_selection": self.selection,
+                    "account": {"login": "octocat", "type": "User"},
+                    "html_url": "https://github.com/settings/installations/77",
+                },
+            )
         if path == "/installation/repositories":
             assert request.headers["Authorization"] == "Bearer ghs_fake"
             page = int(url.params.get("page", "1"))
-            repos = [["octocat/one", "octocat/two"], ["octocat/three"]][page - 1]
+            repos = self.pages[page - 1] if page <= len(self.pages) else []
+            total = sum(len(p) for p in self.pages)
             return httpx.Response(
                 200,
-                json={"total_count": 3, "repositories": [{"full_name": r} for r in repos]},
+                json={"total_count": total, "repositories": [{"full_name": r} for r in repos]},
             )
         return httpx.Response(404, json={"message": f"no fake for {request.method} {path}"})
 
@@ -490,7 +509,14 @@ def test_setup_command_is_typer_registrable(tmp_path, monkeypatch):
     plain_env = {"NO_COLOR": "1", "TERM": "dumb", "COLUMNS": "200"}
     raw_help = CliRunner().invoke(app, ["setup", "--help"], env=plain_env).output
     help_text = re.sub(r"\x1b\[[0-9;]*m", "", raw_help)
-    for flag in ("--uninstall-service", "--org", "--app-name", "--allowed-user", "--no-service"):
+    for flag in (
+        "--uninstall-service",
+        "--org",
+        "--app-name",
+        "--allowed-user",
+        "--no-service",
+        "--repo",  # #56
+    ):
         assert flag in help_text
 
 
@@ -522,3 +548,178 @@ def test_setup_prints_the_permissions_upgrade_for_an_old_app(tmp_path, pem):
     text = "\n".join(out)
     assert "missing permissions" in text and "Checks: read" in text and "Actions: read" in text
     assert "/settings/installations/77" in text
+
+
+# --- which repos (#56) ----------------------------------------------------------------
+
+MANY = [f"octocat/r{i}" for i in range(1, 142)]  # the live run: 141 repos, "All repositories"
+
+
+def _quiet_setup(tmp_path, gh, *, out=None, **kw):
+    """Setup without the launchd step; ``out`` collects what it prints."""
+    return run_setup(
+        opener=Browser(),
+        echo=(out.append if out is not None else lambda s: None),
+        transport=httpx.MockTransport(gh),
+        api_url="https://api.github.test",
+        install_service=False,
+        which=fake_which(TOOLS),
+        run=fake_run(TOOL_OUT),
+        callback_timeout=10,
+        sleep=lambda s: None,
+        **kw,
+    )
+
+
+def _never_ask(question: str) -> str:
+    raise AssertionError(f"setup asked: {question}")
+
+
+def test_first_setup_on_all_repositories_adds_none_without_a_choice(tmp_path, pem):
+    gh = FakeGitHub(pem)
+    gh.set_repos(MANY, selection="all")
+    out: list[str] = []
+    _quiet_setup(tmp_path, gh, out=out)  # no ask: no terminal
+    cfg = config.load()
+    assert cfg.repos == ()
+    assert cfg.installation_ids == (77,)
+    text = "\n".join(out)
+    assert "can see 141 repo(s); none were added" in text
+    assert "fman repo add OWNER/NAME" in text and "fman setup --repo OWNER/NAME" in text
+    # how to narrow the installation itself, with GitHub's own settings URL
+    assert "Repository access" in text and "Only select repositories" in text
+    assert "https://github.com/settings/installations/77" in text
+
+
+def test_first_setup_with_repo_option_adds_exactly_those(tmp_path, pem):
+    gh = FakeGitHub(pem)
+    gh.set_repos(MANY, selection="all")
+    out: list[str] = []
+    _quiet_setup(
+        tmp_path,
+        gh,
+        out=out,
+        repos=["octocat/r5", "OCTOCAT/R7", "octocat/r5", "ghost/nope"],
+        ask=_never_ask,
+    )
+    # GitHub's spelling, de-duplicated; a repo the installation cannot see is refused
+    assert config.load().repos == ("octocat/r5", "octocat/r7")
+    text = "\n".join(out)
+    assert "cannot see: ghost/nope" in text
+    assert "settings/installations/77" in text
+
+
+def test_first_setup_prompt_adds_exactly_the_chosen(tmp_path, pem):
+    gh = FakeGitHub(pem)
+    gh.set_repos(MANY, selection="all")
+    asked: list[str] = []
+    answers = iter(["3, nobody/else 999", "3 octocat/r10"])  # first answer has bad entries
+
+    def ask(question: str) -> str:
+        asked.append(question)
+        return next(answers)
+
+    out: list[str] = []
+    _quiet_setup(tmp_path, gh, out=out, ask=ask)
+    assert config.load().repos == ("octocat/r3", "octocat/r10")
+    assert len(asked) == 2 and "Enter for none" in asked[0]
+    text = "\n".join(out)
+    assert "can see 141 repo(s):" in text and "141. octocat/r141" in text
+    assert "Not in the list: 999, nobody/else" in text
+
+
+def test_first_setup_prompt_defaults_to_none(tmp_path, pem):
+    gh = FakeGitHub(pem)
+    gh.set_repos(MANY, selection="all")
+    out: list[str] = []
+    _quiet_setup(tmp_path, gh, out=out, ask=lambda q: "")
+    assert config.load().repos == ()
+    assert "No repos chosen yet" in "\n".join(out)
+
+
+def test_a_few_repos_on_all_repositories_still_ask(tmp_path, pem):
+    """Few repos, but the installation covers "All repositories": not a choice."""
+    gh = FakeGitHub(pem)
+    gh.set_repos(["octocat/a", "octocat/b"], selection="all")
+    _quiet_setup(tmp_path, gh)
+    assert config.load().repos == ()
+    gh2 = FakeGitHub(pem)
+    gh2.set_repos(["octocat/a", "octocat/b"], selection="all")
+    paths.config_path().unlink()  # start over as a first run
+    _quiet_setup(tmp_path, gh2, ask=lambda q: "2")
+    assert config.load().repos == ("octocat/b",)
+
+
+def test_a_few_repos_picked_on_github_are_added(tmp_path, pem):
+    out: list[str] = []
+    _quiet_setup(tmp_path, FakeGitHub(pem), out=out, ask=_never_ask)
+    assert config.load().repos == ("octocat/one", "octocat/two", "octocat/three")
+    assert "you selected on GitHub" in "\n".join(out)
+
+
+def test_rerun_setup_leaves_a_hand_trimmed_repo_list_byte_for_byte(tmp_path, pem):
+    """The regression from the first live run (#56): setup wrote all 141 repos, the user
+    cut the list to one by hand, and re-running setup (to install the launchd agents)
+    put them all back."""
+    gh = FakeGitHub(pem)
+    gh.set_repos(MANY, selection="all")
+    _quiet_setup(tmp_path, gh, repos=MANY)  # the old behaviour's result: every repo
+    path = paths.config_path()
+    before = path.read_text()
+    assert before.count("octocat/r") == 141
+    trimmed = re.sub(r"(?ms)^repos = \[.*?\]$", 'repos = [ "octocat/r9" ] # just this one', before)
+    assert trimmed != before
+    path.write_text(trimmed)
+    raw = path.read_bytes()
+
+    gh2 = FakeGitHub(pem)
+    gh2.set_repos([*MANY, "octocat/brand-new"], selection="all")  # one more since
+    out: list[str] = []
+    _quiet_setup(tmp_path, gh2, out=out, ask=_never_ask)  # a terminal, but no question
+    assert path.read_bytes() == raw
+    assert config.load().repos == ("octocat/r9",)
+    text = "\n".join(out)
+    assert "left as they are (1): octocat/r9" in text
+    assert "141 more repo(s) the installation can see are not in config.toml" in text
+
+
+def test_rerun_with_repo_option_replaces_the_list(tmp_path, pem):
+    gh = FakeGitHub(pem)
+    _quiet_setup(tmp_path, gh)
+    assert config.load().repos == ("octocat/one", "octocat/two", "octocat/three")
+    _quiet_setup(tmp_path, FakeGitHub(pem), repos=["octocat/two"])
+    assert config.load().repos == ("octocat/two",)
+
+
+def test_parse_choice():
+    from foreman_inator.setup import parse_choice
+
+    avail = ["a/one", "a/two", "B/Three"]
+    assert parse_choice("", avail) == ([], [])
+    assert parse_choice("2, b/three  1", avail) == (["a/two", "B/Three", "a/one"], [])
+    assert parse_choice("all", avail) == (avail, [])
+    assert parse_choice("0 4 x/y", avail) == ([], ["0", "4", "x/y"])
+
+
+def test_setup_command_without_a_terminal_never_asks(monkeypatch):
+    import typer
+    from typer.testing import CliRunner
+
+    import foreman_inator.setup as setup_pkg
+
+    seen: list[dict] = []
+    monkeypatch.setattr(setup_pkg, "run_setup", lambda **kw: seen.append(kw))
+    app = typer.Typer()
+    app.command("setup")(setup_pkg.setup_command)
+
+    @app.command("other")
+    def other() -> None: ...
+
+    runner = CliRunner()
+    assert runner.invoke(app, ["setup", "--no-service"]).exit_code == 0
+    assert seen[-1]["ask"] is None and seen[-1]["repos"] is None
+    res = runner.invoke(app, ["setup", "--repo", "a/b", "--repo", "c/d"])
+    assert res.exit_code == 0, res.output
+    assert seen[-1]["repos"] == ["a/b", "c/d"]
+    bad = runner.invoke(app, ["setup", "--repo", "not-a-repo"])
+    assert bad.exit_code == 2 and len(seen) == 2

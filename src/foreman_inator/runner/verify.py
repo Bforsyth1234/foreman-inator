@@ -17,6 +17,12 @@ Sandbox (#40): ``run(..., sandbox=policy)`` runs the command under ``runner.sand
 ``sandbox.SandboxUnavailable`` when the sandbox is on and cannot run, raised before
 anything starts (fail closed; the worker flags the ticket). No ``sandbox`` (the default)
 runs the command exactly as before.
+
+#54: the child's environment never carries the worker's own Python environment
+(``sandbox.scrub_worker_env``: ``VIRTUAL_ENV`` and the other activation variables, the
+worker's venv on ``PATH``), sandbox on or off. #45: a policy carrying an
+``install.InstallPlan`` (the reviewer's checks) first installs the worktree's dependencies
+once, under that policy; a failed install is a failed run with the install log's tail.
 """
 
 from __future__ import annotations
@@ -271,6 +277,10 @@ def run(
     cwd = Path(cwd)
     out = Path(output_path) if output_path is not None else cwd / ".fman-verify.log"
     out.parent.mkdir(parents=True, exist_ok=True)
+    if sandbox is not None and sandbox.install is not None:
+        failed = _install_first(cmd, cwd, sandbox, out, cancel)
+        if failed is not None:
+            return failed
     full_env = _child_env(env)
     argv, full_env, missing = _sandboxed(cmd.argv, cwd, full_env, sandbox)
     start = time.monotonic()
@@ -322,6 +332,41 @@ def run(
     )
 
 
+def _install_first(
+    cmd: VerifyCommand,
+    cwd: Path,
+    policy: Policy,
+    out: Path,
+    cancel: threading.Event | None,
+) -> VerifyResult | None:
+    """#45: a policy carrying an ``InstallPlan`` (the reviewer's checks) installs ``cwd``'s
+    dependencies once, under the same policy, before the first command there. None when
+    that went fine (or there was nothing to do); else the failed result, with the
+    install log's tail in ``out``. The install log goes next to ``out``."""
+    from foreman_inator.runner import install as install_mod
+
+    log_path = out.with_name(f"{out.stem}-install.log")
+    start = time.monotonic()
+    try:
+        install_mod.ensure(policy.install, cwd, policy, log_path=log_path, cancel=cancel)
+    except install_mod.InstallFailed as exc:
+        out.write_text(
+            f"$ {cmd.display}\nforeman-inator: not run: {exc.reason}\n{exc.detail}\n",
+            encoding="utf-8",
+        )
+        return VerifyResult(
+            passed=False,
+            tests_run=None,
+            tests_failed=None,
+            output_path=out,
+            exit_code=None,
+            timed_out=False,
+            seconds=time.monotonic() - start,
+            command=cmd.display,
+        )
+    return None
+
+
 def _sandboxed(
     argv: Sequence[str], cwd: Path, env: dict[str, str], policy: Policy | None
 ) -> tuple[list[str], dict[str, str], bool]:
@@ -360,7 +405,8 @@ def _wait(proc: subprocess.Popen[bytes], timeout: float, cancel: threading.Event
 
 
 def _child_env(extra: Mapping[str, str] | None) -> dict[str, str]:
-    env = dict(os.environ)
+    # #54: never the worker's own venv (PATH) or activation variables, sandbox on or off.
+    env = sandbox_mod.scrub_worker_env(os.environ)
     env.update({"CI": "1", "NO_COLOR": "1", "FORCE_COLOR": "0", "TERM": "dumb"})
     if extra:
         env.update(extra)

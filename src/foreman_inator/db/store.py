@@ -221,6 +221,7 @@ class RepoSettings:
     verify_command: str | None
     verify_prompted_at: datetime | None
     updated_at: datetime
+    install_command: str | None = None  # migration 006 (#45)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1093,6 +1094,21 @@ class Store:
                 " ON CONFLICT (repo) DO UPDATE SET verify_command = excluded.verify_command,"
                 " updated_at = excluded.updated_at",
                 (repo, verify_command, now),
+            )
+        settings = self.get_repo_settings(repo)
+        assert settings is not None
+        return settings
+
+    def set_install_command(self, repo: str, install_command: str | None) -> RepoSettings:
+        """Save ``repo``'s dependency-install command (#45); None clears it (detected
+        again from the lockfiles)."""
+        now = _ts(self.now())
+        with self.transaction() as conn:
+            conn.execute(
+                "INSERT INTO repo_settings (repo, install_command, updated_at) VALUES (?, ?, ?)"
+                " ON CONFLICT (repo) DO UPDATE SET install_command = excluded.install_command,"
+                " updated_at = excluded.updated_at",
+                (repo, install_command, now),
             )
         settings = self.get_repo_settings(repo)
         assert settings is not None

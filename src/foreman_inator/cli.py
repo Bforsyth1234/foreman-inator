@@ -2,7 +2,8 @@
 
 Commands: ``setup`` (#8), ``config set-key`` (#2), ``run`` and ``status`` and
 ``repo set-verify`` (#14), ``metrics`` and ``approve-spend`` (#21), ``experiment run |
-status | promote`` and ``replay`` (#29). Later waves add ``@app.command()`` functions here.
+status | promote`` and ``replay`` (#29), ``repo add | remove | list`` (#56). Later waves
+add ``@app.command()`` functions here.
 
 The callback below keeps `app` a multi-command group, so adding commands
 never changes how `--version` works.
@@ -93,9 +94,11 @@ def status_command(
         typer.echo("No tickets yet (the worker has not created its database).")
         with contextlib.suppress(config_mod.ConfigError):
             from foreman_inator.runner import sandbox
+            from foreman_inator.worker_status import repos_line
 
             c = config_mod.load()
-            line = sandbox.describe(c.sandbox, dict(c.sandbox_network))  # type: ignore[arg-type]
+            typer.echo(repos_line(c))
+            line = sandbox.describe(c.sandbox, dict(c.sandbox_network), dict(c.sandbox_install))  # type: ignore[arg-type]
             typer.echo(f"!!! {line} !!!" if c.sandbox == "off" else line)
         return
     try:
@@ -167,8 +170,60 @@ def approve_spend_command(
     )
 
 
-repo_app = typer.Typer(help="Per-repo settings kept in the worker's database.")
+repo_app = typer.Typer(
+    help="Which repos the worker works on (config.toml) and per-repo settings (database)."
+)
 app.add_typer(repo_app, name="repo")
+
+_REPOS_ARG = typer.Argument(help="One or more owner/name.", show_default=False)
+
+
+@repo_app.command("add")
+def repo_add(
+    repos: Annotated[list[str], _REPOS_ARG],
+    no_check: Annotated[
+        bool,
+        typer.Option(
+            "--no-check", help="Add without checking that the App's installation can see it."
+        ),
+    ] = False,
+) -> None:
+    """Add repos to the list the worker polls (config.toml).
+
+    Refused when the App's installation cannot see a repo (then nothing is added). The
+    running worker picks the change up when restarted."""
+    from foreman_inator.setup import repo_add_command
+
+    raise typer.Exit(repo_add_command(repos, check=not no_check, echo=typer.echo))
+
+
+@repo_app.command("remove")
+def repo_remove(repos: Annotated[list[str], _REPOS_ARG]) -> None:
+    """Take repos out of the list the worker polls (config.toml).
+
+    Their tickets stay in the database and nothing on GitHub changes; once restarted, the
+    worker stops polling the repo and starts no work on its tickets."""
+    from foreman_inator.setup import repo_remove_command
+
+    raise typer.Exit(repo_remove_command(repos, echo=typer.echo))
+
+
+@repo_app.command("list")
+def repo_list(
+    available: Annotated[
+        bool,
+        typer.Option(
+            "--available", help="Also list the repos the installation can see but not configured."
+        ),
+    ] = False,
+    no_check: Annotated[
+        bool, typer.Option("--no-check", help="Do not ask GitHub what the installation covers.")
+    ] = False,
+) -> None:
+    """The repos in config.toml, marking any the App's installation no longer covers."""
+    from foreman_inator.setup import repo_list_command
+
+    raise typer.Exit(repo_list_command(available=available, check=not no_check, echo=typer.echo))
 
 
 @repo_app.command("set-verify")
@@ -198,6 +253,37 @@ def repo_set_verify(
     typer.echo(f"Saved. {repo} is verified with: {command}")
     if cleared:
         typer.echo(f"Unflagged ticket(s) {', '.join(f'#{i}' for i in cleared)}; work resumes.")
+
+
+@repo_app.command("set-install")
+def repo_set_install(
+    repo: Annotated[str, typer.Argument(help="owner/name")],
+    command: Annotated[
+        str | None,
+        typer.Argument(
+            help="Shell command that installs the dependencies, e.g. 'uv sync --frozen'."
+        ),
+    ] = None,
+    clear: Annotated[bool, typer.Option("--clear", help="Forget the saved command.")] = False,
+) -> None:
+    """Save the command that installs REPO's dependencies in a fresh worktree."""
+    import re
+
+    from foreman_inator import paths
+    from foreman_inator.db.store import Store
+
+    if not re.match(r"^[\w.-]+/[\w.-]+$", repo):
+        raise typer.BadParameter("repo must look like owner/name")
+    if not clear and not (command and command.strip()):
+        raise typer.BadParameter("give a command, or --clear")
+    with Store(paths.db_path()) as store:
+        store.set_install_command(repo, None if clear else (command or "").strip())
+    if clear:
+        typer.echo(
+            f"Cleared the install command for {repo}; it will be detected from the lockfiles again."
+        )
+        return
+    typer.echo(f"Saved. {repo}'s worktrees are prepared with: {command}")
 
 
 experiment_app = typer.Typer(

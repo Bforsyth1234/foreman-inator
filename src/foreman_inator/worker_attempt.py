@@ -18,15 +18,22 @@ Attempt (``attempt_job``), in order:
 6. ``AttemptStarted`` + the attempt row in one transaction, then the writer prompt from
    the writer champion's prompt file (#24, ``writer_template``) and the attempt's
    registered variant id;
-7. inside ``attempt_span`` and a ``Recorder``: ``_launch_writer`` (OpenCode, sandboxed),
-   the worker's own commit, the diff, ``_launch_verify`` (sandboxed) inside
-   ``verify_span``; a rebase attempt whose conflicted files still hold markers fails its
-   checks without running verify;
+7. inside ``attempt_span`` and a ``Recorder``: ``prepare_worktree`` (the seam for #45's
+   dependency install; a no-op here), ``_launch_writer`` (OpenCode, sandboxed), the
+   worker's own commit, the diff, ``_launch_verify`` (sandboxed) inside ``verify_span``;
+   a rebase attempt whose conflicted files still hold markers fails its checks without
+   running verify;
 8. a spend refusal during the run → the attempt is set aside (uncounted) and the ticket
    pauses; otherwise the attempt's diff widens its file locks (#19), and if another
    ticket holds one of those files the attempt waits before publishing;
 9. ``ChecksFailed`` → escalation on the next pass (a rebase attempt: another rebase or
    the flag), or publish → CI gate → AI review.
+
+Could not run (#53, ``worker_setup``): a worktree that cannot be created, a
+``SetupFailed`` from ``prepare_worktree``, or a writer run that never reached the model
+(``worker_setup.could_not_run``; one immediate re-run first) is not failed checks: the
+attempt is set aside (uncounted, like a spend pause) and the ticket is flagged once
+``setup_failed: <what>: <detail>``. No escalation, no retry, no cloud call.
 """
 
 from __future__ import annotations
@@ -62,6 +69,13 @@ from foreman_inator.worker_policy import (
     start_from,
 )
 from foreman_inator.worker_sandbox import FLAG_SANDBOX
+from foreman_inator.worker_setup import (
+    RETRIED_ONCE,
+    WORKTREE,
+    WRITER_SETUP_TRIES,
+    SetupFailed,
+    setup_failure,
+)
 
 if TYPE_CHECKING:
     from foreman_inator.worker_queue import Job
@@ -105,6 +119,16 @@ class AttemptSteps:
     # ------------------------------------------------------------------ seams
     # ``before_route`` (#44) lives in ``worker_clarify``; the sandbox policy in
     # ``worker_sandbox``.
+
+    def prepare_worktree(self, ticket: Ticket, attempt: Attempt, worktree: Worktree) -> None:
+        """Seam for #45 (dependency install): called once per attempt (and per rebase
+        attempt), after the attempt's worktree exists and its row is stored, before the
+        writer is launched. A no-op here; a mixin earlier in ``Worker``'s bases overrides
+        it. Raise ``worker_setup.SetupFailed(reason, detail)`` when the worktree cannot
+        be made ready: the attempt is set aside (not counted against its model) and the
+        ticket is flagged ``setup_failed: <reason>: <detail>`` once, with no escalation
+        and no re-run. Any other exception is a crash of the job, as before."""
+        return None
 
     def _launch_writer(self, *, ticket: Ticket, **kw: Any) -> Any:
         """Process launch point 1 of 3 (#40): the OpenCode session, under the attempt's
@@ -171,14 +195,19 @@ class AttemptSteps:
         _write_excludes(mirror)
         ordinal = len(self.store.list_attempts(ticket.id)) + 1
         counted = list(self.history(ticket).attempts)  # type: ignore[attr-defined]
-        wt = mirror.create(
-            ticket.base_branch,
-            ticket.issue_number,
-            ordinal,
-            token=token,
-            fetch=False,
-            start_point=_start_point(mirror, ticket, counted),
-        )
+        try:
+            wt = mirror.create(
+                ticket.base_branch,
+                ticket.issue_number,
+                ordinal,
+                token=token,
+                fetch=False,
+                start_point=_start_point(mirror, ticket, counted),
+            )
+        except WorktreeError as exc:
+            # #53: no attempt row yet; nothing to set aside, the flag stops the ticket.
+            self.flag_setup_failed(ticket, None, SetupFailed(WORKTREE, str(exc)))
+            return
         _remove_old_worktrees(mirror, ticket, ordinal)
         settings = self.store.get_repo_settings(ticket.repo)
         cmd = verify_mod.detect(wt.path, override=settings.verify_command if settings else None)
@@ -246,6 +275,10 @@ class AttemptSteps:
                 ticket.id, lifecycle.HandedToUser(ticket.id, f"{FLAG_SANDBOX}: {exc}")
             )
             return None
+        except SetupFailed as exc:
+            # #53: the attempt could not run; no model is to blame, so nothing escalates.
+            self.flag_setup_failed(ticket, att, exc)
+            return None
         except Exception:
             if self.store.get_attempt(att.id).ended_at is None:
                 self.store.finish_attempt(att.id, "superseded")
@@ -289,6 +322,17 @@ class AttemptSteps:
             return True
         self.publish_job_for(ticket.id, att, verify=vr, diff=diff, cancel=cancel)  # type: ignore[attr-defined]
         return True
+
+    def flag_setup_failed(self, ticket: Ticket, att: Attempt | None, exc: SetupFailed) -> None:
+        """#53: set the attempt aside (stored ``superseded``, uncounted: out of
+        ``Worker.history`` and the per-model metrics) and flag the ticket once with what
+        failed. A flagged ticket gets no job until the user acts."""
+        if att is not None:
+            self.set_aside(ticket, att, f"it could not run ({exc.reason})")  # type: ignore[attr-defined]
+        log.warning("ticket %d: the attempt could not run (%s); flagged for you", ticket.id, exc)
+        self._event(  # type: ignore[attr-defined]
+            ticket.id, lifecycle.HandedToUser(ticket.id, exc.flag_reason)
+        )
 
     def _sandbox_refused(self, ticket: Ticket, wt: Worktree) -> bool:
         """#40 fail closed, before an attempt row exists: flag the ticket, count nothing."""
@@ -352,16 +396,22 @@ class AttemptSteps:
                 tier=att.tier,
             ) as rec,
         ):
-            result = self._launch_writer(
-                ticket=ticket,
-                attempt_id=att.id,
-                worktree=wt,
-                prompt=prompt.text,
-                endpoint=endpoint,
-                proxy_base_url=self.proxy.base_url(att.id),
-                timeout=self.attempt_timeout,
-                cancel=cancel,
-            )
+            try:
+                self.prepare_worktree(ticket, att, wt)
+                result = self._launch_writer_once_more(
+                    ticket=ticket,
+                    attempt_id=att.id,
+                    worktree=wt,
+                    prompt=prompt.text,
+                    endpoint=endpoint,
+                    proxy_base_url=self.proxy.base_url(att.id),
+                    timeout=self.attempt_timeout,
+                    cancel=cancel,
+                )
+            except SetupFailed as exc:
+                span.set_attribute("attempt.outcome", "setup_failed")
+                rec.close("superseded", stopped_reason="setup_failed", error=str(exc))
+                raise
             if cancel.is_set() or getattr(result, "cancelled", False):
                 self._supersede(att, rec)
             head = wt.commit_all(
@@ -426,6 +476,39 @@ class AttemptSteps:
             diff.diff_lines,
         )
         return att, passed, vr, diff
+
+    def _launch_writer_once_more(self, **kw: Any) -> Any:
+        """``_launch_writer``, with exactly one immediate re-run when the run could not
+        start (``worker_setup.could_not_run``: no server, no session, the prompt not
+        sent, and no model call). Raises ``SetupFailed`` when the last launch could not
+        run either; returns the result otherwise (a cancelled run is returned as is)."""
+        failure: SetupFailed | None = None
+        for n in range(1, WRITER_SETUP_TRIES + 1):
+            result = self._launch_writer(**kw)
+            cancel = kw.get("cancel")
+            if cancel is not None and cancel.is_set():
+                return result
+            failure = setup_failure(result, proxy_tokens=self._proxy_tokens(kw["attempt_id"]))
+            if failure is None:
+                return result
+            if failure.reason not in RETRIED_ONCE:
+                break
+            if n < WRITER_SETUP_TRIES:
+                log.warning(
+                    "ticket %d: attempt %d could not start the coding agent (%s); "
+                    "re-running it once",
+                    kw["ticket"].id,
+                    kw["attempt_id"],
+                    failure,
+                )
+        assert failure is not None
+        raise failure
+
+    def _proxy_tokens(self, attempt_id: int) -> int:
+        """Tokens the model proxy recorded for the attempt (any model call that returned
+        usage adds to the row)."""
+        a = self.store.get_attempt(attempt_id)
+        return int(a.tokens_in or 0) + int(a.tokens_out or 0)
 
     def _supersede(self, att: Attempt, rec: Any) -> None:
         self.store.finish_attempt(att.id, "superseded")

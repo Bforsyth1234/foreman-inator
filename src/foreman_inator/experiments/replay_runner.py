@@ -22,8 +22,11 @@ that touches GitHub or the live tables:
 4. scoring: the case's test files (the merged PR's tests, content at the merge) are
    written over whatever the writer left at those paths, then the verify command runs
    under the sandbox. passed / failed; ``no_change``, ``agent_failed`` and
-   ``timed_out`` also count as not passed. Cost and tokens are the proxy's numbers for
-   that context; time is the side's wall time.
+   ``timed_out`` also count as not passed. A side that could not run at all
+   (``worker_setup.could_not_run``: OpenCode's server, session or prompt failed before
+   any model call, #53) is an ``error``, which keeps the case out of the comparison.
+   Cost and tokens are the proxy's numbers for that context; time is the side's wall
+   time.
 
 Reviewer replay, one case side (``_reviewer_side``): ``review_change`` with ``store=None``
 (nothing written), ``bucket="experiments"`` and the variant's prompt on the case's base
@@ -103,6 +106,7 @@ from foreman_inator.runner import sandbox
 from foreman_inator.runner import verify as verify_mod
 from foreman_inator.runner.worktree import RepoMirror, Worktree, WorktreeError
 from foreman_inator.tickets.prompt import build_writer_prompt, read_conventions
+from foreman_inator.worker_setup import setup_failure
 
 from . import replay_sets as rs
 
@@ -1029,6 +1033,12 @@ def _writer_side(ctx: _SideCtx) -> CaseResult:
             raise _Stop(STOP_CANCELLED)
         usage = {"tokens_in": meter.tokens_in, "tokens_out": meter.tokens_out,
                  "cost_usd": meter.cost}  # fmt: skip
+        setup = setup_failure(run, proxy_tokens=meter.tokens_in + meter.tokens_out)
+        if setup is not None:
+            # #53: the side could not run (no server, session or prompt; no model call).
+            # Not the variant's failure: an ``error`` side keeps the case out of the
+            # comparison instead of scoring it 0 as ``agent_failed`` would.
+            return ctx.result("error", t0, detail=setup.flag_reason, **usage)
         if not run.finished:
             status = "timed_out" if run.status == "timed_out" else "agent_failed"
             return ctx.result(status, t0, detail=run.error or run.status, **usage)
