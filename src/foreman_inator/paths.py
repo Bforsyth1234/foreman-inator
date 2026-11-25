@@ -9,7 +9,9 @@ distribution").
 Each function returns an absolute path and creates the folder it needs.
 """
 
+import contextlib
 import os
+import tempfile
 from pathlib import Path
 
 ENV_HOME = "FOREMAN_INATOR_HOME"
@@ -78,13 +80,40 @@ def worktrees_dir() -> Path:
 
 
 def write_secret_file(path: Path, data: str | bytes) -> Path:
-    """Write ``data`` to ``path`` with mode 600, never briefly world-readable."""
+    """Write ``data`` to ``path`` with mode 600, never briefly world-readable, and
+    atomically: the bytes go to a temp file (mode 600) in the same folder, are fsynced,
+    then ``os.replace`` swaps it in, so a reader (the worker's config reload) sees the
+    old file or the whole new one, never a truncated or partial one."""
     raw = data.encode() if isinstance(data, str) else data
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, SECRET_FILE_MODE)
-    os.fchmod(fd, SECRET_FILE_MODE)  # an existing file keeps its old mode otherwise
-    with os.fdopen(fd, "wb") as handle:
-        handle.write(raw)
+    path = Path(path)
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        os.fchmod(fd, SECRET_FILE_MODE)  # mkstemp gives 600 already; be explicit
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(raw)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+    _fsync_dir(path.parent)
     return path
+
+
+def _fsync_dir(folder: Path) -> None:
+    """Best effort: make the rename durable (not every platform lets a folder be fsynced)."""
+    try:
+        dfd = os.open(folder, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(dfd)
+    except OSError:
+        pass
+    finally:
+        os.close(dfd)
 
 
 def write_app_key(pem: str | bytes) -> Path:

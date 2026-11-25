@@ -396,7 +396,7 @@ build/
 | Command | CLI on the user's PATH | `foreman-inator`, short alias `fman` |
 | GitHub App | Created per user by setup | `foreman-inator[bot]` |
 
-**Setup** (`fman setup`) does four things: registers the user's own GitHub App through the manifest flow, checks for OpenCode and Ollama and offers to install them, writes `~/.foreman-inator/config.toml`, and installs a macOS launchd agent so the worker restarts after a reboot. Not listed on the GitHub Marketplace: every user has a private App, so there is no single public App to list.
+**Setup** (`fman setup`) does four things: registers the user's own GitHub App through the manifest flow, checks for OpenCode and Ollama and offers to install them, writes `~/.foreman-inator/config.toml`, and installs a macOS launchd agent so the worker restarts after a reboot. Not listed on the GitHub Marketplace: every user has a private App, so there is no single public App to list. `fman setup --public` is the opt-in exception: it creates the App as public so other accounts can install it and the owner's worker works on their repos; the key never leaves the owner's Mac (docs/publishing.md).
 
 **Naming note:** plain "Foreman" is crowded. It is a well-known Ruby Procfile tool whose `foreman` command is on many dev machines, and several AI coding projects already use the name, including a Vercel template with nearly the same issue → implementer → cross-vendor reviewer flow. That is why the project is named foreman-inator. Confirm the names are free on PyPI, GitHub, and as a GitHub App name before the first release.
 

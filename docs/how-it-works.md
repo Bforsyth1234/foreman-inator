@@ -304,9 +304,13 @@ Not built yet (SPEC milestone 5): seeded-bug reviewer tests, traffic split and
 head-to-head writer experiments, and restarting a recorded run from its
 failure step.
 
+Next after that: interactive chat sessions through the same tiers and spend
+caps. The design and its open questions are in [chat-design.md](chat-design.md);
+nothing of it is wired yet.
+
 ## Metrics and the trace viewer
 
-`fman metrics` serves a read-only page on 127.0.0.1:8642, with no JavaScript
+`fman metrics` serves a local page on 127.0.0.1:8642, with no JavaScript
 and no external URLs. Every number can be filtered by model, repo and date
 range; a metric with no data shows as empty, not zero.
 
@@ -322,6 +326,10 @@ range; a metric with no data shows as empty, not zero.
   reviewer variant.
 - `/experiments`: champions, running and ended experiments, replay comparisons
   and live judgments.
+- `/activity`, `/settings`, `/tiers`: live work with a Retry button on flagged
+  tickets, config editing, and models per tier. These and
+  `/experiments/manage` are the pages that write, each POST behind a form
+  token and a loopback Origin/Host check.
 
 Failed exploration attempts and shadow reviews never count against a model.
 After each kickback, a local model reads the attempt's recording in the
