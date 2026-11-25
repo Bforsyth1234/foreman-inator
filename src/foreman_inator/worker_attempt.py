@@ -55,6 +55,7 @@ from foreman_inator.config import ConfigError, ModelEndpoint
 from foreman_inator.db.store import Attempt, Ticket
 from foreman_inator.experiments import variants
 from foreman_inator.pr.publisher import pr_head_branch
+from foreman_inator.resources import memory
 from foreman_inator.routing import escalation as esc
 from foreman_inator.runner import sandbox
 from foreman_inator.runner import verify as verify_mod
@@ -119,6 +120,8 @@ class AttemptSteps:
     traces_dir: Path
     attempt_timeout: float | None
     verify_timeout: float
+    #: #59: ``ollama host -> span attributes``; an instance attribute replaces it in tests.
+    resource_snapshot = staticmethod(memory.snapshot)
 
     # ------------------------------------------------------------------ seams
     # ``before_route`` (#44) lives in ``worker_clarify``; the sandbox policy in
@@ -409,6 +412,11 @@ class AttemptSteps:
                 variant_id=variant,
                 tier=att.tier,
             ) as rec,
+            memory.attempt_snapshots(  # #59: memory + Ollama state at start and end
+                span,
+                memory.local_ollama_host(endpoint, getattr(self.config, "models", ())),
+                snap=self.resource_snapshot,
+            ),
         ):
             try:
                 self.prepare_worktree(ticket, att, wt)
