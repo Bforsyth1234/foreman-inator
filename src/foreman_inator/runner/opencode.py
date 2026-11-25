@@ -798,6 +798,7 @@ class _Run:
     error: str | None = None
     aborted_error: bool = False
     cancelled: bool = False
+    queued_s: float = 0.0  # #34: time queued for a local slot, added to the deadline
 
 
 class OpenCodeDriver:
@@ -815,6 +816,7 @@ class OpenCodeDriver:
         keep_state: bool = False,
         base_env: Mapping[str, str] | None = None,
         on_event: Callable[[DriverEvent], None] | None = None,
+        extra_time: Callable[[int], float] | None = None,
     ):
         self.opencode_bin = opencode_bin
         self.timeout = timeout
@@ -824,6 +826,10 @@ class OpenCodeDriver:
         self.keep_state = keep_state
         self.base_env = base_env
         self.on_event = on_event
+        # #34: seconds to add to an attempt's timeout, asked each loop turn with the
+        # attempt id; the worker passes `ModelProxy.queue_wait` so time spent queued for
+        # a local-model slot never counts against the writer timeout.
+        self.extra_time = extra_time
 
     @property
     def state_root(self) -> Path:
@@ -936,6 +942,9 @@ class OpenCodeDriver:
             deadline = t0 + limit
             while True:
                 now = time.monotonic()
+                if not aborted and not run.cancelled:
+                    run.queued_s = self._extra(attempt_id)
+                    deadline = t0 + limit + run.queued_s
                 if not aborted and cancel is not None and cancel.is_set():
                     aborted = run.cancelled = True
                     log.info("opencode attempt %s cancelled", attempt_id)
@@ -966,6 +975,16 @@ class OpenCodeDriver:
         finally:
             stop.set()
         return self._result(api, run, sid, aborted, limit, t0)
+
+    def _extra(self, attempt_id: int) -> float:
+        """The injected extra time (#34), never negative; a failing callable adds none."""
+        if self.extra_time is None:
+            return 0.0
+        try:
+            return max(0.0, float(self.extra_time(attempt_id)))
+        except Exception as exc:
+            log.warning("opencode extra_time for attempt %s failed: %s", attempt_id, exc)
+            return 0.0
 
     def _await_connected(
         self, q: queue.Queue[DriverEvent], run: _Run, api: OpenCodeSession, attempt_id: int
@@ -998,6 +1017,8 @@ class OpenCodeDriver:
         elif aborted:
             status = "timed_out"
             error = f"timed out after {limit:.0f}s"
+            if run.queued_s >= 1:
+                error += f" (plus {run.queued_s:.0f}s queued for a local-model slot)"
         elif run.error:
             status, error = "errored", run.error
         else:
