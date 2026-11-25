@@ -75,7 +75,7 @@ import signal
 import subprocess
 import threading
 import time
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, Protocol
@@ -217,6 +217,93 @@ def build_config(endpoint: ModelEndpoint, proxy_base_url: str) -> dict[str, Any]
         "formatter": False,
         "permission": PERMISSIONS,
     }
+
+
+#: Chat (#71): one provider per wire, so a ladder can mix OpenAI-compatible and Anthropic
+#: models in one session. The OpenAI-compatible one keeps the attempts' id.
+CHAT_PROVIDERS = {"openai": PROVIDER_ID, "anthropic": f"{PROVIDER_ID}-anthropic"}
+
+
+def _chat_endpoint(item: Any) -> ModelEndpoint:
+    """A ladder item: a ``chat.Rung`` (its ``endpoint``) or a ``ModelEndpoint``."""
+    ep = getattr(item, "endpoint", item)
+    if not isinstance(ep, ModelEndpoint):
+        raise TypeError(f"not a ladder rung or ModelEndpoint: {item!r}")
+    return ep
+
+
+def build_chat_config(
+    ladder: Iterable[Any], small_model: ModelEndpoint | Any, proxy_url: str
+) -> dict[str, Any]:
+    """The per-session ``opencode.json`` of a chat (chat design section 4): every model
+    of the session's ladder (``chat.Rung``s or ``ModelEndpoint``s, lowest tier first)
+    under a ``fman`` provider pointing at the chat's proxy URL, so a tier move only
+    changes the ``modelID`` the next ``prompt_async`` names: no restart, history kept.
+
+    ``small_model`` (OpenCode's title/summary model; the session's lowest-tier model) is
+    added if the ladder lacks it. ``model`` (the default when a prompt names none) is the
+    first rung. One provider per wire (``CHAT_PROVIDERS``), each listed only when a model
+    uses it. Everything else (permissions, no share/LSP/formatter/snapshot, no
+    ``instructions``) is exactly ``build_config``'s, so a chat is as headless and as
+    closed as an attempt."""
+    endpoints = [_chat_endpoint(r) for r in ladder]
+    if not endpoints:
+        raise ValueError("a chat needs at least one model in its ladder")
+    small = _chat_endpoint(small_model)
+    if all((e.wire, e.model) != (small.wire, small.model) for e in endpoints):
+        endpoints.append(small)
+    base = proxy_url.rstrip("/")
+    providers: dict[str, dict[str, Any]] = {}
+    owner: dict[str, str] = {}  # model id -> provider id
+    for ep in endpoints:
+        wire = ep.wire if ep.wire in CHAT_PROVIDERS else "openai"
+        pid = CHAT_PROVIDERS[wire]
+        if owner.get(ep.model, pid) != pid:
+            raise ValueError(f"model id {ep.model!r} is listed under two wires")
+        owner[ep.model] = pid
+        prov = providers.setdefault(
+            pid,
+            {
+                "npm": PROVIDER_PACKAGES[wire],
+                "name": "foreman-inator proxy",
+                # The proxy holds the real keys (Keychain); OpenCode never sees one.
+                "options": {"baseURL": base, "apiKey": "fman-proxy"},
+                "models": {},
+            },
+        )
+        prov["models"].setdefault(ep.model, {"name": ep.name, "tool_call": True})
+    first = endpoints[0]
+    return {
+        "$schema": "https://opencode.ai/config.json",
+        "provider": providers,
+        "model": f"{owner[first.model]}/{first.model}",
+        "small_model": f"{owner[small.model]}/{small.model}",
+        "enabled_providers": list(providers),
+        "share": "disabled",
+        "autoupdate": False,
+        "snapshot": False,
+        "lsp": False,
+        "formatter": False,
+        "permission": PERMISSIONS,
+    }
+
+
+def config_models(config: Mapping[str, Any]) -> dict[str, str]:
+    """``{modelID: providerID}`` for every model an ``opencode.json`` lists."""
+    out: dict[str, str] = {}
+    for pid, prov in (config.get("provider") or {}).items():
+        for mid in (prov or {}).get("models") or {}:
+            out.setdefault(str(mid), str(pid))
+    return out
+
+
+def config_proxy_url(config: Mapping[str, Any]) -> str | None:
+    """The proxy base URL the config's providers point at (they all share one)."""
+    for prov in (config.get("provider") or {}).values():
+        url = ((prov or {}).get("options") or {}).get("baseURL")
+        if url:
+            return str(url)
+    return None
 
 
 _SECRET_NAME = re.compile(r"(KEY|TOKEN|SECRET|PASSW|CREDENTIAL|AUTH)", re.IGNORECASE)
@@ -689,6 +776,27 @@ class OpenCodeSession:
         }
         self._ok(self._client.post(f"/session/{self.session_id}/prompt_async", json=body))
 
+    def get(self, session_id: str) -> dict[str, Any] | None:
+        """``GET /session/{id}``: the stored session, or None when the server has no such
+        session (404 ``NotFoundError``). A new server started on the same
+        ``XDG_DATA_HOME`` serves the sessions an earlier one created (checked against
+        1.18.7, see ``ChatServer``)."""
+        r = self._client.get(f"/session/{session_id}")
+        if r.status_code == 404:
+            return None
+        return self._ok(r).json()
+
+    def use(self, session_id: str) -> str:
+        """Point this adapter at an existing session (a resumed chat)."""
+        self.session_id = session_id
+        return session_id
+
+    def status(self) -> dict[str, Any]:
+        """``GET /session/status``: ``{sessionID: {type: idle|busy|retry, ...}}`` (1.18.7's
+        ``SessionStatus``; a session it does not list is idle)."""
+        out = self._ok(self._client.get("/session/status")).json()
+        return out if isinstance(out, dict) else {}
+
     def abort(self, timeout: float = 10.0) -> bool:
         if self.session_id is None:
             return False
@@ -806,6 +914,119 @@ def _edited_path(ev: ToolEvent) -> str | None:
         if isinstance(v, str) and v:
             return v
     return None
+
+
+def handle_event(
+    ev: DriverEvent,
+    run: _Run,
+    api: OpenCodeSession,
+    record: Callable[[ToolEvent], None],
+    *,
+    reject_message: str = "unattended run: not permitted",
+) -> bool:
+    """Apply one event to ``run`` (the attempt's or one chat turn's tally); True when it
+    is over. Permission and question asks are rejected (``PERMISSIONS`` never asks; an
+    allow here would be a way around 7g); each finished tool call goes to ``record``
+    once. Shared by ``OpenCodeDriver`` and ``ChatServer`` (chat design section 2)."""
+    if isinstance(ev, ToolEvent):
+        key = f"{ev.session_id}:{ev.call_id}"
+        if key in run.tools:
+            return False
+        run.tools.add(key)
+        run.tool_errors += ev.is_error
+        if tool_kind(ev.name) == "edit":
+            run.edits += 1
+            path = _edited_path(ev)
+            if path:
+                run.files.add(path)
+        record(ev)
+    elif isinstance(ev, TextEvent):
+        run.texts[(ev.message_id, ev.part_id)] = ev.text
+    elif isinstance(ev, MessageEvent):
+        if ev.session_id == run.session_id:
+            if ev.role == "assistant":
+                run.assistant[ev.message_id] = ev
+                if ev.error and "MessageAbortedError" not in ev.error:
+                    run.error = ev.error
+            elif ev.role == "user":
+                run.user_messages.add(ev.message_id)
+    elif isinstance(ev, StatusEvent):
+        if ev.session_id == run.session_id and ev.status == "busy":
+            run.seen_busy = True
+    elif isinstance(ev, IdleEvent):
+        if ev.session_id == run.session_id and (run.seen_busy or run.assistant):
+            return True
+    elif isinstance(ev, ErrorEvent):
+        if ev.session_id in (None, run.session_id):
+            if ev.name == "MessageAbortedError":
+                run.aborted_error = True
+            else:
+                run.error = ev.message
+    elif isinstance(ev, PermissionEvent):
+        run.rejections += 1
+        log.warning("opencode asked for %s %s; rejecting", ev.permission, ev.patterns)
+        with contextlib.suppress(httpx.HTTPError):
+            api.reject_permission(ev.request_id, reject_message)
+    elif isinstance(ev, QuestionEvent):
+        run.rejections += 1
+        with contextlib.suppress(httpx.HTTPError):
+            api.reject_question(ev.request_id)
+    elif isinstance(ev, FileEditedEvent):
+        if ev.file:
+            run.files.add(ev.file)
+    elif isinstance(ev, StreamClosed):
+        run.error = run.error or ev.error or "event stream closed"
+        return True
+    return False
+
+
+class EventPump:
+    """Reads ``GET /event`` on a thread into ``queue`` while the server lives. A dropped
+    stream is reconnected up to ``retries`` times in a row (``reset_on_connect``: a
+    stream that reached ``server.connected`` again starts the count over, for a chat
+    server that lives for many turns); then a ``StreamClosed`` is queued."""
+
+    def __init__(
+        self,
+        api: OpenCodeSession,
+        alive: Callable[[], bool],
+        *,
+        name: str,
+        retries: int = 3,
+        reset_on_connect: bool = False,
+    ):
+        self.api = api
+        self.alive = alive
+        self.name = name
+        self.retries = retries
+        self.reset_on_connect = reset_on_connect
+        self.stop_event = threading.Event()
+        self.queue: queue.Queue[DriverEvent] = queue.Queue()
+        self.closed = threading.Event()  # set when the pump gave up or was stopped
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._run, name=self.name, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+
+    def _run(self) -> None:
+        try:
+            tries = 0
+            while tries < self.retries:  # reconnect a dropped stream while the server lives
+                tries += 1
+                for ev in self.api.events(self.stop_event):
+                    if self.reset_on_connect and isinstance(ev, Connected):
+                        tries = 0
+                    self.queue.put(ev)
+                if self.stop_event.is_set() or not self.alive():
+                    return
+                time.sleep(0.2)
+            self.queue.put(StreamClosed(f"event stream closed {self.retries} times"))
+        finally:
+            self.closed.set()
 
 
 # --------------------------------------------------------------------------- the driver
@@ -945,21 +1166,10 @@ class OpenCodeDriver:
         *,
         cancel: threading.Event | None = None,
     ) -> AttemptResult:
-        stop = threading.Event()
-        q: queue.Queue[DriverEvent] = queue.Queue()
         sid = api.create(f"foreman-inator attempt {attempt_id}")
-
-        def pump() -> None:
-            for _ in range(3):  # reconnect a dropped stream while the server lives
-                for ev in api.events(stop):
-                    q.put(ev)
-                if stop.is_set() or not server.alive():
-                    return
-                time.sleep(0.2)
-            q.put(StreamClosed("event stream closed 3 times"))
-
-        reader = threading.Thread(target=pump, name=f"opencode-events-{attempt_id}", daemon=True)
-        reader.start()
+        pump = EventPump(api, server.alive, name=f"opencode-events-{attempt_id}")
+        stop, q = pump.stop_event, pump.queue
+        pump.start()
         run = _Run(session_id=sid)
         aborted = False
         try:
@@ -1072,56 +1282,7 @@ class OpenCodeDriver:
 
     def _handle(self, ev: DriverEvent, run: _Run, api: OpenCodeSession, attempt_id: int) -> bool:
         """Apply one event; True when the run is over."""
-        if isinstance(ev, ToolEvent):
-            key = f"{ev.session_id}:{ev.call_id}"
-            if key in run.tools:
-                return False
-            run.tools.add(key)
-            run.tool_errors += ev.is_error
-            if tool_kind(ev.name) == "edit":
-                run.edits += 1
-                path = _edited_path(ev)
-                if path:
-                    run.files.add(path)
-            record_tool(attempt_id, ev)
-        elif isinstance(ev, TextEvent):
-            run.texts[(ev.message_id, ev.part_id)] = ev.text
-        elif isinstance(ev, MessageEvent):
-            if ev.session_id == run.session_id:
-                if ev.role == "assistant":
-                    run.assistant[ev.message_id] = ev
-                    if ev.error and "MessageAbortedError" not in ev.error:
-                        run.error = ev.error
-                elif ev.role == "user":
-                    run.user_messages.add(ev.message_id)
-        elif isinstance(ev, StatusEvent):
-            if ev.session_id == run.session_id and ev.status == "busy":
-                run.seen_busy = True
-        elif isinstance(ev, IdleEvent):
-            if ev.session_id == run.session_id and (run.seen_busy or run.assistant):
-                return True
-        elif isinstance(ev, ErrorEvent):
-            if ev.session_id in (None, run.session_id):
-                if ev.name == "MessageAbortedError":
-                    run.aborted_error = True
-                else:
-                    run.error = ev.message
-        elif isinstance(ev, PermissionEvent):
-            run.rejections += 1
-            log.warning("opencode asked for %s %s; rejecting", ev.permission, ev.patterns)
-            with contextlib.suppress(httpx.HTTPError):
-                api.reject_permission(ev.request_id, "unattended run: not permitted")
-        elif isinstance(ev, QuestionEvent):
-            run.rejections += 1
-            with contextlib.suppress(httpx.HTTPError):
-                api.reject_question(ev.request_id)
-        elif isinstance(ev, FileEditedEvent):
-            if ev.file:
-                run.files.add(ev.file)
-        elif isinstance(ev, StreamClosed):
-            run.error = run.error or ev.error or "event stream closed"
-            return True
-        return False
+        return handle_event(ev, run, api, lambda tool_ev: record_tool(attempt_id, tool_ev))
 
 
 def _with_proxy_port(policy: Policy | None, proxy_base_url: str) -> Policy | None:
@@ -1139,6 +1300,481 @@ def run_final_text(api: OpenCodeSession, run: _Run) -> str:
             return text
     order = list(run.assistant)
     for mid in reversed(order):
+        parts = [t for (m, _), t in run.texts.items() if m == mid]
+        if any(parts):
+            return "".join(parts).strip()
+    return ""
+
+
+# --------------------------------------------------------------------------- chat (#71)
+
+ChatTurnStatus = Literal["finished", "aborted", "timed_out", "errored"]
+
+
+class ChatBusy(OpenCodeError):
+    """A message was sent while the session's previous turn is still running."""
+
+
+@dataclass(frozen=True)
+class TurnResult:
+    """What one chat turn (one user message) did. Spend is the proxy's to count; the
+    tokens and cost here are OpenCode's own numbers, for display only."""
+
+    status: ChatTurnStatus
+    model_id: str
+    final_message: str
+    error: str | None = None
+    tool_calls: int = 0
+    tool_errors: int = 0
+    edits: int = 0
+    assistant_messages: int = 0
+    permission_rejections: int = 0
+    tokens_in: int = 0
+    tokens_out: int = 0
+    cost_usd: float = 0.0
+    seconds: float = 0.0
+    files_edited: tuple[str, ...] = ()
+    queued_s: float = 0.0
+
+    @property
+    def finished(self) -> bool:
+        return self.status == "finished"
+
+
+def chat_sandbox(policy: Policy | None, *, network: bool = False) -> Policy | None:
+    """The chat server's sandbox: the writer's ``policy`` unchanged, or with ``network``
+    (decision 4, the repo's ``chat_network`` opt-in) the first-attempt dependency
+    install's outbound rule as well: TCP to any host on ``sandbox.INSTALL_PORTS``
+    (443/80) plus DNS and certificate trust (``Policy.outbound_ports``, the field
+    ``runner.install.install_policy`` sets for base-branch installs). The proxy port and
+    loopback listening stay; writes, reads, the Keychain (securityd stays denied) and the
+    scrubbed environment are unchanged. No policy, or ``sandbox = "off"``: as given."""
+    if policy is None or policy.mode == "off" or not network or policy.network == "allow":
+        return policy
+    return dataclasses.replace(policy, outbound_ports=tuple(sandbox_mod.INSTALL_PORTS))
+
+
+def record_chat_tool(chat_id: int, ev: ToolEvent) -> None:
+    """The default tool recorder of a chat: a ``tool`` row in the session's recording
+    (``get_recorder(chat_id, "chat")``), if one is open. Spans for chat tool calls are
+    the caller's (``ChatServer(on_tool=...)``), as their parent is the chat turn span."""
+    rec = get_recorder(chat_id, "chat")
+    if rec is not None:
+        rec.tool(
+            name=ev.name,
+            input=ev.input,
+            content=ev.output,
+            is_error=ev.is_error,
+            tool_use_id=ev.call_id,
+            tool_kind=tool_kind(ev.name),
+        )
+
+
+class ChatServer:
+    """One ``opencode serve`` and one OpenCode session for a whole chat (#71, chat design
+    section 2): many turns, one process, the session's history kept between them.
+
+        server = ChatServer(wt, chat_id=3, config=build_chat_config(...), state_dir=...,
+                            shared_dir=..., sandbox=writer_policy, network=False)
+        sid = server.start()                    # or start(resume=sid) after a restart
+        turn = server.send("fix the test", "qwen3:8b")
+        for ev in turn: ...                     # DriverEvents until idle/error/timeout
+        turn.result                             # TurnResult
+        server.abort()                          # from any thread: ends the running turn
+        server.stop()                           # kills the process group; state kept
+
+    Reuses the attempt pieces unchanged: ``OpenCodeServer`` (process, env, sandbox
+    binding), ``OpenCodeSession`` (HTTP), ``parse_event``, ``handle_event`` (permission
+    and question asks rejected, tool calls counted once) and ``EventPump``. A turn ends
+    on the session going idle, a session error, ``turn_timeout`` (plus ``extra_time()``,
+    the local-slot queue wait) or ``abort()``; an abort OpenCode ignores for
+    ``abort_grace`` stops the server (7e: nothing keeps running unseen).
+
+    ``state_dir`` (``<home>/opencode/chats/<id>``) holds ``opencode.json`` and the
+    session's ``XDG_DATA_HOME``/``XDG_STATE_HOME``; ``stop()`` keeps it, so a later
+    ``start(resume=...)`` reopens the session.
+
+    Rule 12, OpenCode 1.18.7 (``opencode --version``; its own OpenAPI document at
+    ``GET /doc`` and a live check against the installed binary, 2026-11-25; also
+    https://opencode.ai/docs/server/):
+
+    * Multi-message sessions: ``POST /session/{id}/prompt_async`` ("Create and send a new
+      message to a session asynchronously, starting the session if needed") appends a
+      turn to an existing session; two prompts in a row left four messages (user,
+      assistant, user, assistant) in ``GET /session/{id}/message``. Each prompt names its
+      own ``model`` ({providerID, modelID}), so the tier can change per turn.
+    * Reload / resume: sessions are stored in ``<XDG_DATA_HOME>/opencode/opencode.db``
+      (SQLite). A second server started on the same ``XDG_DATA_HOME`` answered
+      ``GET /session/{id}`` with 200 and the full message list, and listed it in
+      ``GET /session``; an unknown id is 404 ``NotFoundError``. So resume = start a new
+      server on the kept state dir and keep prompting the old session id; no summary
+      prompt is needed. (``/session/{id}/fork``, ``/summarize``, ``/revert`` exist too;
+      unused.)
+    * ``GET /session/status`` maps session ids to ``SessionStatus`` (idle | busy |
+      retry); used after an event-stream reconnect to see whether a turn ended while
+      no events arrived.
+    * Without ``enabled_providers`` 1.18.7 falls back to its own hosted ``opencode``
+      provider and answers from the network; ``build_chat_config`` always sets it.
+    """
+
+    def __init__(
+        self,
+        worktree_path: Path | str,
+        *,
+        chat_id: int,
+        config: dict[str, Any],
+        state_dir: Path | str,
+        shared_dir: Path | str,
+        opencode_bin: str = "opencode",
+        startup_timeout: float = STARTUP_TIMEOUT,
+        turn_timeout: float = DEFAULT_TIMEOUT,
+        abort_grace: float = ABORT_GRACE,
+        base_env: Mapping[str, str] | None = None,
+        sandbox: Policy | None = None,
+        network: bool = False,
+        on_tool: Callable[[ToolEvent], None] | None = None,
+        extra_time: Callable[[], float] | None = None,
+    ):
+        self.worktree_path = Path(worktree_path).resolve()
+        self.chat_id = chat_id
+        self.config = config
+        self.models = config_models(config)
+        if not self.models:
+            raise ValueError("the chat config lists no models")
+        self.state_dir = Path(state_dir)
+        self.turn_timeout = turn_timeout
+        self.abort_grace = abort_grace
+        self.on_tool = on_tool or (lambda ev: record_chat_tool(chat_id, ev))
+        self.extra_time = extra_time
+        proxy_url = config_proxy_url(config) or ""
+        self.server = OpenCodeServer(
+            self.worktree_path,
+            config=config,
+            attempt_dir=self.state_dir,
+            shared_dir=Path(shared_dir),
+            opencode_bin=opencode_bin,
+            startup_timeout=startup_timeout,
+            base_env=base_env,
+            sandbox=chat_sandbox(_with_proxy_port(sandbox, proxy_url), network=network),
+        )
+        self.api: OpenCodeSession | None = None
+        self.pump: EventPump | None = None
+        self.session_id: str | None = None
+        self.resumed = False
+        self._lock = threading.Lock()
+        self._turn: ChatTurnStream | None = None
+        self._old_messages: set[str] = set()  # message ids of earlier turns
+
+    # ------------------------------------------------------------------ lifecycle
+
+    def start(self, *, resume: str | None = None, title: str | None = None) -> str:
+        """Start the server, wait for its event stream, then reopen ``resume`` (an
+        OpenCode session id from an earlier server on this state dir) or create a new
+        session. Returns the session id (``resumed`` says which). Raises
+        ``OpenCodeError`` (and ``sandbox.SandboxUnavailable``: fail closed) with nothing
+        left running."""
+        try:
+            url = self.server.start()
+            self.api = OpenCodeSession(url, directory=self.worktree_path, auth=self.server.auth)
+            self.pump = EventPump(
+                self.api, self.server.alive, name=f"opencode-chat-{self.chat_id}",
+                reset_on_connect=True,
+            )  # fmt: skip
+            self.pump.start()
+            self._await_connected()
+            if resume and self.api.get(resume) is not None:
+                self.session_id = self.api.use(resume)
+                self.resumed = True
+                with contextlib.suppress(httpx.HTTPError, OpenCodeError, ValueError):
+                    self._old_messages = {
+                        str((m.get("info") or {}).get("id", "")) for m in self.api.messages()
+                    }
+            else:
+                if resume:
+                    log.warning("opencode chat %s: session %s not found; new session",
+                                self.chat_id, resume)  # fmt: skip
+                self.session_id = self.api.create(title or f"foreman-inator chat {self.chat_id}")
+                self.resumed = False
+            return self.session_id
+        except BaseException:
+            self.stop()
+            raise
+
+    def _await_connected(self) -> None:
+        assert self.pump is not None
+        end = time.monotonic() + 10.0
+        while time.monotonic() < end:
+            try:
+                ev = self.pump.queue.get(timeout=0.1)
+            except queue.Empty:
+                if not self.server.alive():
+                    raise OpenCodeError(f"opencode exited: {self.server.log_tail(500)}") from None
+                continue
+            if isinstance(ev, Connected):
+                return
+            if isinstance(ev, StreamClosed):
+                raise OpenCodeError(ev.error or "event stream closed")
+        log.warning("opencode chat %s: no server.connected; going on", self.chat_id)
+
+    def alive(self) -> bool:
+        return self.server.alive() and self.pump is not None and not self.pump.closed.is_set()
+
+    @property
+    def busy(self) -> bool:
+        with self._lock:
+            return self._turn is not None and not self._turn.done
+
+    def abort(self) -> bool:
+        """End the running turn (status ``aborted``). Safe from any thread; False when no
+        turn is running."""
+        with self._lock:
+            turn = self._turn
+        if turn is None or turn.done:
+            return False
+        turn.abort_requested.set()
+        return True
+
+    def stop(self) -> None:
+        """Stop the event pump and kill the server's process group. Safe to call twice.
+        The state dir is kept (resume)."""
+        with self._lock:
+            turn = self._turn
+        if turn is not None and not turn.done:
+            turn.abort_requested.set()
+        if self.pump is not None:
+            self.pump.stop()
+        if self.api is not None:
+            self.api.close()
+        self.server.stop()
+
+    def __enter__(self) -> ChatServer:
+        self.start()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.stop()
+
+    # ------------------------------------------------------------------ turns
+
+    def send(self, text: str, model_id: str, *, timeout: float | None = None) -> ChatTurnStream:
+        """Send one user message on ``model_id`` (one of the config's models; its provider
+        comes from the config). Returns the turn: iterate it for its ``DriverEvent``s,
+        then read ``.result``. ``ChatBusy`` while the previous turn still runs."""
+        if self.api is None or self.session_id is None:
+            raise OpenCodeError("the chat server is not started")
+        provider = self.models.get(model_id)
+        if provider is None:
+            raise OpenCodeError(f"model {model_id!r} is not in this chat's config")
+        with self._lock:
+            if self._turn is not None and not self._turn.done:
+                raise ChatBusy("still working on the previous message")
+            turn = ChatTurnStream(
+                self, text, model_id, provider,
+                self.turn_timeout if timeout is None else timeout,
+            )  # fmt: skip
+            self._turn = turn
+        turn._begin()
+        return turn
+
+    def _extra(self) -> float:
+        if self.extra_time is None:
+            return 0.0
+        try:
+            return max(0.0, float(self.extra_time()))
+        except Exception as exc:
+            log.warning("opencode chat %s extra_time failed: %s", self.chat_id, exc)
+            return 0.0
+
+
+class ChatTurnStream:
+    """One running chat turn: an iterator of ``DriverEvent``s (``Connected`` left out),
+    with ``result`` set once it is exhausted. Breaking out early aborts the turn."""
+
+    def __init__(
+        self, server: ChatServer, text: str, model_id: str, provider_id: str, limit: float
+    ):
+        self.server = server
+        self.text = text
+        self.model_id = model_id
+        self.provider_id = provider_id
+        self.limit = limit
+        self.abort_requested = threading.Event()
+        self.result: TurnResult | None = None
+        assert server.session_id is not None
+        self._run = _Run(session_id=server.session_id)
+        self._t0 = time.monotonic()
+        self._gen = self._events()
+
+    @property
+    def done(self) -> bool:
+        return self.result is not None
+
+    def __iter__(self) -> Iterator[DriverEvent]:
+        return self._gen
+
+    def __next__(self) -> DriverEvent:
+        return next(self._gen)
+
+    def wait(self) -> TurnResult:
+        """Drain the turn's events and return its result."""
+        for _ in self._gen:
+            pass
+        assert self.result is not None
+        return self.result
+
+    def _begin(self) -> None:
+        """Drop stale events and post the prompt (``send`` calls this at once, so the
+        turn runs even before anyone iterates). A failure ends the turn ``errored``."""
+        srv = self.server
+        assert srv.api is not None and srv.pump is not None
+        self._drain(srv.pump, self._run)
+        if not self._run.error:
+            try:
+                srv.api.prompt(self.text, model_id=self.model_id, provider_id=self.provider_id)
+                return
+            except (OpenCodeError, httpx.HTTPError) as exc:
+                self._run.error = str(exc) or type(exc).__name__
+        self._finish(srv.api, self._run, "errored")
+
+    def _events(self) -> Iterator[DriverEvent]:
+        if self.done:
+            return
+        srv = self.server
+        api, pump, run = srv.api, srv.pump, self._run
+        assert api is not None and pump is not None
+        status: ChatTurnStatus | None = None
+        ended = False
+        aborted = False
+        try:
+            deadline = self._t0 + self.limit
+            while True:
+                now = time.monotonic()
+                if not aborted:
+                    run.queued_s = srv._extra()
+                    deadline = self._t0 + self.limit + run.queued_s
+                if not aborted and self.abort_requested.is_set():
+                    aborted, status = True, "aborted"
+                    with contextlib.suppress(httpx.HTTPError):
+                        api.abort()
+                    deadline = now + srv.abort_grace
+                    continue
+                if not aborted and now >= deadline:
+                    aborted, status = True, "timed_out"
+                    log.warning("opencode chat %s turn timed out after %.0fs",
+                                srv.chat_id, self.limit)  # fmt: skip
+                    with contextlib.suppress(httpx.HTTPError):
+                        api.abort()
+                    deadline = now + srv.abort_grace
+                    continue
+                if aborted and now >= deadline:
+                    run.error = run.error or "OpenCode ignored the abort; server stopped"
+                    srv.server.stop()  # 7e: never leave a turn running unseen
+                    break
+                try:
+                    ev = pump.queue.get(timeout=min(1.0, max(0.01, deadline - now)))
+                except queue.Empty:
+                    if not srv.server.alive():
+                        run.error = run.error or f"opencode exited: {srv.server.log_tail(500)}"
+                        break
+                    continue
+                if isinstance(ev, Connected):  # the stream reconnected mid-turn
+                    if run.seen_busy and not self._still_busy(api, run.session_id):
+                        break  # it went idle while no events arrived
+                    continue
+                if self._stale(ev):
+                    continue
+                over = handle_event(ev, run, api, srv.on_tool, reject_message=CHAT_REJECT)
+                yield ev
+                if over:
+                    break
+            ended = True
+        finally:
+            if not ended and status is None:
+                # the caller stopped iterating mid-turn: stop the model too (7e)
+                status, run.error = "aborted", run.error or "turn left before it ended"
+                with contextlib.suppress(httpx.HTTPError):
+                    api.abort()
+            self._finish(api, run, status)
+
+    def _drain(self, pump: EventPump, run: _Run) -> None:
+        """Drop events left over from before this turn; a dead stream fails the turn."""
+        while True:
+            try:
+                ev = pump.queue.get_nowait()
+            except queue.Empty:
+                break
+            if isinstance(ev, StreamClosed):
+                run.error = ev.error or "event stream closed"
+        if pump.closed.is_set() and not run.error:
+            run.error = "event stream closed"
+
+    def _stale(self, ev: DriverEvent) -> bool:
+        """An event of an earlier turn's message (a late update)."""
+        old = self.server._old_messages
+        if isinstance(ev, (MessageEvent, TextEvent)):
+            return ev.message_id in old
+        return False
+
+    @staticmethod
+    def _still_busy(api: OpenCodeSession, sid: str) -> bool:
+        try:
+            st = api.status().get(sid) or {}
+        except (httpx.HTTPError, OpenCodeError, ValueError):
+            return True
+        return st.get("type") in ("busy", "retry")
+
+    def _finish(self, api: OpenCodeSession, run: _Run, status: ChatTurnStatus | None) -> None:
+        if self.result is not None:
+            return
+        srv = self.server
+        if status is None:
+            status = "errored" if run.error else "finished"
+        error = run.error
+        if status == "timed_out":
+            error = f"timed out after {self.limit:.0f}s"
+            if run.queued_s >= 1:
+                error += f" (plus {run.queued_s:.0f}s queued for a local-model slot)"
+        elif status == "aborted":
+            error = error or "aborted"
+        srv._old_messages |= set(run.assistant) | run.user_messages
+        self.result = TurnResult(
+            status=status,
+            model_id=self.model_id,
+            final_message=_turn_final_text(api, run),
+            error=error,
+            tool_calls=len(run.tools),
+            tool_errors=run.tool_errors,
+            edits=run.edits,
+            assistant_messages=len(run.assistant),
+            permission_rejections=run.rejections,
+            tokens_in=sum(m.tokens_in for m in run.assistant.values()),
+            tokens_out=sum(m.tokens_out for m in run.assistant.values()),
+            cost_usd=sum(m.cost_usd for m in run.assistant.values()),
+            seconds=time.monotonic() - self._t0,
+            files_edited=tuple(sorted(run.files)),
+            queued_s=run.queued_s,
+        )
+
+
+#: What a rejected permission ask tells the chat's model: ask the user in plain text.
+CHAT_REJECT = "not permitted in a chat; ask the user in plain text instead"
+
+
+def _turn_final_text(api: OpenCodeSession, run: _Run) -> str:
+    """The last assistant message of this turn (never an earlier turn's)."""
+    with contextlib.suppress(httpx.HTTPError, OpenCodeError, ValueError, KeyError):
+        for msg in reversed(api.messages()):
+            info = msg.get("info") or {}
+            if info.get("role") != "assistant" or str(info.get("id")) not in run.assistant:
+                continue
+            texts = [
+                str(p.get("text", ""))
+                for p in msg.get("parts") or []
+                if p.get("type") == "text" and not p.get("synthetic")
+            ]
+            if any(texts):
+                return "".join(texts).strip()
+    for mid in reversed(list(run.assistant)):
         parts = [t for (m, _), t in run.texts.items() if m == mid]
         if any(parts):
             return "".join(parts).strip()
