@@ -311,6 +311,8 @@ def test_wave13_keys_are_validated(foreman_home: Path, line: str) -> None:
     _write(foreman_home, line + "\n")
     with pytest.raises(ConfigError):
         config.load()
+
+
 # --------------------------------------------------------------------------- writer timeout
 
 
