@@ -10,16 +10,23 @@ when the sandbox is off. Wave 9: the champion lines (#24, including "PROMPT CHAN
 command and lifts the "no verify command" flag from that repo's open tickets, so the
 running worker picks them up on its next pass. #51: one ``Profile <repo>: ...`` line per
 repo whose profile is not ``default``, and ``set_profile`` for ``fman repo set-profile``.
+Wave 15: with ``ollama_host`` the "Ollama: N loaded (X GB)" / "Ollama: unreachable (...)"
+line (#35, ``resources.ollama``), and with ``plugins`` one line per plugin (#45).
 """
 
 from __future__ import annotations
 
 from collections.abc import Sequence
 
+import httpx
+
 from foreman_inator.config import Config
 from foreman_inator.db.store import COLUMNS, Attempt, Store, Ticket
 from foreman_inator.experiments import variants
 from foreman_inator.locks import Locks
+from foreman_inator.plugins import PluginSet
+from foreman_inator.plugins import status_lines as plugin_status_lines
+from foreman_inator.resources.ollama import Unreachable, loaded_models
 from foreman_inator.routing import profile as prof
 from foreman_inator.runner import sandbox
 from foreman_inator.spend import FLAG_SPEND_CAP, Spend
@@ -118,9 +125,19 @@ def _waits(t: Ticket, attempts: Sequence[Attempt], store: Store | None) -> list[
     return []
 
 
-def render_status(store: Store, *, closed_limit: int = 5, config: Config | None = None) -> str:
+def render_status(
+    store: Store,
+    *,
+    closed_limit: int = 5,
+    config: Config | None = None,
+    ollama_host: str | None = None,
+    ollama_transport: httpx.BaseTransport | None = None,
+    plugins: PluginSet | None = None,
+) -> str:
     """Tickets by column with their current attempt, flags, waits and PR numbers; with
-    ``config``, the cloud spend line last."""
+    ``config``, the cloud spend line last. With ``ollama_host`` (see ``local_ollama_host``)
+    the Ollama line, asked over ``ollama_transport`` (tests); with ``plugins``, the plugin
+    lines. Both are off by default, so no caller asks Ollama by accident."""
     tickets = store.list_tickets()
     locks = Locks(store)
     waits = {
@@ -173,7 +190,33 @@ def render_status(store: Store, *, closed_limit: int = 5, config: Config | None 
             config.sandbox, dict(config.sandbox_network), dict(config.sandbox_install)
         )  # type: ignore[arg-type]
         out.append(f"!!! {line} !!!" if config.sandbox == "off" else line)
+    if ollama_host is not None:
+        out.append(ollama_line(ollama_host, transport=ollama_transport))
+    if plugins is not None:
+        out.extend(plugin_status_lines(plugins))
     return "\n".join(out)
+
+
+def local_ollama_host(config: Config) -> str | None:
+    """#35: the base URL of the first local model in ``config`` (its Ollama), or None
+    when every model is cloud (then there is no Ollama to ask)."""
+    for m in config.models:
+        if m.kind == "local":
+            return m.base_url
+    return None
+
+
+def ollama_line(host: str, *, transport: httpx.BaseTransport | None = None) -> str:
+    """#35: ``Ollama: 2 loaded (21.3 GB): a, b`` or ``Ollama: unreachable (reason)``.
+    Unreachable is never shown as zero models."""
+    got = loaded_models(host, transport=transport)
+    if isinstance(got, Unreachable):
+        return f"Ollama: unreachable ({got.reason})"
+    gb = sum(m.size for m in got) / 1e9
+    line = f"Ollama: {len(got)} loaded ({gb:.1f} GB)"
+    if got:
+        line += ": " + ", ".join(m.name for m in got)
+    return line
 
 
 def repos_line(config: Config) -> str:
@@ -253,4 +296,12 @@ def set_verify_command(store: Store, repo: str, command: str | None) -> list[int
     return cleared
 
 
-__all__ = ["profile_lines", "render_status", "repos_line", "set_profile", "set_verify_command"]
+__all__ = [
+    "local_ollama_host",
+    "ollama_line",
+    "profile_lines",
+    "render_status",
+    "repos_line",
+    "set_profile",
+    "set_verify_command",
+]
