@@ -66,6 +66,7 @@ def summary_line(
     kickbacks: Sequence[Kickback],
     *,
     now: datetime | None = None,
+    attempt_budget_usd: float | None = None,
 ) -> str:
     """One line: who solved it, attempts, kickbacks, cost and time.
 
@@ -75,7 +76,9 @@ def summary_line(
       restart and re-run, not separate tries).
     * kickbacks: all of the ticket's kickbacks, split into yours and the AI reviewer's.
     * cost: every attempt plus every non-shadow review (shadow reviews are experiment
-      spend), formatted like the PR body.
+      spend), formatted like the PR body. With ``attempt_budget_usd`` (#58) it adds the
+      most one attempt spent against that per-attempt limit, and how many attempts
+      stopped at their budget (``end_reason`` ``budget``) whenever any did.
     * time: ``created_at`` → ``done_at`` (or ``now`` while ``done_at`` is not set yet).
     """
     ordered = sorted(attempts, key=lambda a: a.id)
@@ -102,11 +105,26 @@ def summary_line(
     parts.append(kb)
     cost = sum(a.cost_usd for a in attempts) + sum(r.cost_usd for r in reviews if not r.shadow)
     parts.append(f"cost {format_cost(cost)}")
+    budget = _attempt_budget_part(tries, attempt_budget_usd)
+    if budget:
+        parts.append(budget)
     end = ticket.done_at or now
     if end is not None:
         secs = (end - ticket.created_at).total_seconds()
         parts.append(f"{format_duration(secs)} from label to merge")
     return f"{SUMMARY_PREFIX} " + " · ".join(parts)
+
+
+def _attempt_budget_part(tries: Sequence[Attempt], limit: float | None) -> str:
+    """``max $0.42 per attempt of $1.50 limit``, ``1 stopped at its budget`` (#58)."""
+    bits: list[str] = []
+    if limit is not None and tries:
+        top = max(a.cost_usd for a in tries)
+        bits.append(f"max {format_cost(top)} per attempt of {format_cost(limit)} limit")
+    stopped = sum(1 for a in tries if getattr(a, "end_reason", None) == "budget")
+    if stopped:
+        bits.append(f"{stopped} stopped at the attempt budget")
+    return ", ".join(bits)
 
 
 def summary_comment(
@@ -116,9 +134,12 @@ def summary_comment(
     kickbacks: Sequence[Kickback],
     *,
     now: datetime | None = None,
+    attempt_budget_usd: float | None = None,
 ) -> str:
     """The comment body: the hidden marker, then the one visible line."""
-    line = summary_line(ticket, attempts, reviews, kickbacks, now=now)
+    line = summary_line(
+        ticket, attempts, reviews, kickbacks, now=now, attempt_budget_usd=attempt_budget_usd
+    )
     return f"{summary_marker(ticket.id)}\n{line}"
 
 
@@ -139,7 +160,9 @@ def find_summary(api: GitHubAPI, ticket: Ticket) -> Comment | None:
     return None
 
 
-def post_summary(api: GitHubAPI, store: Store, ticket_id: int) -> SummaryResult:
+def post_summary(
+    api: GitHubAPI, store: Store, ticket_id: int, *, attempt_budget_usd: float | None = None
+) -> SummaryResult:
     """Post the ticket's summary on its issue once; a retry finds it and does not repost.
 
     Reads the store when called, so call it after the accept is recorded (the worker's
@@ -152,6 +175,7 @@ def post_summary(api: GitHubAPI, store: Store, ticket_id: int) -> SummaryResult:
         store.list_reviews(ticket_id=ticket.id, shadow=False),
         store.list_kickbacks(ticket_id=ticket.id),
         now=store.now(),
+        attempt_budget_usd=attempt_budget_usd,
     )
     existing = find_summary(api, ticket)
     if existing is not None:

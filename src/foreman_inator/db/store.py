@@ -45,6 +45,8 @@ Role = Literal["writer", "reviewer"]
 ExperimentMode = Literal["replay", "seeded", "shadow", "split", "pair"]
 ExperimentStatus = Literal["running", "promoted", "rejected"]
 SpendBucket = Literal["live", "experiments"]
+#: attempts.end_reason (#58, migration 007): why an attempt ended, beyond its outcome.
+EndReason = Literal["budget", "timeout"]
 CiStatus = Literal["passed", "failed", "base_red", "no_ci", "timed_out", "no_permission"]
 
 COLUMNS: tuple[str, ...] = ("todo", "in_progress", "testing", "done", "dropped")
@@ -148,6 +150,9 @@ class Attempt:
     # migration 002 (#41): GitHub CI on the PR head. Defaults keep hand-built rows valid.
     ci_passed: bool | None = None
     ci_status: CiStatus | None = None
+    # migration 007 (#58): "budget" when the attempt hit its per-attempt limit.
+    end_reason: EndReason | None = None
+    end_detail: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -301,7 +306,11 @@ def _from_db(name: str, value: Any) -> Any:
 
 
 def _row_to[T](cls: type[T], row: sqlite3.Row) -> T:
-    return cls(**{f.name: _from_db(f.name, row[f.name]) for f in fields(cls)})  # type: ignore[arg-type]
+    # A column a later migration adds is missing from rows read part-way through the
+    # migrations (a test of an older migration): the field's default stands in for it.
+    have = set(row.keys())
+    values = {f.name: _from_db(f.name, row[f.name]) for f in fields(cls) if f.name in have}  # type: ignore[arg-type]
+    return cls(**values)
 
 
 # --- Migrations -----------------------------------------------------------------------
@@ -795,6 +804,19 @@ class Store:
             attempt_id,
             values,
             frozenset({"ci_status", "ci_passed", "outcome", "verify_output_path"}),
+        )
+        return self.get_attempt(attempt_id)
+
+    def set_attempt_end_reason(
+        self, attempt_id: int, reason: EndReason | None, detail: str | None = None
+    ) -> Attempt:
+        """Record why an attempt ended (#58), e.g. ``("budget", "spent $1.52 of $1.50")``."""
+        self._update(
+            "attempts",
+            "id",
+            attempt_id,
+            {"end_reason": reason, "end_detail": detail},
+            frozenset({"end_reason", "end_detail"}),
         )
         return self.get_attempt(attempt_id)
 

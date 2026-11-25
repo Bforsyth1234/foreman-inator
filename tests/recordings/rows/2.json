@@ -9,6 +9,8 @@
    "cost_usd": 0.0,
    "diff_files": 1,
    "diff_lines": 14,
+   "end_detail": null,
+   "end_reason": null,
    "ended_at": "2026-01-05T09:23:00+00:00",
    "id": 5,
    "model": "qwen3.8-27b",
