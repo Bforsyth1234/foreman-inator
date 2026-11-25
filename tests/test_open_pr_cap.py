@@ -3,6 +3,9 @@
 
 from __future__ import annotations
 
+import contextlib
+import dataclasses
+import threading
 from pathlib import Path
 
 import pytest
@@ -98,6 +101,52 @@ def test_a_ticket_with_a_pr_is_never_held(tmp_path: Path) -> None:
         t = e.ticket(a)
         assert t.pr_number is not None and open_fman_prs(e.store, REPO) == 1
         assert e.worker.open_pr_gate(t)
+    finally:
+        e.close()
+
+
+@pytest.mark.timeout(300)
+def test_two_concurrent_publishes_at_cap_minus_one_open_exactly_one_pr(tmp_path: Path) -> None:
+    """max_parallel_per_repo > 1: two passed tickets publishing at once at cap - 1 must not
+    both pass the gate; the check and the PR's creation are atomic per repo."""
+    e = make_env(tmp_path, cap=1)
+    try:
+        a, b, c = label_three(e)
+        settle(e)
+        assert e.ticket(a).column == "testing" and open_fman_prs(e.store, REPO) == 1
+        held = [e.ticket(n) for n in (b, c)]
+        assert all(t.column == "in_progress" and t.pr_number is None for t in held)
+        e.worker.config = dataclasses.replace(e.worker.config, max_open_prs_per_repo=2)
+        # Both publishes reach PR creation together if nothing stops the second one.
+        meet = threading.Barrier(2)
+        real = e.gh.create_draft_pr
+
+        def create(repo: str, **kw: object) -> object:
+            with contextlib.suppress(threading.BrokenBarrierError):
+                meet.wait(timeout=3)  # broken: the other publish is held at the gate
+            return real(repo, **kw)
+
+        e.gh.create_draft_pr = create  # type: ignore[method-assign]
+        errors: list[BaseException] = []
+
+        def publish(t: object) -> None:
+            try:
+                e.worker.publish_job_for(t.id, e.store.list_attempts(t.id)[-1])  # type: ignore[attr-defined]
+            except BaseException as exc:  # noqa: BLE001 - reported below
+                errors.append(exc)
+
+        threads = [threading.Thread(target=publish, args=(t,)) for t in held]
+        for th in threads:
+            th.start()
+        for th in threads:
+            th.join(60)
+        assert not errors
+        assert open_fman_prs(e.store, REPO) == 2
+        assert len(open_prs(e)) == 2
+        cols = sorted(e.ticket(n).column for n in (b, c))
+        assert cols == ["in_progress", "testing"]
+        waiting = next(e.ticket(n) for n in (b, c) if e.ticket(n).column == "in_progress")
+        assert waiting.pr_number is None and waiting.flag_reason is None
     finally:
         e.close()
 

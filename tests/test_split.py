@@ -192,6 +192,102 @@ def test_a_retry_after_a_challenger_attempt_goes_back_to_the_champion(env, wins)
     assert split.pick(store, config, t, up, ep(config, "w-two"), [a], min_cases=2) is None
 
 
+def run_ladder(store: Store, config: Config, t: Any, outcome_of: Any, cap: int) -> list[Any]:
+    """Drive ``next_step`` + ``pick`` (as the worker does) over failing attempts until the
+    ticket is handed to the user or ``cap`` attempts ran. Returns the attempts."""
+    ladder = esc.build_ladder(config.models)
+    exp = split.active_split(store, min_cases=2)
+    ch = split.load_challenger(config, exp.challenger_variant)
+    for i in range(cap + 1):
+        done = store.list_attempts(t.id)
+        h = esc.History(tuple(done), routed_tier=t.routed_tier)
+        step = esc.next_step(h, ladder)
+        if isinstance(step, esc.HandToUser) or len(done) >= cap:
+            break
+        endpoint = config.model(step.model)
+        p = split.pick(store, config, t, step, endpoint, done, min_cases=2)
+        if p is not None:
+            endpoint = p.endpoint
+        challenger = p is not None and p.side == "challenger"
+        variant = ch.variant_id if challenger else vid(endpoint.name)
+        a = store.add_attempt(
+            t.id, model=endpoint.name, tier=endpoint.tier, trigger=step.trigger, variant_id=variant
+        )
+        store.finish_attempt(a.id, outcome_of(i))
+    return store.list_attempts(t.id)
+
+
+def opus_fable_env(tmp_path: Path) -> tuple[Store, Config]:
+    cloud = "https://c.example.invalid/v1"
+    config = Config(
+        app_id=1,
+        allowed_users=("brooks",),
+        repos=(REPO,),
+        models=(
+            ModelEndpoint("w-one", 1, "local", "w-one-up", LOCAL_URL, "fam-w"),
+            ModelEndpoint("w-two", 2, "local", "w-two-up", LOCAL_URL, "fam-w2"),
+            ModelEndpoint("opus", 3, "cloud", "opus-up", cloud, "fam-c", key_ref("c")),
+            ModelEndpoint("fable", 3, "cloud", "fable-up", cloud, "fam-c", key_ref("c")),
+            ModelEndpoint("rev-x", 3, "cloud", "rev-x-up", cloud, "fam-x", key_ref("x")),
+        ),
+        reviewer_models=("rev-x",),
+        experiments=ExperimentSettings(min_cases=2, live_min_sample=2),
+    )
+    store = Store(tmp_path / "fman.db")
+    variants.ensure_defaults(store, config)
+    variants.set_champion(store, "writer", vid("opus"))
+    return store, config
+
+
+FAILS = {
+    "failed checks": lambda i: "failed_checks",
+    "with kickbacks": lambda i: "kicked_back" if i % 3 == 1 else "failed_checks",
+    "kickbacks only": lambda i: "kicked_back",
+}
+
+
+@pytest.mark.parametrize("fails", FAILS.values(), ids=FAILS.keys())
+def test_split_retries_stay_bounded_when_the_challenger_rung_is_above_the_champion(
+    tmp_path: Path, wins, fails
+):
+    """7e: tier 3 Opus then Fable, champion Opus, challenger Fable. Only the retry right
+    after Fable's first attempt goes back to Opus; the ladder then reaches Fable's rung by
+    escalation and its retries stay there, so the ticket reaches the user."""
+    store, config = opus_fable_env(tmp_path)
+    try:
+        exp = start(store, config, "fable")
+        t = ticket_on(store, exp, "challenger")
+        store.update_ticket(t.id, routed_tier=3)
+        t = store.get_ticket(t.id)
+        bound = esc.attempt_bound(len(esc.build_ladder(config.models)))
+        done = run_ladder(store, config, t, fails, bound + 5)
+        assert len(done) <= bound
+        assert (done[0].model, done[0].variant_id) == ("fable", vid("fable"))
+        assert done[1].model == "opus"  # the retry right after it: the champion
+        last = esc.next_step(
+            esc.History(tuple(done), routed_tier=3), esc.build_ladder(config.models)
+        )
+        assert isinstance(last, esc.HandToUser)
+        assert any(a.model == "fable" and a.trigger == "escalation" for a in done)
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("fails", FAILS.values(), ids=FAILS.keys())
+def test_split_retries_stay_bounded_on_two_local_rungs_of_one_tier(env, wins, fails):
+    store, config = env
+    exp = start(store, config, "w-alt")
+    t = ticket_on(store, exp, "challenger")
+    ladder = esc.build_ladder(config.models)
+    bound = esc.attempt_bound(len(ladder))
+    done = run_ladder(store, config, t, fails, bound + 5)
+    assert len(done) <= bound
+    assert [a.model for a in done[:2]] == ["w-alt", "w-one"]
+    assert isinstance(
+        esc.next_step(esc.History(tuple(done), routed_tier=1), ladder), esc.HandToUser
+    )
+
+
 def test_no_traffic_unless_the_challenger_won_its_replay_against_this_champion(env, wins):
     store, config = env
     exp = start(store, config, "w-alt")

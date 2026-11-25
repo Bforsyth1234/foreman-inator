@@ -188,6 +188,9 @@ class QueueSteps:
         self._repo_locks: dict[str, threading.RLock] = {}
         self._waiting: dict[int, tuple[int, ...]] = {}  # ticket -> lock blockers (logging)
         self._pr_capped: set[int] = set()  # tickets waiting at the open-PR cap (logging)
+        # #77: repo -> lock held across the open-PR gate and the PR's creation, so two
+        # publishes at cap - 1 (max_parallel_per_repo > 1) cannot both open one.
+        self._pr_open_locks: dict[str, threading.Lock] = {}
 
     # ------------------------------------------------------------------ mirrors
 
@@ -270,6 +273,12 @@ class QueueSteps:
                 *wait,
             )
         return False
+
+    def pr_open_lock(self, repo: str) -> threading.Lock:
+        """#77: the lock a publish holds from its last open-PR gate check until its new PR
+        is saved on the ticket (see ``PublishSteps.publish_job_for``)."""
+        with self._lock:
+            return self._pr_open_locks.setdefault(repo, threading.Lock())
 
     def _lock_gate(self, t: Ticket) -> bool:
         """May ``t`` start (or publish) now? Locks its wanted files if so (#19)."""

@@ -35,10 +35,12 @@ challenger's id. The repo profile still applies to it (a cloud challenger meets 
 ``Spend.writer_gate``, including the thrifty approval; the per-attempt budget, #58, is
 enforced by the proxy on whatever model runs).
 
-A retry after a challenger first attempt goes back to the champion: a plain ``Retry`` on
-the challenger's model (a model challenger has its own rung on the ladder) runs on the
-champion's model instead (``pick`` returns the champion side for it). Escalations follow
-the ladder as usual. Every count stays bounded (7e).
+The retry right after a challenger first attempt goes back to the champion: a plain
+``Retry`` on the challenger's model (a model challenger has its own rung on the ladder)
+when the ticket's only counted, non-superseded attempt is the challenger's, runs on the
+champion's model instead (``pick`` returns the champion side for it). Only that one
+retry: later retries and escalations follow the ladder as usual, even when the ladder
+later reaches the challenger's rung, so every count stays bounded (7e).
 
 Judging (``score`` / ``judge``)
 -------------------------------
@@ -220,7 +222,7 @@ def pick(
     except variants.VariantError:
         return None
     if counted:
-        return _back_to_champion(store, config, ticket, step, exp, champ.model)
+        return _back_to_champion(store, config, ticket, step, exp, champ.model, counted)
     if not _plain_retry(step) or getattr(step, "trigger", None) != "first":
         return None  # an explore start (or anything else): not a plain first attempt
     if endpoint.name != champ.model:
@@ -248,14 +250,27 @@ def _plain_retry(step: Any) -> bool:
 
 
 def _back_to_champion(
-    store: Store, config: Any, ticket: Ticket, step: Any, exp: Experiment, champ_model: str
+    store: Store,
+    config: Any,
+    ticket: Ticket,
+    step: Any,
+    exp: Experiment,
+    champ_model: str,
+    counted: tuple[Attempt, ...] | list[Attempt],
 ) -> Pick | None:
-    """A plain retry on the challenger's model after a challenger first attempt runs on the
-    champion's model (with the champion's prompt)."""
+    """The plain retry on the challenger's model directly after the challenger's first
+    attempt runs on the champion's model (with the champion's prompt). Only that one
+    retry: once the ticket has more than that one counted attempt, the ladder decides,
+    even on the challenger's own rung (7e: swapping every later retry would reset the
+    per-rung counts each time and, with the challenger's rung above the champion's,
+    escalation would never end)."""
     if stored_side(store, ticket, exp.id) != "challenger":
         return None
     if not _plain_retry(step):
         return None  # escalations follow the ladder
+    done = [a for a in counted if a.outcome != "superseded"]
+    if len(done) != 1 or done[0].variant_id != exp.challenger_variant:
+        return None  # not the retry right after the challenger's first attempt
     try:
         ch_model = variants.parse_variant_id(exp.challenger_variant).model
     except variants.VariantError:

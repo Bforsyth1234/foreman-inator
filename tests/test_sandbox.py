@@ -456,6 +456,65 @@ def test_reads_outside_the_worktree_fail(att):
     assert res["own_file"] == "ok" and res["system"] == "ok"
 
 
+DOTENV_PROBE = r"""
+import json, os, sys
+from pathlib import Path
+out = {"exists": {p: os.path.exists(p) for p in sys.argv[1:]}, "found": {}, "error": None}
+try:  # python-dotenv's find_dotenv walk (every level, not stopping at the first hit)
+    here = Path.cwd()
+    for d in (here, *here.parents):
+        for name in (".env", ".env.local", ".env.test"):
+            c = d / name
+            if os.path.isfile(c):
+                with open(c) as f:
+                    out["found"][str(c)] = f.read()
+except OSError as e:
+    out["error"] = f"{e!r} {e.filename}"
+print(json.dumps(out))
+"""
+
+
+@macos
+def test_dotenv_files_above_the_worktree_are_invisible_and_its_own_readable(att):
+    """A dependency's ``load_dotenv()`` walks up from the worktree; a ``.env`` it can stat
+    but not open (``~/.env``) crashed test collection. Above the worktree: not even
+    ``stat``; the worktree's own ``.env`` reads as before."""
+    ancestors = [att.tmp, att.wt.path.parent, att.fhome]
+    decoys = [a / n for a in ancestors for n in (".env", ".env.local", ".env.test")]
+    for d in decoys:
+        d.write_text("SECRET=decoy\n")
+    (att.tmp / ".envrc").write_text("not a dotenv\n")
+    (att.wt.path / ".env").write_text("OWN=1\n")
+    probe = att.wt.path / "dotenv_probe.py"
+    probe.write_text(DOTENV_PROBE)
+    pol = att.policy().for_command(sys.executable)
+    paths = [str(d) for d in decoys] + [str(att.tmp / ".envrc"), str(att.wt.path / ".env")]
+    argv = sb.wrap([sys.executable, str(probe), *paths], pol)
+    out = subprocess.run(
+        argv, cwd=att.wt.path, env=sb.apply_env(os.environ, pol), capture_output=True, text=True,
+        timeout=60,
+    )  # fmt: skip
+    assert out.returncode == 0, out.stderr
+    res = json.loads(out.stdout)
+    assert res["error"] is None
+    assert res["found"] == {str(att.wt.path / ".env"): "OWN=1\n"}
+    assert not any(res["exists"][str(d)] for d in decoys)
+    assert res["exists"][str(att.wt.path / ".env")]
+    assert res["exists"][str(att.tmp / ".envrc")]  # only .env-style names lose their stat
+
+
+def test_ancestor_dotenv_deny_comes_after_every_read_allow(tmp_path):
+    pol = _plain_policy(tmp_path, read_files=(tmp_path / "f",))
+    lines = sb.render_profile(pol).splitlines()
+    allows = [i for i, x in enumerate(lines) if x.startswith("(allow file-read")]
+    for op in ("file-read*", "file-read-metadata"):  # metadata: its own rule (see module)
+        deny = next(i for i, x in enumerate(lines) if x.startswith(f"(deny {op} (regex"))
+        assert deny > max(allows)
+    assert f'(regex #"^{sb._re(tmp_path)}/\\.env(\\.[^/]*)?$")' in lines[deny]
+    assert '(regex #"^/\\.env(\\.[^/]*)?$")' in lines[deny]
+    assert str(tmp_path / "wt") + "/" not in lines[deny]  # the worktree's own stay readable
+
+
 @macos
 def test_writes_outside_the_worktree_fail(att):
     outside = att.tmp / "outside.txt"
