@@ -65,7 +65,7 @@ in the item, and put the shape you rely on behind one small adapter so a
 change touches one file.
 ============================================================ -->
 
-Next ID: #81
+Next ID: #82
 Legend: `[ ]` todo · `[~]` in progress · `[~] live` built, waiting on its live check · `[x]` done (move to DONE.md)
 
 ## Wave plan
@@ -489,4 +489,20 @@ Files: ⚬ EDITED: src/foreman_inator/runner/sandbox.py (profile rules), tests (
 Verify: a sandboxed process in a worktree with a decoy `.env` in a parent folder sees `os.path.exists` False, and a find_dotenv-style upward search does not raise; the worktree's own `.env` is readable; the existing sensitive-path tests stay green. Non-vacuous: drop the new metadata deny and the decoy test fails with PermissionError.
 Live (user): restart the worker, re-label bot-inator#56: verify collects its tests instead of failing at import.
 Scheduled: wave 16 (built with the wave 16 review fixes).
+Deviations:
+
+### Unscheduled (status on the issue, 2026-11-25)
+
+#81 — Say on the issue when work starts, and keep that one comment up to date [ ] · Added: 2026-11-25 · Source: user
+Ask: "add a todo and a github issue that states when the llm has started working on an issue to update it that states it is working on the issue".
+Why: today the worker posts on the issue only when something needs the user (needs-info questions, flags, the PR summary). Between labeling an issue and its PR appearing (often 20+ minutes, sometimes several attempts) the issue shows nothing, so from GitHub or the phone there is no way to tell "queued", "working" and "stuck" apart without `fman status` on the Mac.
+Idea:
+⚬ When a ticket's first attempt starts, post ONE status comment with a hidden marker (`<!-- foreman-inator:status -->`): "foreman-inator is working on this: attempt 1 on tier N (model), started HH:MM". On each later attempt, escalation, verify, review or PR step, EDIT that same comment (PATCH the issue comment) instead of posting a new one, so the issue gets one comment, not a stream. The last state stays: "PR #N opened", "handed over: <reason>", "dropped".
+⚬ Optional label `fman:working` while an attempt runs, removed when it ends. A bot-applied label never starts work (invariant 7b), and this label is not `agent`, so it can't loop.
+⚬ Config `status_comment = true` (default on) and `status_label = false`. Per repo off through the same repo settings as the profile.
+⚬ The status comment is excluded everywhere bot comments already are: it is never an answer to needs-info, never in #48's issue-comments context, never counted as user activity.
+⚬ Rate: at most one edit per state change (no per-turn updates), so a long attempt makes a handful of API calls.
+Safety: text in the comment is the worker's own (model name, tier, step, times, PR link); no model output and no cost figures unless the user turns `status_show_cost` on, since issue comments on a public repo are public.
+Verify: first attempt start posts exactly one marked comment; escalation and PR open edit it (comment count unchanged); a restart finds the existing comment by marker and edits it instead of posting a second; the needs-info answer detector and the issue-comments context ignore it; with `status_comment = false` nothing is posted. Non-vacuous: drop the marker lookup and the restart test posts a second comment.
+Estimate: about 2 hours with tests (needs `update_comment` in the GitHub client and the fake). Related: #44 (needs-info), #48 (comments), #76 (activity page shows the same state on the Mac).
 Deviations:
