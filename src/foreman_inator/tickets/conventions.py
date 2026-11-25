@@ -21,7 +21,8 @@ outside it is ignored, since ``owned_files`` comes from issue text.
 ``render`` turns the result into the text that goes inside the writer prompt's
 ``conventions`` fence; the reviewer (#39) and ``fman rules show`` (#42) use the same
 function, so all three show exactly the same block. ``Conventions.sha256`` is the hash of
-that block, for the attempt span and replay records.
+that block, for the attempt span and replay records. ``describe`` lists the sources, their
+character counts and every cut (``CLIPPED at N chars``), for ``fman rules show``.
 """
 
 from __future__ import annotations
@@ -120,6 +121,33 @@ def render(conv: Conventions) -> str:
     reviewer and ``fman rules show``."""
     parts = [f"[{s.label}]\n{defuse(s.text)}" for s in conv.sources]
     return "\n\n".join(parts)
+
+
+CLIPPED = "CLIPPED at {shown} chars"
+
+
+def describe(conv: Conventions) -> list[str]:
+    """One line per source for ``fman rules show`` (#42): kind, path, characters in the
+    file, and ``CLIPPED at N chars`` for each source the shared budget cut (``N`` = what
+    is shown; 0 = left out). Then each duplicate repo file that was skipped. Sources are
+    in display order; sources left out entirely follow them."""
+    lines = []
+    for s in conv.sources:
+        line = f"{s.kind:<10} {s.path}  {s.chars} chars"
+        if s.clipped:
+            shown = next((c.shown for c in conv.clips if c.path == s.path), len(s.text))
+            line += "  " + CLIPPED.format(shown=shown)
+        lines.append(line)
+    for c in conv.clips:
+        if c.shown == 0:
+            lines.append(
+                f"{c.kind:<10} {c.path}  {c.chars} chars  "
+                + CLIPPED.format(shown=0)
+                + " (left out: the budget was used up)"
+            )
+    for path in conv.skipped:
+        lines.append(f"{'skipped':<10} {path}  (same file or text as an earlier source)")
+    return lines
 
 
 # --------------------------------------------------------------------------- gathering
