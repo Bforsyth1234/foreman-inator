@@ -58,6 +58,8 @@ Layout (every key optional; missing keys take the defaults below)::
     base_url = "https://api.z.ai/api/coding/paas/v4"
     family = "glm"       # reviewer must be a different family from the writer
     api_key_ref = "keychain:foreman-inator/glm"
+    # wire = "openai"    # openai | anthropic: how OpenCode talks to it through the proxy
+    #                    # (#52). "anthropic": the native Messages route, with prompt caching.
 
 Unknown keys are an error, and so is anything that looks like a plain-text key.
 """
@@ -93,6 +95,11 @@ DEFAULT_ATTEMPT_MAX_INPUT_TOKENS_LOCAL = 4_000_000
 DEFAULT_RETENTION_DAYS = 90.0
 
 Kind = Literal["local", "cloud"]
+#: #52: the API shape a writer's OpenCode provider speaks to the proxy for this model.
+#: "openai": ``chat/completions`` (every model). "anthropic": the native Messages route
+#: (``/v1/messages``, passthrough), which carries prompt caching for Claude models.
+Wire = Literal["openai", "anthropic"]
+WIRES = ("openai", "anthropic")
 
 # Keys whose presence means someone pasted a secret into the file.
 _SECRET_KEYS = {"api_key", "apikey", "key", "token", "secret", "password"}
@@ -174,6 +181,10 @@ class ModelEndpoint:
     base_url: str  # OpenAI-compatible base URL
     family: str  # e.g. "inkling", "qwen", "glm", "claude"; reviewer independence compares this
     api_key_ref: str | None = None  # keychain:foreman-inator/<name>
+    #: #52: "anthropic" gives OpenCode an ``@ai-sdk/anthropic`` provider and the proxy's
+    #: Messages route (prompt caching); "openai" (default) the OpenAI-compatible one. The
+    #: reviewer and router use ``chat/completions`` whatever this says.
+    wire: Wire = "openai"
 
     @property
     def is_cloud(self) -> bool:
@@ -238,6 +249,7 @@ def default_models() -> tuple[ModelEndpoint, ...]:
             "https://api.anthropic.com/v1",
             "claude",
             key_ref("anthropic"),
+            wire="anthropic",
         ),
         ModelEndpoint(
             "claude-fable",
@@ -247,6 +259,7 @@ def default_models() -> tuple[ModelEndpoint, ...]:
             "https://api.anthropic.com/v1",
             "claude",
             key_ref("anthropic"),
+            wire="anthropic",
         ),
     )
 
@@ -522,6 +535,8 @@ def _validate_model(m: ModelEndpoint) -> None:
         raise ConfigError(f"{where}: tier must be one of {TIERS}")
     if m.kind not in ("local", "cloud"):
         raise ConfigError(f"{where}: kind must be 'local' or 'cloud'")
+    if m.wire not in WIRES:
+        raise ConfigError(f"{where}: wire must be 'openai' or 'anthropic'")
     if not m.family:
         raise ConfigError(f"{where}: family is required")
     url = urlparse(m.base_url)
@@ -593,7 +608,7 @@ def _model_from_dict(raw: Any, where: str) -> ModelEndpoint:
     _typed(raw, dict, where)
     allowed = {f.name for f in fields(ModelEndpoint)}
     _check_keys(raw, allowed, where)
-    missing = sorted(allowed - {"api_key_ref"} - set(raw))
+    missing = sorted(allowed - {"api_key_ref", "wire"} - set(raw))
     if missing:
         raise ConfigError(f"{where}: missing key(s) {', '.join(missing)}")
     return ModelEndpoint(
@@ -604,6 +619,7 @@ def _model_from_dict(raw: Any, where: str) -> ModelEndpoint:
         base_url=_typed(raw["base_url"], str, f"{where}.base_url"),
         family=_typed(raw["family"], str, f"{where}.family"),
         api_key_ref=_typed(raw.get("api_key_ref"), (str, type(None)), f"{where}.api_key_ref"),
+        wire=_typed(raw.get("wire", "openai"), str, f"{where}.wire"),  # type: ignore[arg-type]
     )
 
 
@@ -756,6 +772,7 @@ def to_dict(cfg: Config) -> dict[str, Any]:
             f.name: getattr(m, f.name)
             for f in fields(ModelEndpoint)
             if getattr(m, f.name) is not None
+            and not (f.name == "wire" and m.wire == "openai")  # the default stays implicit
         }
         for m in cfg.models
     ]
