@@ -64,6 +64,8 @@ def _line(
     if t.pr_number is not None:
         parts.append(f"PR #{t.pr_number}")
     line = "  ".join(parts)
+    if t.column in ("done", "dropped"):
+        return line  # #50: a closed ticket's flag is history, not something for the user
     if t.flag_reason and t.flag_reason.startswith(FLAG_SPEND_CAP):
         line += (
             f"\n         WAITING: spend approval ({t.flag_reason}); run `fman approve-spend {t.id}`"
@@ -74,9 +76,22 @@ def _line(
     if blockers:
         held = ", ".join(f"#{b}" for b in blockers)
         line += f"\n         WAITING: on files held by ticket(s) {held}"
+        line += _release_hint(blockers, store)
     for why in _waits(t, attempts, store):
         line += f"\n         WAITING: {why}"
     return line
+
+
+def _release_hint(blockers: Sequence[int], store: Store | None) -> str:
+    """#55: for a blocker that is flagged for the user, say what releases its files."""
+    if store is None:
+        return ""
+    hints = []
+    for b in blockers:
+        bt = store.get_ticket(b)
+        if bt.flag_reason:
+            hints.append(f"#{b} is flagged: close or re-label issue {bt.repo}#{bt.issue_number}")
+    return f" ({'; '.join(hints)})" if hints else ""
 
 
 def _waits(t: Ticket, attempts: Sequence[Attempt], store: Store | None) -> list[str]:
