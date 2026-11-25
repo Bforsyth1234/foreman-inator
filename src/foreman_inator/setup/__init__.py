@@ -74,9 +74,11 @@ def register_app(
     transport: httpx.BaseTransport | None = None,
     api_url: str = API_URL,
     timeout: float = manifest.CALLBACK_TIMEOUT_SECONDS,
+    relay_url: str | None = None,
 ) -> manifest.AppCredentials:
-    """Run the manifest flow in the browser and return the new App's credentials."""
-    with manifest.CallbackServer(org=org, app_name=app_name) as server:
+    """Run the manifest flow in the browser and return the new App's credentials.
+    ``relay_url`` (#15): the App is registered with its webhook pointed there."""
+    with manifest.CallbackServer(org=org, app_name=app_name, relay_url=relay_url) as server:
         echo(f"Opening your browser to create the App: {server.start_url}")
         opener(server.start_url)
         code = server.wait_for_code(timeout)
@@ -85,6 +87,24 @@ def register_app(
     if creds.permissions and unexpected:
         echo(f"Warning: GitHub reports permissions beyond the manifest: {unexpected}")
     return creds
+
+
+def _with_relay(cfg: config.Config, relay_url: str, secret: str, echo: Echo) -> config.Config:
+    """#15: save ``relay_url`` and the secret's Keychain reference; store ``secret`` (the
+    one GitHub returned when it created the App) under ``relay-webhook-secret``."""
+    from foreman_inator.github.relay import DEFAULT_SECRET_NAME
+
+    if secret:
+        ref = config.set_key(DEFAULT_SECRET_NAME, secret)
+        echo(f"Webhook relay: {relay_url}; the App's webhook secret is in the Keychain.")
+    else:
+        ref = config.key_ref(DEFAULT_SECRET_NAME)
+        echo(
+            "Webhook relay saved. The App already exists, so set its webhook URL to the relay "
+            "and its secret in the App's settings on GitHub, then store the same secret with "
+            f"`fman config set-key {DEFAULT_SECRET_NAME}` (see docs/relay.md)."
+        )
+    return replace(cfg, relay_url=relay_url, relay_secret_ref=ref)
 
 
 def run_setup(
@@ -110,10 +130,14 @@ def run_setup(
     poll_interval: float = manifest.INSTALL_POLL_SECONDS,
     clock: manifest.Clock = time.monotonic,
     sleep: manifest.Sleep = time.sleep,
+    relay_url: str | None = None,
 ) -> SetupResult:
     """``repos``: the repos to work on (``--repo``), replacing the list; None leaves the
     choice to ``choose_repos`` (ask through ``ask`` on a first run, or keep the list).
-    ``ask`` None means no terminal: nothing is asked and the list is not widened."""
+    ``ask`` None means no terminal: nothing is asked and the list is not widened.
+    ``relay_url`` (#15, ``--relay-url``): a new App gets its webhook pointed at the relay,
+    and the webhook secret GitHub returns is stored in the Keychain
+    (``relay-webhook-secret``); ``relay_url`` and ``relay_secret_ref`` are saved."""
     cfg = config.load()
     on_disk = cfg
     key_path = paths.app_key_path()
@@ -124,6 +148,8 @@ def run_setup(
         echo(f"Using the App already configured (id {cfg.app_id}).")
         if allowed_users:
             cfg = manifest.add_allowed_users(cfg, allowed_users)
+        if relay_url and relay_url != cfg.relay_url:
+            cfg = _with_relay(cfg, relay_url, "", echo)
     else:
         creds = register_app(
             opener=opener,
@@ -133,9 +159,12 @@ def run_setup(
             transport=transport,
             api_url=api_url,
             timeout=callback_timeout,
+            relay_url=relay_url,
         )
         paths.write_app_key(creds.pem)
         cfg = manifest.apply_app(cfg, creds, allowed_users)
+        if relay_url:
+            cfg = _with_relay(cfg, relay_url, creds.webhook_secret, echo)
         config.save(cfg)  # keep the App even if a later step fails
         on_disk = cfg
         result.created_app = True
@@ -732,6 +761,14 @@ def setup_command(
             show_default=False,
         ),
     ] = None,
+    relay_url: Annotated[
+        str | None,
+        _opt(
+            "--relay-url",
+            help="Webhook relay (https) whose deliveries trigger an early poll (docs/relay.md).",
+            show_default=False,
+        ),
+    ] = None,
 ) -> None:
     """Register your own GitHub App, check dependencies and install the launchd agent.
 
@@ -749,6 +786,13 @@ def setup_command(
             given = [check_repo_name(r) for r in repo]
         except RepoCommandError as exc:
             raise typer.BadParameter(str(exc), param_hint="--repo") from exc
+    if relay_url is not None:
+        from foreman_inator.github.relay import RelayConfigError, check_relay_url
+
+        try:
+            relay_url = check_relay_url(relay_url)
+        except RelayConfigError as exc:
+            raise typer.BadParameter(str(exc), param_hint="--relay-url") from exc
     interactive = sys.stdin.isatty() and sys.stdout.isatty()
     try:
         run_setup(
@@ -759,6 +803,7 @@ def setup_command(
             repos=given,
             ask=_prompt if interactive else None,
             install_service=not no_service,
+            relay_url=relay_url,
         )
     except (manifest.ManifestFlowError, launchd.ServiceError, config.ConfigError) as exc:
         typer.echo(f"Setup stopped: {exc}", err=True)

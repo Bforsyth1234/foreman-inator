@@ -37,6 +37,7 @@ from foreman_inator.db.store import Attempt, Review, Ticket
 from foreman_inator.github.app_auth import GitHubNotFound
 from foreman_inator.locks import DORMANT_FLAGS, flag_kind, predict_files
 from foreman_inator.pr.summary import post_summary
+from foreman_inator.retry import FLAG_RETRY_ROUND, RETRYABLE_FLAGS
 from foreman_inator.routing import Override
 from foreman_inator.routing import escalation as esc
 from foreman_inator.tickets import lifecycle
@@ -161,12 +162,23 @@ class ActionHandlers:
         ctx.publish = res
         ctx.ticket = self.store.get_ticket(t.id)
         log.info("ticket %d: PR #%d %s (draft until reviewed)", t.id, res.pr.number, res.action)
+        if res.action == "created":
+            self.status_update(ctx.ticket, "pr_opened", pr_number=res.pr.number)  # type: ignore[attr-defined]  # #77
         if res.action in ("closed", "merged"):
             ctx.stop = True  # a person closed or merged it; the poller reports that next
 
     def _a_ai_review(self, ctx: Ctx) -> None:
         """Checks passed and the draft PR is up: the AI review (``worker_review``)."""
         assert ctx.ticket is not None and ctx.attempt is not None
+        att = ctx.attempt
+        self.status_update(  # type: ignore[attr-defined]  # #77
+            ctx.ticket,
+            "reviewing",
+            attempt=len(self.store.list_attempts(ctx.ticket.id)),
+            tier=att.tier,
+            model=att.model,
+            started_at=att.started_at,
+        )
         self.review_stage(ctx.ticket, ctx.attempt, ctx.cancel)  # type: ignore[attr-defined]
 
     def _a_mark_ready(self, ctx: Ctx) -> None:
@@ -348,6 +360,8 @@ class ActionHandlers:
     def _a_release_locks(self, ctx: Ctx) -> None:
         if ctx.ticket is not None and self.locks.release(ctx.ticket):
             log.info("ticket %d: file locks released", ctx.ticket.id)
+        if ctx.ticket is not None and ctx.ticket.column == "dropped":
+            self.status_update(ctx.ticket, "dropped")  # type: ignore[attr-defined]  # #77
 
     def _a_cleanup_worktree(self, ctx: Ctx) -> None:
         if ctx.ticket is not None:
@@ -452,6 +466,10 @@ _FLAG_TEXT = {
         "and no model was charged. Fix the cause on the worker's Mac; the worker's log "
         "has the details."
     ),
+    FLAG_RETRY_ROUND: (
+        "The extra round a manual retry (`fman retry`) gives is used up, so "
+        "foreman-inator handed this issue to you again."
+    ),
     lifecycle.FLAG_REBASE_CAP: (
         "The pull request still conflicts with its base branch after the rebase attempts "
         "foreman-inator makes, so the conflict goes to you."
@@ -504,6 +522,12 @@ def flag_comment(ticket: Ticket, reason: str, *, pr_number: int | None = None) -
             "To start over, remove the `agent` label and add it again. Nothing else will "
             "run on this issue until then.",
         ]
+        if kind in RETRYABLE_FLAGS:  # #79: or retry it, keeping its history
+            lines.append(
+                "Once the cause is fixed, you can also retry it on the worker's Mac, "
+                f"keeping its attempts and branch: `fman retry {ticket.repo}#{ticket.issue_number}`"
+                " (add `--up` to move up a tier)."
+            )
         if ticket.pr_number is None and flag_kind(reason) in DORMANT_FLAGS:
             lines.append(  # #55: a dormant ticket's file locks are released
                 "While it waits, its file locks are released so other issues can change the "

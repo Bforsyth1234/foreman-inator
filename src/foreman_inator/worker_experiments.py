@@ -416,6 +416,41 @@ def stop_split(store: Store, experiment_id: int) -> Experiment:
     return store.end_experiment(exp.id, "rejected", note)
 
 
+CANCEL_NOTE = "cancelled from the metrics page"
+
+
+def cancel_experiment(
+    store: Store, experiment_id: int, *, note: str = CANCEL_NOTE, home: Path | None = None
+) -> Experiment:
+    """End a running experiment as ``rejected`` without promoting anything (#67, the
+    metrics page's Cancel button). A split ends as ``split stop`` ends it. A replay or
+    seeded run is ended under the run lock, so no ``fman experiment run`` is replaying it
+    at that moment (refused while one runs: stop it first); ``run --all`` then skips it,
+    since it resumes only running experiments. Its stored comparison is kept in the note."""
+    exp = store.get_experiment(experiment_id)
+    if exp.status != "running":
+        raise ExperimentError(f"#{exp.id} is not running ({exp.status})")
+    if exp.mode == "split":
+        c = split_mod.score(store, exp.id)
+        j = split_mod.judge(c)
+        return store.end_experiment(
+            exp.id, "rejected", f"{note}\n{split_mod.comparison_note(c, j)}"
+        )
+    if exp.mode not in ("replay", "seeded"):
+        return store.end_experiment(exp.id, "rejected", f"{exp.result_note or ''}\n{note}".strip())
+    try:
+        with run_lock(home):
+            out = store.end_experiment(
+                exp.id, "rejected", f"{exp.result_note or ''}\n{note}".strip()
+            )
+    except ExperimentError:  # the lock is held: a run is replaying right now
+        raise ExperimentError(
+            f"an experiment run is in progress; stop it first, then cancel #{exp.id}"
+        ) from None
+    log.info("experiment %d: %s", exp.id, note)
+    return out
+
+
 def split_lines(store: Store, config: Config, experiment_id: int | None = None) -> list[str]:
     """``fman experiment split status [id]`` (reads only)."""
     exps = (
@@ -504,6 +539,7 @@ def build_deps(
         spend=spend,
         recordings_dir=rec,
         config=config,
+        traces_dir=paths.traces_dir(),  # #78: stored image descriptions
     )
 
 
@@ -644,6 +680,7 @@ def run_command(
     mode: str = "replay",
     seed: int | None = None,
     kinds: list[str] | tuple[str, ...] | None = None,
+    cancel: threading.Event | None = None,
 ) -> int:
     """``fman experiment run``: its own proxy, its own mirrors, the run lock, clean stops.
     ``local_slots``: the worker proxy's ``slots`` when run inside the worker (#34).
@@ -651,7 +688,8 @@ def run_command(
     challenger side only; ``challenger`` may then be omitted (the champion's model and
     prompt). ``mode="seeded"`` (#35, ``--mode seeded``): a reviewer challenger against
     the champion on merged cases with a planted bug (``replay_runner.run_seeded``);
-    ``seed`` and ``kinds`` choose the mutations."""
+    ``seed`` and ``kinds`` choose the mutations. ``cancel`` (#67): an event that stops the
+    run cleanly when set, as SIGINT does on the CLI (the metrics page's Stop button)."""
     from foreman_inator import config as config_mod
     from foreman_inator.spend import Spend
 
@@ -688,6 +726,8 @@ def run_command(
 
         env = RunEnv(store, cfg, build_deps(store, cfg, proxy=proxy, spend=spend,
                                             driver=driver_factory()))  # fmt: skip
+        if cancel is not None:
+            env.cancel = cancel
         old = install_cancel_handlers(env.cancel) if _main_thread() else {}
         try:
             if all_:
@@ -763,11 +803,216 @@ from foreman_inator.worker_promote import (  # noqa: E402
 )
 from foreman_inator.worker_replay import replay_command, replay_report  # noqa: E402
 
+# =========================================================================== #49 drafts
+
+
+def _proposer_name(config: Config, proposer: str | None) -> str | None:
+    return proposer or config.experiments.proposer_model or None
+
+
+def _require_db() -> Path:
+    db = paths.db_path()
+    if not db.exists():
+        raise ExperimentError("no database yet: run the worker first")
+    return db
+
+
+def draft_lines(draft: Any) -> list[str]:
+    """What ``fman experiment propose`` prints for a stored draft (and the page shows)."""
+    path = Path(draft.path)
+    return [
+        f"Draft #{draft.id}: {draft.role} prompt {draft.prompt_name} (from {draft.base_variant},"
+        f" proposed by {draft.proposer_model})",
+        f"  draft:     {path}",
+        f"  rationale: {path.with_name(path.stem + '.rationale.md')}",
+        f"  cutoff:    {draft.cutoff_at:%Y-%m-%d} (its replay uses only tickets created after it)",
+        f"  estimated cost ${draft.est_cost_usd:.4f}; spent ${draft.cost_usd:.4f}",
+        "",
+        *draft.rationale.strip().splitlines(),
+        "",
+        f"Read and edit the draft, then `fman experiment approve-draft {draft.id}` (registers"
+        f" it and starts its replay) or `fman experiment discard-draft {draft.id}`.",
+    ]
+
+
+def propose_command(
+    *,
+    role: str,
+    proposer: str | None = None,
+    echo: Callable[[str], None] = print,
+    config: Config | None = None,
+    proxy_factory: Callable[[Config, Store, Any], Any] | None = None,
+    db: Path | None = None,
+) -> Any:
+    """``fman experiment propose --role R [--proposer M]`` (#49): one proposer call through
+    this process's own proxy (experiments bucket, spend caps); stores a draft, registers
+    nothing. Returns the draft; ``ExperimentError`` when refused or failed. ``db``: the
+    database (default ``paths.db_path()``; the metrics page passes its own)."""
+    from foreman_inator import config as config_mod
+    from foreman_inator.experiments import propose as pp
+    from foreman_inator.spend import Spend
+
+    cfg = config or config_mod.load()
+    if db is not None and not Path(db).exists():
+        raise ExperimentError("no database yet: run the worker first")
+    with Store(db or _require_db()) as store:
+        spend = Spend(store, cfg)
+        proxy = (proxy_factory or make_proxy)(cfg, store, spend)
+        try:
+            draft = pp.propose(
+                store,
+                cfg,
+                role,
+                proxy=proxy,
+                proposer=_proposer_name(cfg, proposer),
+                spend=spend,
+                holdout_days=cfg.experiments.proposer_holdout_days,
+                lookback_days=cfg.experiments.proposer_lookback_days,
+            )
+        except (pp.ProposeError, ConfigError) as exc:
+            raise ExperimentError(str(exc)) from None
+        finally:
+            with contextlib.suppress(Exception):
+                proxy.stop()
+    for line in draft_lines(draft):
+        echo(line)
+    return draft
+
+
+def approve_draft_only(store: Store, draft_id: int) -> Any:
+    """#49: the user's approval of draft ``draft_id``: install and register it and start
+    (not run) its cutoff replay. Holds the run lock (it syncs the replay mirrors)."""
+    from foreman_inator.experiments import propose as pp
+
+    rec = paths.recordings_dir()
+    with run_lock():
+        try:
+            return pp.approve_draft(
+                store,
+                draft_id,
+                mirror_for=mirror_for(
+                    store,
+                    worker_root=paths.worktrees_dir(),
+                    # the mirrors ``build_deps`` gives the run, so the replay reuses them
+                    replay_root=replays_root() / "mirrors",
+                    recordings_dir=rec,
+                ),
+                recordings_dir=rec,
+            )
+        except pp.ProposeError as exc:
+            raise ExperimentError(str(exc)) from None
+
+
+def approve_draft_command(
+    draft_id: int,
+    *,
+    echo: Callable[[str], None] = print,
+    run: bool = True,
+    **run_kw: Any,
+) -> int:
+    """``fman experiment approve-draft ID``: approve, then run its replay exactly as
+    ``fman experiment run --role R --challenger V`` (``run=False`` stops after the start)."""
+    with Store(_require_db()) as store:
+        a = approve_draft_only(store, draft_id)
+    echo(
+        f"Approved draft #{a.draft.id}: challenger {a.variant_id} ({a.prompt_path}),"
+        f" replay experiment #{a.experiment_id} on set #{a.set_id}."
+    )
+    if not run:
+        echo(f"Run it with `{a.run_hint}`.")
+        return 0
+    return run_command(role=a.draft.role, challenger=a.variant_id, all_=False, echo=echo,
+                       **run_kw)  # fmt: skip
+
+
+def discard_draft_command(draft_id: int, *, echo: Callable[[str], None] = print) -> Any:
+    """``fman experiment discard-draft ID``: mark it discarded and remove its files."""
+    from foreman_inator.experiments import propose as pp
+
+    with Store(_require_db()) as store:
+        try:
+            d = pp.discard_draft(store, draft_id)
+        except pp.ProposeError as exc:
+            raise ExperimentError(str(exc)) from None
+    echo(f"Discarded draft #{d.id} ({d.prompt_name}).")
+    return d
+
+
+# =========================================================================== #18 fork
+
+
+def fork_settings(config: Config) -> Any:
+    from foreman_inator.tracing import fork
+
+    ex = config.experiments
+    return fork.ForkSettings(
+        writer_timeout_s=float(ex.fork_writer_timeout_s), budget_usd=float(ex.fork_budget_usd)
+    )
+
+
+def fork_command(
+    attempt: int,
+    *,
+    model: str | None = None,
+    prompt: str | None = None,
+    step: int | None = None,
+    echo: Callable[[str], None] = print,
+    config: Config | None = None,
+    proxy_factory: Callable[[Config, Store, Any], Any] | None = None,
+    driver_factory: Callable[[Any], Any] | None = None,
+    cancel: threading.Event | None = None,
+) -> int:
+    """``fman replay --fork ATTEMPT [--model M] [--prompt P] [--step N]`` (#18): restart a
+    recorded attempt at its failure step (``tracing.fork``). 0 when the fork ran, 2 when
+    it could not start (``ForkError``: the message says why)."""
+    from foreman_inator import config as config_mod
+    from foreman_inator.spend import Spend
+    from foreman_inator.tracing import fork
+
+    cfg = config or config_mod.load()
+    cancel = cancel or threading.Event()
+    with run_lock(), Store(_require_db()) as store:
+        spend = Spend(store, cfg)
+        proxy = (proxy_factory or make_proxy)(cfg, store, spend)
+        try:
+            if driver_factory is not None:
+                driver = driver_factory(proxy)
+            else:
+                from foreman_inator.runner.opencode import OpenCodeDriver
+
+                driver = OpenCodeDriver(extra_time=getattr(proxy, "queue_wait", None))
+            deps = build_deps(store, cfg, proxy=proxy, spend=spend, driver=driver)
+            old = install_cancel_handlers(cancel) if _main_thread() else {}
+            try:
+                res = fork.fork_attempt(deps, attempt, model=model, prompt=prompt, step=step,
+                                        settings=fork_settings(cfg), cancel=cancel)  # fmt: skip
+            except fork.ForkError as exc:
+                echo(f"cannot fork attempt {attempt}: {exc}")
+                return 2
+            finally:
+                for sig, h in old.items():
+                    signal.signal(sig, h)
+        finally:
+            with contextlib.suppress(Exception):
+                proxy.stop()
+    for line in res.lines():
+        echo(line)
+    return 0
+
+
 __all__ = [
     "ExperimentError",
     "PromoteResult",
     "RunEnv",
+    "approve_draft_command",
+    "approve_draft_only",
+    "discard_draft_command",
+    "draft_lines",
+    "fork_command",
+    "fork_settings",
+    "propose_command",
     "build_deps",
+    "cancel_experiment",
     "champion_variant",
     "ensure_shadow",
     "install_cancel_handlers",

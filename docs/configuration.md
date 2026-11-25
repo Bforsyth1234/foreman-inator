@@ -50,6 +50,14 @@ as `"keychain:foreman-inator/<name>"`.
 | `cold_load_timeout_seconds` | `120` | Extra seconds the clarity check and the router wait when Ollama says their model is not loaded yet (a cold load); a timeout while the model loads is retried once. The worker asks tier 1's local Ollama (`/api/ps`). 0 to 3600. |
 | `max_local_inference` | `1` | Local-model calls in flight at once, across the worker and its experiment runs; the rest queue. Time spent queued never counts against an attempt's writer timeout. Cloud calls and embeddings are not limited. 1 to 16. |
 | `retention_days` | `90` | Days `fman prune` and the worker's daily prune keep an unmerged ticket's recordings and traces and ended attempts' scratch. At least 1. |
+| `classifier_router` | `true` | Route with a trained classifier on the issue embeddings once it beats the nearest-neighbor router on the held-out newest 20% of accepted tickets (chronological split; a tie keeps nearest-neighbor). The comparison is rechecked daily. `false`: nearest-neighbor only. |
+| `classifier_min_tickets` | `300` | Accepted tickets before the classifier is trained at all. At least 1. |
+| `relay_url` | none | A webhook relay (smee.io or your own; https, or http to localhost). Each delivery that verifies against the App's webhook secret triggers an immediate poll; nothing in a delivery is trusted. None: polling only. See [relay.md](relay.md). |
+| `relay_min_poll_gap_seconds` | 15 | The least time (0 to 3600 s) between a poll and a relay-nudged one. Nudges inside it are coalesced into one poll when it passes, so a flood of deliveries (replayed or not) polls at most once per gap. |
+| `relay_secret_ref` | none | Keychain reference of the webhook secret. None reads `keychain:foreman-inator/relay-webhook-secret`, where `fman setup --relay-url` stores it. |
+| `status_comment` | `true` | Keep one comment on the issue up to date while work runs: attempt and tier, verifying, in review, PR opened, handed over, dropped. Edited in place, never one per step. A repo's settings row can turn it off. |
+| `status_label` | `false` | Also add the `fman:working` label while work runs (removed when it stops). It never starts work. |
+| `status_show_cost` | `false` | Put the spend so far in the status comment. Issue comments on a public repo are public. |
 
 ## `[spend_caps]`
 
@@ -127,6 +135,11 @@ Replays, the shadow reviewer and the nightly run.
 | `shadow_timeout_s` | `900` | Time limit for one shadow review. |
 | `nightly_hour` | `2` | Local hour (0–23) of the nightly `fman experiment run --all`. Takes effect when `fman setup` is run again. |
 | `nightly_minute` | `0` | Its minute (0–59). |
+| `proposer_holdout_days` | `30` | `fman experiment propose`: the proposer reads kickbacks created before now minus this; the challenger's replay uses only tickets after it. At least 1. |
+| `proposer_lookback_days` | `90` | ...and no older than that cutoff minus this. At least 1. |
+| `proposer_model` | `""` | The tier 3 model that drafts prompts. `""`: the first one independent of the scoring reviewer. |
+| `fork_budget_usd` | `1.0` | Cloud spend one `fman replay --fork` may use, inside the experiments budget. 0 or more. |
+| `fork_writer_timeout_s` | `1200` | Time limit for one fork's writer session. Above 0. |
 
 Timeouts are in seconds and must be above 0.
 
@@ -146,6 +159,7 @@ every model is one rung of the escalation ladder.
 | `base_url` | yes | OpenAI-compatible base URL. |
 | `family` | yes | For example `"qwen"` or `"claude"`. The AI reviewer must be from a different family than the writer. |
 | `api_key_ref` | for cloud | `"keychain:foreman-inator/<name>"`. |
+| `vision` | no | `true`: this model takes images. Images that allowed users attached to the issue (body, answers, comments) are fetched by the worker from GitHub's attachment hosts and described by a vision model (a local one first; a cloud one only when the repo allows cloud, inside the spend caps); the writer gets the descriptions as text. Default `false`. |
 | `wire` | no | How the writer (OpenCode) talks to the model through the proxy: `"openai"` (default, `chat/completions`) or `"anthropic"` (Anthropic's native Messages route, `/v1/messages`, which keeps prompt caching). The reviewer and router use `chat/completions` either way. |
 
 The defaults:

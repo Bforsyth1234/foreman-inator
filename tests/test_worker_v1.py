@@ -193,7 +193,9 @@ def test_two_failed_checks_escalate_instead_of_a_third_try(env: Env) -> None:
     assert [a.tier for a in attempts] == [1, 1, 2]
     assert all(a.verify_output_path and Path(a.verify_output_path).exists() for a in attempts)
     assert t.column == "in_progress" and t.flag_reason is None
-    assert not env.gh.writes_named("post_comment")
+    # #77: only the status comment (its own marker) is posted while the ticket works.
+    posted = env.gh.writes_named("post_comment")
+    assert all("foreman-inator:status" in c.args["body"] for c in posted)
     assert not env.gh.writes_named("create_draft_pr")
     # The retry was told why: the check output is in its prompt.
     assert "CHECK OUTPUT" in env.driver.prompts[1] and "fail" in env.driver.prompts[1]
@@ -238,7 +240,11 @@ def test_no_verify_command_flags_once_then_set_verify_resumes(tmp_path: Path) ->
         e.once()
         t = e.ticket(n)
         assert t.column == "todo" and t.flag_reason.startswith("no_verify_command")
-        comments = e.gh.writes_named("post_comment")
+        comments = [  # #77: the status comment is a separate, marked comment
+            c
+            for c in e.gh.writes_named("post_comment")
+            if "foreman-inator:status" not in c.args["body"]
+        ]
         assert len(comments) == 1
         assert "fman repo set-verify acme/widgets" in comments[0].args["body"]
         assert not e.attempts(n) and not e.driver.prompts

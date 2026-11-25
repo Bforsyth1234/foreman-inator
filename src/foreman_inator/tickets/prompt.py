@@ -78,6 +78,7 @@ CLARIFICATION_BUDGET = 5_100  # the Q&A text (#44; ``clarify.QA_BUDGET`` plus ro
 LINE_COMMENTS_BUDGET = 6_000  # a review's line comments (#42), the first ones kept
 ISSUE_COMMENT_BUDGET = 2_000  # per issue comment (#25 / todo #48)
 ISSUE_COMMENTS_BUDGET = 6_000  # all issue comments; the newest are kept
+IMAGES_BUDGET = 14_000  # the images block (#78, ``images.render``: up to 8 descriptions)
 OWNED_FILES_MAX = 40  # list entries
 OWNED_FILE_BUDGET = 200  # per path
 HISTORY_MAX = 10  # attempts listed; the newest are kept
@@ -230,6 +231,7 @@ def build_writer_prompt(
     conflicted_files: Sequence[str] = (),
     clarification: str | None = None,
     issue_comments: str | None = None,
+    images: str | None = None,
 ) -> WriterPrompt:
     """Render the writer's session prompt for ``attempt`` of ``ticket``.
 
@@ -245,6 +247,9 @@ def build_writer_prompt(
     ``issue_comments`` is ``issue_comments_text``'s result (#25, todo #48): the allowed
     users' comments, already clipped to ``ISSUE_COMMENTS_BUDGET``; it goes after the
     issue body inside the issue fence, defused.
+    ``images`` is ``images.images_text``'s result (#78): a description of each image an
+    allowed user attached, labelled with its source; it goes last inside the issue
+    fence, defused, so text read off an image is fenced like the issue body.
     """
     if attempt.ticket_id != ticket.id:
         raise ValueError(f"attempt {attempt.id} belongs to ticket {attempt.ticket_id}")
@@ -265,7 +270,7 @@ def build_writer_prompt(
         s["issue"].substitute(
             issue_number=ticket.issue_number,
             issue_title=defuse(clip_head(" ".join(ticket.title.split()), TITLE_BUDGET)),
-            issue_body=_issue_body(ticket.request, issue_comments),
+            issue_body=_issue_body(ticket.request, issue_comments, images),
         )
     )
     if clarification and clarification.strip():
@@ -359,10 +364,12 @@ def build_writer_prompt(
     )
 
 
-def _issue_body(request: str, comments: str | None) -> str:
+def _issue_body(request: str, comments: str | None, images: str | None = None) -> str:
     body = defuse(clip_head(request, ISSUE_BODY_BUDGET)) or "(no body)"
     if comments and comments.strip():
         body += "\n\n" + defuse(clip_head(comments, ISSUE_COMMENTS_BUDGET + 200))
+    if images and images.strip():
+        body += "\n\n" + defuse(clip_head(images, IMAGES_BUDGET))
     return body
 
 
@@ -587,12 +594,14 @@ def writer_prompt_for(
     rules_file: str | Path | None = None,
     global_rules: str | Path | None = None,
     issue_comments: str | None = None,
+    images: str | None = None,
 ) -> WriterPrompt:
     """Caller-side convenience for the worker (#14): read everything, then build.
     ``conflicted_files``: ``Replay.conflicted`` for a ``rebase`` attempt (#43). The
     clarification Q&A (#44) is read from the store's ``clarify-qa:<ticket>`` cursor.
     ``rules_file`` is the repo's configured rules file (#38); ``global_rules`` overrides
-    ``paths.rules_path()`` (tests). ``issue_comments``: ``fetch_issue_comments`` (#25)."""
+    ``paths.rules_path()`` (tests). ``issue_comments``: ``fetch_issue_comments`` (#25).
+    ``images``: ``images.images_text``, or for a replay ``images.stored_text`` (#78)."""
     from foreman_inator.tickets.conventions import gather
 
     conv = gather(worktree, ticket.owned_files, global_path=global_rules, rules_file=rules_file)
@@ -605,4 +614,5 @@ def writer_prompt_for(
         conflicted_files=conflicted_files,
         clarification=store.get_cursor(ticket.repo, clarify_qa_cursor(ticket.id)),
         issue_comments=issue_comments,
+        images=images,
     )

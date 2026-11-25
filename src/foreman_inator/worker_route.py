@@ -28,13 +28,25 @@ State is the ``poll_cursors`` row ``lifecycle.clarify_cursor(ticket)``: ``clear`
 Routing (#15, #23; wired in wave 9)
 -----------------------------------
 A ``tier:N`` label is the route, with no model call. Otherwise the nearest-neighbour
-router (``knn.route_knn``) is asked first; below ``knn_threshold`` accepted tickets, or on
-any embedding failure, it returns None and the rules router (``routing.route``) decides.
+router (``knn.route_knn``) is asked first (then, past its own gate, the classifier: #37
+below); below ``knn_threshold`` accepted tickets, or on any embedding failure, it
+returns None and the rules router (``routing.route``) decides.
 The exploration decision (``explore.should_explore`` with ``explore_rate``; never for an
 override) is made once, here, and stored as the ``explore:<ticket>`` cursor in the same
 transaction as ``routed_tier`` and ``route_reason``; ``Worker.explore`` reads it, so a
 restart or a config change gives the same answer. A later ``tier:N`` label before any
 attempt routes again through the override path, which stores "0".
+
+Classifier router (#37 / GitHub #19)
+-------------------------------------
+When kNN picked (``route.source == "knn"``, so its vector is stored) and
+``classifier_router`` is on (default) and at least ``classifier_min_tickets`` (default
+300) accepted tickets are in the pool, ``classifier.route_classifier`` may replace the
+pick: only while its logistic regression beats the kNN rule on the chronological held-out
+20% (a tie keeps kNN; the check is cached on the worker, ``classifier_gate``, and redone
+at most daily). Its ``route_reason`` starts ``"classifier: "``. It makes no model call and
+never raises, so a ``tier:N`` override (never reaches it), exploration, profiles, split
+proposals (``label`` is set from the tier) and local-only repos behave as with kNN.
 
 Repo profiles (#51)
 -------------------
@@ -101,7 +113,7 @@ from typing import TYPE_CHECKING, Any
 from foreman_inator import routing
 from foreman_inator.db.store import Ticket
 from foreman_inator.github.app_auth import GitHubNotFound
-from foreman_inator.routing import explore, knn
+from foreman_inator.routing import classifier, explore, knn
 from foreman_inator.routing import profile as prof
 from foreman_inator.routing.escalation import DEFAULT_LIMITS, Limits, with_cloud
 from foreman_inator.tickets import clarify, decompose
@@ -119,6 +131,10 @@ DEFAULT_SPLIT_LARGE = decompose.DEFAULT_ENABLED
 DEFAULT_SPLIT_TIMEOUT = decompose.DEFAULT_TIMEOUT
 #: #51: the ``poll_cursors`` row holding a ticket's (profile-shifted) start tier.
 START_CURSOR_PREFIX = "start:"
+#: #37: module defaults for the ``classifier_router`` / ``classifier_min_tickets`` keys.
+DEFAULT_CLASSIFIER_ROUTER = classifier.DEFAULT_ENABLED
+DEFAULT_CLASSIFIER_MIN_TICKETS = classifier.DEFAULT_MIN_TICKETS
+_GATE_LOCK = threading.Lock()
 
 
 def start_cursor(ticket_id: int) -> str:
@@ -346,7 +362,7 @@ class RouteSteps:
         """#23 once ``knn_threshold`` tickets are accepted; None falls back to the rules.
         ``route_knn`` never raises and stores the new ticket's vector, so a re-route after a
         crash reuses it (no second embedding call)."""
-        return knn.route_knn(
+        r = knn.route_knn(
             t,
             store=self.store,
             config=self.config,
@@ -359,6 +375,31 @@ class RouteSteps:
             allow_cloud_embedder=bool(self.config.allow_cloud_embedder)
             and self.store.repo_allows_cloud(t.repo),
         )
+        if r is None or not getattr(self.config, "classifier_router", DEFAULT_CLASSIFIER_ROUTER):
+            return r
+        return (
+            classifier.route_classifier(
+                t,
+                store=self.store,
+                config=self.config,
+                embedder=self.embedder or knn.embedding_endpoint(),  # type: ignore[attr-defined]
+                gate=self.classifier_gate(),
+                knn_route=r,
+                min_tickets=int(
+                    getattr(self.config, "classifier_min_tickets", DEFAULT_CLASSIFIER_MIN_TICKETS)
+                ),
+                k=int(self.config.knn_k),
+            )
+            or r
+        )
+
+    def classifier_gate(self) -> classifier.Gate:
+        """#37: this worker's cached held-out comparison (made on first use)."""
+        with _GATE_LOCK:
+            gate = self.__dict__.get("_classifier_gate")
+            if gate is None:
+                gate = self.__dict__["_classifier_gate"] = classifier.Gate()
+            return gate
 
     # ------------------------------------------------------------------ profiles (#51)
 
@@ -391,6 +432,8 @@ class RouteSteps:
 
 __all__ = [
     "CLARIFY_DONE",
+    "DEFAULT_CLASSIFIER_MIN_TICKETS",
+    "DEFAULT_CLASSIFIER_ROUTER",
     "DEFAULT_SPLIT_LARGE",
     "DEFAULT_SPLIT_TIMEOUT",
     "START_CURSOR_PREFIX",

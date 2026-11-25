@@ -5,7 +5,8 @@ Commands: ``setup`` (#8), ``config set-key`` (#2), ``run`` and ``status`` and
 status | promote`` and ``replay`` (#29), ``repo add | remove | list`` (#56), ``prune``
 (#56), ``repo set-profile`` (#51), ``rules show`` (#42), ``repo set-cloud`` (#49),
 ``experiment split start | stop | status`` (#34), ``experiment run --mode seeded``
-(#35), ``sweep`` (#77). Later waves
+(#35), ``sweep`` (#77), ``experiment propose | approve-draft | discard-draft`` (#49),
+``replay --fork`` (#18), ``retry`` (#73). Later waves
 add ``@app.command()`` functions here.
 
 The callback below keeps `app` a multi-command group, so adding commands
@@ -503,6 +504,62 @@ def experiment_promote(
     raise typer.Exit(0 if res.outcome == "promoted" else 1)
 
 
+@experiment_app.command("propose")
+def experiment_propose(
+    role: Annotated[str, typer.Option("--role", help="writer or reviewer.")],
+    proposer: Annotated[
+        str | None,
+        typer.Option(
+            "--proposer",
+            help="Tier 3 model that drafts it (default: experiments.proposer_model, else the"
+            " first one independent of the scoring reviewer).",
+            show_default=False,
+        ),
+    ] = None,
+) -> None:
+    """Draft the next prompt of the role's champion from recent kickbacks (one LLM call).
+
+    Writes a draft and its rationale for you to read; registers nothing. Approve it with
+    `fman experiment approve-draft ID` or drop it with `fman experiment discard-draft ID`.
+    One LLM-drafted challenger per role at a time; costs go to the experiments budget."""
+    from foreman_inator.worker_experiments import ExperimentError, propose_command
+
+    try:
+        propose_command(role=role, proposer=proposer, echo=typer.echo)
+    except ExperimentError as exc:
+        _fail(exc)
+
+
+@experiment_app.command("approve-draft")
+def experiment_approve_draft(
+    draft: Annotated[int, typer.Argument(help="Draft id (from `fman experiment propose`).")],
+) -> None:
+    """Approve a drafted prompt: register it as a challenger and run its replay.
+
+    The replay uses tickets created after the draft's cutoff only, as `fman experiment
+    run --role R --challenger V` would run it. Nothing is promoted."""
+    from foreman_inator.worker_experiments import ExperimentError, approve_draft_command
+
+    try:
+        code = approve_draft_command(draft, echo=typer.echo)
+    except ExperimentError as exc:
+        _fail(exc)
+    raise typer.Exit(code)
+
+
+@experiment_app.command("discard-draft")
+def experiment_discard_draft(
+    draft: Annotated[int, typer.Argument(help="Draft id (from `fman experiment propose`).")],
+) -> None:
+    """Discard a drafted prompt and remove its files."""
+    from foreman_inator.worker_experiments import ExperimentError, discard_draft_command
+
+    try:
+        discard_draft_command(draft, echo=typer.echo)
+    except ExperimentError as exc:
+        _fail(exc)
+
+
 split_app = typer.Typer(
     help="Live traffic split: a share of first attempts to a writer challenger."
 )
@@ -692,7 +749,10 @@ def sweep_command(
 
 @app.command("replay")
 def replay_command(
-    ticket: Annotated[str, typer.Argument(help="Ticket id (from `fman status`).")],
+    ticket: Annotated[
+        str | None,
+        typer.Argument(help="Ticket id (from `fman status`).", show_default=False),
+    ] = None,
     recordings: Annotated[
         Path | None, typer.Option("--recordings", help="Recordings folder (default: yours).")
     ] = None,
@@ -703,10 +763,56 @@ def replay_command(
         Path | None,
         typer.Option("--rows", help="Stored rows as JSON (a checked-in regression case)."),
     ] = None,
+    fork: Annotated[
+        int | None,
+        typer.Option(
+            "--fork",
+            help="Attempt id: restart it at its labelled failure step with a new model or"
+            " prompt (#18; model calls, experiments budget).",
+            show_default=False,
+        ),
+    ] = None,
+    model: Annotated[
+        str | None,
+        typer.Option("--model", help="--fork: the model to continue with.", show_default=False),
+    ] = None,
+    prompt: Annotated[
+        str | None,
+        typer.Option(
+            "--prompt", help="--fork: a writer prompt name to rebuild with.", show_default=False
+        ),
+    ] = None,
+    step: Annotated[
+        int | None,
+        typer.Option(
+            "--step",
+            help="--fork: restart at this step instead of the labelled one.",
+            show_default=False,
+        ),
+    ] = None,
 ) -> None:
     """Step through a recorded ticket and check today's router, escalation, review policy
-    and lifecycle still decide as they did (no model calls). Exit 1 on any difference."""
+    and lifecycle still decide as they did (no model calls). Exit 1 on any difference.
+
+    With --fork ATTEMPT: restart that attempt at its failure step in a scratch worktree
+    (sandboxed, never pushed) and record what happens next to it. Exit 2 when it cannot."""
     from foreman_inator.worker_experiments import replay_command as run_replay
+
+    if fork is not None:
+        from foreman_inator.worker_experiments import ExperimentError, fork_command
+
+        if ticket is not None:
+            raise typer.BadParameter("give a ticket id or --fork ATTEMPT, not both")
+        try:
+            code = fork_command(fork, model=model, prompt=prompt, step=step, echo=typer.echo)
+        except ExperimentError as exc:
+            typer.echo(f"Error: {exc}", err=True)
+            raise typer.Exit(2) from exc
+        raise typer.Exit(code)
+    if model is not None or prompt is not None or step is not None:
+        raise typer.BadParameter("--model, --prompt and --step go with --fork")
+    if ticket is None:
+        raise typer.BadParameter("give a ticket id (or --fork ATTEMPT)")
 
     raise typer.Exit(
         run_replay(
@@ -817,6 +923,48 @@ def prune_command(
         typer.echo(line)
     if report.errors:
         raise typer.Exit(1)
+
+
+@app.command("retry")
+def retry_command(
+    ticket: Annotated[str, typer.Argument(help="owner/repo#issue, or a ticket id.")],
+    tier: Annotated[
+        int | None,
+        typer.Option("--tier", help="Retry on this tier (1-3).", show_default=False),
+    ] = None,
+    up: Annotated[bool, typer.Option("--up", help="Retry one tier up.")] = False,
+) -> None:
+    """Retry a flagged or dropped ticket, keeping its history (attempts, branch, PR).
+
+    Same tier by default. The worker picks it up on its next pass; the retry gets one more
+    round, then the ticket comes back to you. Exit 1 when the retry is refused."""
+    from datetime import UTC, datetime
+
+    from foreman_inator import config as config_mod
+    from foreman_inator import paths
+    from foreman_inator.db.store import Store
+    from foreman_inator.retry import retry
+
+    if tier is not None and up:
+        raise typer.BadParameter("give --tier N or --up, not both")
+    db = paths.db_path()
+    if not db.exists():
+        _fail(FileNotFoundError("no database yet: run the worker first"))
+    cfg = config_mod.load()
+    api = None
+    key_path = paths.app_key_path()
+    if cfg.app_id is not None and cfg.installation_ids and key_path.exists():
+        from foreman_inator.worker_run import build_github
+
+        try:
+            api = build_github(cfg, key_path)  # a dropped ticket's issue and PR are checked
+        except Exception as exc:  # noqa: BLE001 - only a dropped ticket needs it
+            typer.echo(f"(GitHub not reachable: {type(exc).__name__}; flagged tickets only)")
+    choice: int | str | None = tier if tier is not None else ("up" if up else None)
+    with Store(db) as store:
+        res = retry(store, cfg, ticket, tier=choice, now=datetime.now(UTC), api=api)  # type: ignore[arg-type]
+    typer.echo(res.reason)
+    raise typer.Exit(0 if res.ok else 1)
 
 
 def _register_setup() -> None:

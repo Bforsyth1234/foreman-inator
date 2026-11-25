@@ -1,7 +1,9 @@
 """Replay of recorded tickets (todo #28, SPEC "Tracing" → "Recording and replay").
 
 Two of SPEC's three uses of a recording live here; neither makes a model call, opens a
-socket or writes to the store. (The third, fork from failure, is #36.)
+socket or writes to the store. (The third, fork from failure, is #36: ``tracing/fork.py``.
+Its results are recordings too, ``<attempt>.fork_<n>.jsonl.gz`` next to the attempt's, so
+the timeline and the trace view show them; they are never span-tree or regression input.)
 
 **Playback.** ``replay_spans(recordings_dir, traces_dir, ticket_id)`` rebuilds a ticket's
 span tree from its recordings (``<recordings>/<ticket>/<attempt>[.<role>].jsonl[.gz]``,
@@ -86,8 +88,23 @@ STEP_TEXT_LIMIT = 2000
 MAX_ID_DIGITS = 18
 
 _ID = re.compile(r"[0-9]{1,18}", re.ASCII)
-_RECORDING = re.compile(r"([0-9]{1,18})(?:\.([a-z][a-z_]{0,31}))?\.jsonl(\.gz)?", re.ASCII)
+_RECORDING = re.compile(r"([0-9]{1,18})(?:\.([a-z][a-z0-9_]{0,31}))?\.jsonl(\.gz)?", re.ASCII)
 _ROLE_ORDER = {"attempt": 0, "review": 1}
+#: Role of a fork-from-failure recording (#36): ``fork_<n>``, n = 1, 2, ... per attempt.
+FORK_ROLE_PREFIX = "fork_"
+_FORK_ROLE = re.compile(r"fork_([1-9][0-9]{0,5})", re.ASCII)
+
+
+def fork_role(n: int) -> str:
+    """The recording role of an attempt's ``n``-th fork (1-based)."""
+    if isinstance(n, bool) or not isinstance(n, int) or not 1 <= n <= 999_999:
+        raise ValueError(f"not a fork number: {n!r}")
+    return f"{FORK_ROLE_PREFIX}{n}"
+
+
+def is_fork_role(role: str | None) -> bool:
+    """True for a fork-from-failure recording's role (``fork_<n>``)."""
+    return isinstance(role, str) and _FORK_ROLE.fullmatch(role) is not None
 
 
 def parse_id(text: Any) -> int | None:
@@ -437,7 +454,11 @@ def replay_spans(
 ) -> list[SpanNode]:
     """Rebuild the ticket's span tree by playing its recordings back into the skeleton
     from its span files (module docstring). No model calls, no writes."""
-    recs = [r for r in load_ticket(recordings_dir, ticket_id) if not r.partial or r.result]
+    recs = [
+        r
+        for r in load_ticket(recordings_dir, ticket_id)
+        if (not r.partial or r.result) and not is_fork_role(r.role)
+    ]  # a fork (#36) ran after the fact: it has no span in the ticket's trace
     rows = load_span_rows(traces_dir, ticket_id) if traces_dir is not None else []
     nodes = [_node(r, i) for i, r in enumerate(rows)]
     if not nodes:
@@ -652,7 +673,7 @@ def _steps(rec: AttemptRecording, verify: dict[str, Any] | None) -> list[Step]:
                 )
         elif kind == "result":
             outcome = row.get("outcome") or row.get("stopped_reason") or ""
-            if rec.role == "attempt":
+            if rec.role == "attempt" or is_fork_role(rec.role):
                 passed = row.get("tests_passed")
                 detail = []
                 if verify:
@@ -717,7 +738,9 @@ def timeline(
                 model=str(h.get("model") or ""),
                 tier=h.get("tier"),
                 variant_id=h.get("variant_id"),
-                trigger=att.trigger if att is not None and rec.role == "attempt" else None,
+                trigger=_fork_trigger(h)
+                if is_fork_role(rec.role)
+                else (att.trigger if att is not None and rec.role == "attempt" else None),
                 outcome=res.get("outcome") or None,
                 partial=rec.partial,
                 steps=tuple(steps),
@@ -727,6 +750,20 @@ def timeline(
             )
         )
     return TicketTimeline(ticket_id, tuple(out))
+
+
+def _fork_trigger(header: dict[str, Any]) -> str:
+    """What a fork recording's header says it restarted (#36), for the timeline."""
+    out = f"fork of attempt {header.get('attempt_id')}"
+    idx = header.get("fork_step_index")
+    if idx is not None:
+        out += f" at step {idx}"
+    if header.get("fork_failure_step"):
+        out += f" ({header['fork_failure_step']})"
+    changed = [str(header[k]) for k in ("fork_model", "fork_prompt") if header.get(k)]
+    if changed:
+        out += ", with " + " and ".join(changed)
+    return out
 
 
 # =========================================================================== store rows
@@ -1307,6 +1344,7 @@ __all__ = [
     "KEY_ATTRIBUTES",
     "STEP_TEXT_LIMIT",
     "AttemptRecording",
+    "FORK_ROLE_PREFIX",
     "DecisionDiff",
     "RecordingTimeline",
     "Regression",
@@ -1319,7 +1357,9 @@ __all__ = [
     "TicketTimeline",
     "build_tree",
     "diff_trees",
+    "fork_role",
     "implied_events",
+    "is_fork_role",
     "load_span_rows",
     "load_ticket",
     "parse_id",

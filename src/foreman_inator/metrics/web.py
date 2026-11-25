@@ -49,6 +49,7 @@ from foreman_inator.db.store import Store
 from foreman_inator.metrics import queries as q
 from foreman_inator.pr.publisher import format_cost
 from foreman_inator.pr.summary import format_duration
+from foreman_inator.resources import snapshot as res
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8642
@@ -187,6 +188,132 @@ def fmt_duration(d: q.Duration) -> str:
     if d.median_seconds is None:
         return NO_DATA
     return f"{e(format_duration(d.median_seconds))} <small>(median of {d.count})</small>"
+
+
+def fmt_bytes(n: Any) -> str:
+    """Bytes as decimal GB (``21.3 GB``, as ``fman status`` shows Ollama), "-" if unknown."""
+    if not isinstance(n, int | float) or isinstance(n, bool):
+        return "-"
+    return f"{n / 1e9:.1f} GB"
+
+
+def fmt_age(seconds: float) -> str:
+    s = int(seconds)
+    if s < 120:
+        return f"{s}s"
+    if s < 7200:
+        return f"{s // 60} min"
+    return f"{s // 3600} h"
+
+
+# --- resources (#60) ------------------------------------------------------------------
+
+
+def _as_of(reading: res.Reading) -> str:
+    age = reading.age_seconds or 0.0
+    text = f"as of {fmt_age(age)} ago"
+    if reading.stale:
+        return (
+            f'<span class="error">{e(text)}: stale (older than '
+            f"{int(res.STALE_AFTER_SECONDS // 60)} min), the worker may not be running</span>"
+        )
+    return f"<small>{e(text)}</small>"
+
+
+def _ollama_summary(part: Any) -> str:
+    if part is None:
+        return "Ollama: no local model configured"
+    if not isinstance(part, dict):
+        return "Ollama: unknown"
+    if "unreachable" in part:
+        word = "slow" if part.get("slow") else "unreachable"
+        return f"Ollama: {e(word)} ({e(str(part.get('unreachable')))})"
+    models = [m for m in part.get("models") or [] if isinstance(m, dict)]
+    total = sum(m.get("size") or 0 for m in models if isinstance(m.get("size"), int))
+    return f"Ollama: {len(models)} loaded ({e(fmt_bytes(total))})"
+
+
+def _memory_summary(mem: Any) -> str:
+    if not isinstance(mem, dict):
+        return "Memory: unknown"
+    used, total = mem.get("used_bytes"), mem.get("total_bytes")
+    text = f"Memory: {e(fmt_bytes(used))} of {e(fmt_bytes(total))} used"
+    if isinstance(mem.get("free_pct"), int):
+        text += f", {mem['free_pct']}% free"
+    return text + f", pressure {e(str(mem.get('pressure') or 'unknown'))}"
+
+
+def _slots_summary(slots: Any) -> str:
+    if not isinstance(slots, dict):
+        return "Local inference slots: unknown (no proxy)"
+    return (
+        f"Local inference slots: {e(str(slots.get('in_use')))} of {e(str(slots.get('cap')))} in use"
+    )
+
+
+def render_resources_block(reading: res.Reading) -> str:
+    """The short resource block on the main page (links to ``/resources``)."""
+    link = '<a href="/resources">details</a>'
+    if reading.data is None:
+        return (
+            f'<p class="resources"><small>Resources: {e(reading.error or "")} · {link}</small></p>'
+        )
+    d = reading.data
+    parts = [_ollama_summary(d.get("ollama")), _memory_summary(d.get("memory"))]
+    parts.append(_slots_summary(d.get("local_slots")))
+    return f'<p class="resources">{" · ".join(parts)} · {_as_of(reading)} · {link}</p>'
+
+
+def render_resources(reading: res.Reading, *, nav: Sequence[tuple[str, str]] = ()) -> str:
+    """The ``/resources`` page: loaded models, memory and local slots from the snapshot."""
+    head = (
+        "<h1>Resources</h1>"
+        '<p class="lede">What the worker saw on its last poll: the models Ollama holds, '
+        "the machine's memory and the local inference slots in use against the cap.</p>"
+    )
+    if reading.data is None:
+        return render_page(
+            "Resources", head + f'<p class="empty">{e(reading.error or "")}</p>', nav=nav
+        )
+    d = reading.data
+    body = head + f"<p>{_as_of(reading)}</p>"
+    body += f"<h2>Local inference slots</h2><p>{_slots_summary(d.get('local_slots'))}</p>"
+    body += f"<h2>Memory</h2><p>{_memory_summary(d.get('memory'))}</p>"
+    part = d.get("ollama")
+    host = part.get("host") if isinstance(part, dict) else None
+    body += "<h2>Loaded models</h2>"
+    if host:
+        body += f"<p><small>Ollama at {e(str(host))}</small></p>"
+    models = part.get("models") if isinstance(part, dict) else None
+    if isinstance(models, list) and models:
+        rows = "".join(
+            f"<tr><td>{e(str(m.get('name')))}</td><td>{e(fmt_bytes(m.get('size')))}</td>"
+            f"<td>{e(fmt_bytes(m.get('size_vram')))}</td>"
+            f"<td>{e(str(m.get('expires_at') or '-'))}</td></tr>"
+            for m in models
+            if isinstance(m, dict)
+        )
+        body += (
+            '<div class="scroll"><table><thead><tr><th>Model</th><th>Size</th>'
+            f"<th>In GPU memory</th><th>Unloads at</th></tr></thead><tbody>{rows}</tbody>"
+            "</table></div>"
+        )
+    elif isinstance(models, list):
+        body += '<p class="empty">No model loaded.</p>'
+    else:
+        body += f"<p>{_ollama_summary(part)}</p>"
+    return render_page("Resources", body, nav=nav)
+
+
+def resources_routes(
+    resources_path: str | Path, *, nav: Sequence[tuple[str, str]] = ()
+) -> list[BaseRoute]:
+    """``GET /resources``: read-only, from the snapshot file the worker writes."""
+
+    def page(request: Request) -> Response:
+        return HTMLResponse(render_resources(res.load(resources_path), nav=nav))
+
+    return [Route("/resources", page, methods=["GET"])]
 
 
 # --- SVG charts -----------------------------------------------------------------------
@@ -412,7 +539,11 @@ def _recent(rep: q.Report) -> str:
 
 
 def render_report(
-    rep: q.Report, opts: q.FilterOptions, *, nav: Sequence[tuple[str, str]] = ()
+    rep: q.Report,
+    opts: q.FilterOptions,
+    *,
+    nav: Sequence[tuple[str, str]] = (),
+    resources: res.Reading | None = None,
 ) -> str:
     cost_points = [(p.bucket, p.cost_per_accepted) for p in rep.trend]
     local_points = [(p.bucket, p.local_share) for p in rep.trend]
@@ -429,6 +560,7 @@ def render_report(
         "model that wrote the accepted change and what happened after you merged it.</p>"
         + _form(rep.filter, rep.bucket, opts)
         + headline
+        + (render_resources_block(resources) if resources is not None else "")
         + "<h2>Writers</h2>"
         + _writer_table(rep)
         + "<h2>AI reviewers</h2>"
@@ -463,8 +595,14 @@ def open_store(store_path: str | Path) -> Store:
 
 
 def metrics_routes(
-    store_path: str | Path, *, nav: Sequence[tuple[str, str]] = ()
+    store_path: str | Path,
+    *,
+    nav: Sequence[tuple[str, str]] = (),
+    resources_path: str | Path | None = None,
 ) -> list[BaseRoute]:
+    """``GET /`` and ``GET /api/metrics``. With ``resources_path`` the page shows the
+    short resource block (#60) read from that snapshot file."""
+
     def load(request: Request) -> tuple[q.Report, q.FilterOptions]:
         filt, bucket = parse_filter(request.query_params)
         store = open_store(store_path)
@@ -482,7 +620,8 @@ def metrics_routes(
         except (FileNotFoundError, sqlite3.OperationalError):
             body = "<h1>foreman-inator metrics</h1><p>No database yet: run the worker first.</p>"
             return HTMLResponse(render_page("No data", body, nav=nav), 503)
-        return HTMLResponse(render_report(rep, opts, nav=nav))
+        reading = res.load(resources_path) if resources_path is not None else None
+        return HTMLResponse(render_report(rep, opts, nav=nav, resources=reading))
 
     def api(request: Request) -> Response:
         try:
@@ -501,9 +640,12 @@ def create_app(
     *,
     extra_routes: Sequence[BaseRoute] = (),
     nav: Sequence[tuple[str, str]] = (),
+    resources_path: str | Path | None = None,
 ) -> ASGIApp:
-    """The metrics app. ``extra_routes`` and ``nav`` are for later pages (#29)."""
-    app = Starlette(routes=[*metrics_routes(store_path, nav=nav), *extra_routes])
+    """The metrics app. ``extra_routes`` and ``nav`` are for later pages (#29);
+    ``resources_path`` adds the resource block to the main page (#60)."""
+    routes = metrics_routes(store_path, nav=nav, resources_path=resources_path)
+    app = Starlette(routes=[*routes, *extra_routes])
     return LoopbackHostOnly(app)
 
 
@@ -514,6 +656,7 @@ M4_NAV: tuple[tuple[str, str], ...] = (
     ("/traces", "Traces"),
     ("/failures", "Failure steps"),
     ("/experiments", "Experiments"),
+    ("/resources", "Resources"),
 )
 
 
@@ -627,6 +770,7 @@ def render_experiments(
         "<h1>Experiments</h1>"
         '<p class="lede">A challenger becomes champion only after it wins on replay and '
         "holds up live, and only when you run <code>fman experiment promote</code>.</p>"
+        '<p><a href="/experiments/manage">Start, stop, propose or promote experiments</a></p>'
         f"<h2>Champions</h2><ul>{champs}</ul>"
         "<h2>Running</h2>"
         + table([r for r in rows if r["status"] == "running"])
@@ -688,14 +832,18 @@ def full_app(
     recordings_dir: str | Path,
     traces_dir: str | Path | None,
     config: Any = None,
+    resources_path: str | Path | None = None,
 ) -> ASGIApp:
-    """The page ``fman metrics`` serves: the metrics page, the trace view (#28) and the
-    failure-step and experiment pages, all behind the loopback guard."""
+    """The page ``fman metrics`` serves: the metrics page, the trace view (#28), the
+    failure-step and experiment pages and ``/resources`` (#60, from ``resources_path``,
+    default ``<home>/run/resources.json``), all behind the loopback guard."""
     from foreman_inator.config import Config
-    from foreman_inator.metrics import trace_view
+    from foreman_inator.metrics import experiments_ui, trace_view
     from foreman_inator.routing import escalation, explore
 
     cfg = config if config is not None else Config()
+    nav = (*M4_NAV, experiments_ui.NAV_ENTRY)  # #67: the page that runs experiments
+    res_path = resources_path if resources_path is not None else res.default_path()
     ladder = escalation.build_ladder(cfg.models)
     plain = trace_view.store_rows_for(
         store_path, ladder=ladder, recordings_dir=recordings_dir, traces_dir=traces_dir
@@ -720,15 +868,21 @@ def full_app(
     routes = [
         *trace_view.trace_routes(
             recordings_dir, traces_dir, store_path=store_path, ladder=ladder,
-            rows_for=rows_for, nav=M4_NAV,
+            rows_for=rows_for, nav=nav,
         ),
         *m4_routes(
             store_path,
             min_cases=cfg.experiments.min_cases,
             min_sample=cfg.experiments.live_min_sample,
+            nav=nav,
+        ),
+        *resources_routes(res_path, nav=nav),
+        # #67/#69: start, stop, cancel, promote and propose (POSTs behind forms.FormGuard).
+        *experiments_ui.routes(
+            store_path, load_config=(lambda: cfg) if config is not None else None, nav=nav
         ),
     ]  # fmt: skip
-    return create_app(store_path, extra_routes=routes, nav=M4_NAV)
+    return create_app(store_path, extra_routes=routes, nav=nav, resources_path=res_path)
 
 
 def metrics_url(host: str, port: int, **params: str) -> str:
@@ -849,6 +1003,7 @@ __all__ = [
     "LoopbackHostOnly",
     "MetricsServer",
     "create_app",
+    "fmt_bytes",
     "full_app",
     "is_loopback",
     "line_chart",
@@ -859,5 +1014,8 @@ __all__ = [
     "parse_filter",
     "render_page",
     "render_report",
+    "render_resources",
+    "render_resources_block",
+    "resources_routes",
     "serve",
 ]

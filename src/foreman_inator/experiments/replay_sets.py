@@ -47,6 +47,17 @@ unless the caller says every model of the run is local (``cloud_models=False``).
 setting is read when the cases are listed, not when the set was built, so a repo set
 local only after its set was built is left out at once. The default fails closed.
 
+Cutoff (#69). A challenger an LLM drafted from kickbacks must never be scored on the
+tickets it was written from. Its proposer read only kickbacks older than a cutoff, so its
+replay uses only tickets **created after** the cutoff (every kickback of such a ticket is
+after it too). ``build_replay_set(cutoff_at=...)`` builds a set of only those tickets and
+records the cutoff on the set; ``latest_set`` / ``ensure_current_set`` never return such a
+set, so hand-written challengers keep replaying the ordinary monthly set. ``list_cases``
+applies the strictest of its ``cutoff_at`` argument, the set's cutoff and the cutoff of
+``experiment_id``'s experiment (``experiments.cutoff_at``), so a case at or before the
+cutoff never reaches a proposed challenger's replay, whichever set it runs on. A case whose
+ticket row is gone is left out once a cutoff applies (fails closed).
+
 Public API: ``build_replay_set``, ``ensure_current_set`` (the monthly rebuild),
 ``latest_set``, ``rebuild_due``, ``list_sets``, ``get_set``, ``list_cases``,
 ``get_case``.
@@ -154,6 +165,7 @@ class ReplaySet:
     max_merges: int
     case_count: int
     skipped_count: int
+    cutoff_at: datetime | None = None  # #69: only tickets created after it
 
 
 @dataclass(frozen=True, slots=True)
@@ -325,12 +337,15 @@ def _read_tests(mirror: RepoMirror, paths: Sequence[str], at: str) -> tuple[Merg
 # --------------------------------------------------------------------------- case builders
 
 
-def _merged_tickets(store: Store, max_merges: int) -> list[Ticket]:
-    rows = store.query(
-        "SELECT id FROM tickets WHERE \"column\" = 'done' AND accepted_attempt_id IS NOT NULL"
-        " ORDER BY done_at DESC, id DESC LIMIT ?",
-        (int(max_merges),),
-    )
+def _merged_tickets(
+    store: Store, max_merges: int, cutoff_at: datetime | None = None
+) -> list[Ticket]:
+    sql = "SELECT id FROM tickets WHERE \"column\" = 'done' AND accepted_attempt_id IS NOT NULL"
+    params: list[Any] = []
+    if cutoff_at is not None:
+        sql += " AND created_at > ?"
+        params.append(_ts(cutoff_at))
+    rows = store.query(sql + " ORDER BY done_at DESC, id DESC LIMIT ?", (*params, int(max_merges)))
     return sorted((store.get_ticket(int(r["id"])) for r in rows), key=lambda t: t.id)
 
 
@@ -459,10 +474,15 @@ def reviewer_case(
 
 
 def _collect(
-    store: Store, role: Role, mirror_for: MirrorFor, max_merges: int, recordings_dir: Path | None
+    store: Store,
+    role: Role,
+    mirror_for: MirrorFor,
+    max_merges: int,
+    recordings_dir: Path | None,
+    cutoff_at: datetime | None = None,
 ) -> list[Case | _Skip]:
     out: list[Case | _Skip] = []
-    for ticket in _merged_tickets(store, max_merges):
+    for ticket in _merged_tickets(store, max_merges, cutoff_at):
         if role == "writer":
             try:
                 mirror = _mirror(mirror_for, ticket.repo)
@@ -498,25 +518,34 @@ def build_replay_set(
     mirror_for: MirrorFor,
     max_merges: int = DEFAULT_SET_SIZE,
     recordings_dir: Path | str | None = None,
+    cutoff_at: datetime | None = None,
 ) -> ReplaySet:
     """Build and store a new set from the latest ``max_merges`` merged tickets.
 
     ``mirror_for(repo)`` returns the repo's ``RepoMirror`` (or None); it is read, never
-    fetched. Skipped cases are stored with their reason."""
+    fetched. Skipped cases are stored with their reason. ``cutoff_at`` (#69): only tickets
+    created after it, for one proposed challenger; such a set is never the "latest"."""
     if role not in ROLES:
         raise ValueError(f"role must be one of {ROLES}, not {role!r}")
     if max_merges <= 0:
         raise ValueError("max_merges must be positive")
     rec = Path(recordings_dir) if recordings_dir is not None else None
-    items = _collect(store, role, mirror_for, max_merges, rec)
+    items = _collect(store, role, mirror_for, max_merges, rec, cutoff_at)
     now = _ts(store.now())
     ok = sum(1 for i in items if not isinstance(i, _Skip))
     with store.transaction() as conn:
-        cur = conn.execute(
-            "INSERT INTO replay_sets (role, built_at, max_merges, case_count, skipped_count)"
-            " VALUES (?, ?, ?, ?, ?)",
-            (role, now, int(max_merges), ok, len(items) - ok),
-        )
+        if cutoff_at is None:
+            cur = conn.execute(
+                "INSERT INTO replay_sets (role, built_at, max_merges, case_count, skipped_count)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (role, now, int(max_merges), ok, len(items) - ok),
+            )
+        else:
+            cur = conn.execute(
+                "INSERT INTO replay_sets (role, built_at, max_merges, case_count, skipped_count,"
+                " cutoff_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (role, now, int(max_merges), ok, len(items) - ok, _ts(cutoff_at)),
+            )
         set_id = int(cur.lastrowid)  # type: ignore[arg-type]
         for item in items:
             if isinstance(item, _Skip):
@@ -544,7 +573,13 @@ def _set_from(row: Any) -> ReplaySet:
         max_merges=int(row["max_merges"]),
         case_count=int(row["case_count"]),
         skipped_count=int(row["skipped_count"]),
+        cutoff_at=_cutoff_of(row),
     )
+
+
+def _cutoff_of(row: Any) -> datetime | None:
+    value = row["cutoff_at"] if "cutoff_at" in row.keys() else None  # noqa: SIM118 (sqlite3.Row)
+    return datetime.fromisoformat(value) if value else None
 
 
 def get_set(store: Store, set_id: int) -> ReplaySet:
@@ -563,7 +598,11 @@ def list_sets(store: Store, role: Role | None = None) -> list[ReplaySet]:
 
 
 def latest_set(store: Store, role: Role) -> ReplaySet | None:
-    rows = store.query("SELECT * FROM replay_sets WHERE role = ? ORDER BY id DESC LIMIT 1", (role,))
+    """The role's latest ordinary set (a proposed challenger's cutoff set never is, #69)."""
+    rows = store.query(
+        "SELECT * FROM replay_sets WHERE role = ? AND cutoff_at IS NULL ORDER BY id DESC LIMIT 1",
+        (role,),
+    )
     return _set_from(rows[0]) if rows else None
 
 
@@ -616,16 +655,48 @@ def _case_from(row: Any) -> StoredCase:
     )
 
 
+def effective_cutoff(
+    store: Store,
+    set_id: int,
+    *,
+    cutoff_at: datetime | None = None,
+    experiment_id: int | None = None,
+) -> datetime | None:
+    """#69: the strictest (latest) of ``cutoff_at``, the set's cutoff and the experiment's."""
+    found: list[datetime] = [cutoff_at] if cutoff_at is not None else []
+    rows = store.query("SELECT * FROM replay_sets WHERE id = ?", (int(set_id),))
+    if rows and (c := _cutoff_of(rows[0])) is not None:
+        found.append(c)
+    if experiment_id is not None:
+        exp = store.get_experiment(int(experiment_id))
+        if exp.cutoff_at is not None:
+            found.append(exp.cutoff_at)
+    aware = [c if c.tzinfo else c.replace(tzinfo=UTC) for c in found]
+    return max(aware) if aware else None
+
+
 def list_cases(
-    store: Store, set_id: int, *, include_skipped: bool = False, cloud_models: bool = True
+    store: Store,
+    set_id: int,
+    *,
+    include_skipped: bool = False,
+    cloud_models: bool = True,
+    cutoff_at: datetime | None = None,
+    experiment_id: int | None = None,
 ) -> list[StoredCase]:
     """The set's cases, oldest first. ``cloud_models`` (#49): may a model of this run be a
     cloud model? True (the default) leaves out the cases of local-only repos; pass False
-    only when every model the cases go to is local."""
-    sql = "SELECT * FROM replay_cases WHERE set_id = ?"
+    only when every model the cases go to is local. Cutoff (#69, ``effective_cutoff``):
+    only cases whose ticket was created after it."""
+    sql = "SELECT c.* FROM replay_cases c WHERE c.set_id = ?"
+    params: list[Any] = [int(set_id)]
     if not include_skipped:
-        sql += " AND status = 'ok'"
-    cases = [_case_from(r) for r in store.query(sql + " ORDER BY id", (int(set_id),))]
+        sql += " AND c.status = 'ok'"
+    cutoff = effective_cutoff(store, set_id, cutoff_at=cutoff_at, experiment_id=experiment_id)
+    if cutoff is not None:
+        sql += " AND EXISTS (SELECT 1 FROM tickets t WHERE t.id = c.ticket_id AND t.created_at > ?)"
+        params.append(_ts(cutoff))
+    cases = [_case_from(r) for r in store.query(sql + " ORDER BY c.id", params)]
     if not cloud_models:
         return cases
     local = store.local_only_repos()
@@ -654,6 +725,7 @@ __all__ = [
     "build_replay_set",
     "case_from_json",
     "case_to_json",
+    "effective_cutoff",
     "ensure_current_set",
     "get_case",
     "get_set",

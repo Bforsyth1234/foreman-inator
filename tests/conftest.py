@@ -13,6 +13,26 @@ def foreman_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return home
 
 
+@pytest.fixture(autouse=True)
+def no_ollama_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The worker writes its resource snapshot once per poll (#37), which asks the local
+    Ollama what it holds and runs vm_stat/sysctl. Tests never reach a real Ollama (it
+    answers "unreachable") and spawn no probe per poll (memory reads "unknown"); tests of
+    the snapshot itself pass their own readers."""
+    from foreman_inator.resources.memory import MemoryState
+    from foreman_inator.resources.ollama import Unreachable
+    from foreman_inator.worker_resources import ResourceSteps
+
+    monkeypatch.setattr(
+        ResourceSteps, "resources_ollama", staticmethod(lambda host: Unreachable("test"))
+    )
+    monkeypatch.setattr(
+        ResourceSteps,
+        "resources_memory",
+        staticmethod(lambda: MemoryState(None, None, None, "unknown")),
+    )
+
+
 def pytest_addoption(parser: pytest.Parser, pluginmanager: pytest.PytestPluginManager) -> None:
     """`addopts` in pyproject.toml passes `--numprocesses=auto` (pytest-xdist). With xdist
     disabled (`-p no:xdist`, a serial debugging run) that would be an unknown argument, so
