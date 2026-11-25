@@ -36,7 +36,7 @@ from opentelemetry import trace as otel_trace
 from fakes.github import FakeGitHub
 from fakes.models import FakeModels
 from fakes.opencode import FakeOpenCode, Script, bash, edit, say
-from foreman_inator.config import Config, SpendCaps
+from foreman_inator.config import Config, SpendCaps, local_tier2_models
 from foreman_inator.db.store import Store
 from foreman_inator.github.poller import Poller
 from foreman_inator.proxy.server import ModelProxy
@@ -276,6 +276,9 @@ class Env:
         # call per kickback, on a background thread); tests/test_worker_v3.py turns them on.
         config_kw.setdefault("explore_rate", 0.0)
         config_kw.setdefault("failure_labels", False)
+        # #70: the default ladder's tier 2 became GLM (cloud); these scenarios were written
+        # against the five-rung ladder with a local tier 2, which stays as an opt-in.
+        config_kw.setdefault("models", local_tier2_models())
         self.config = Config(
             app_id=1,
             allowed_users=(USER,),

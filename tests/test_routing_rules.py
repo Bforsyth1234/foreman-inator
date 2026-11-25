@@ -17,7 +17,7 @@ from fde_kit.prompts import PromptRef
 
 from fakes.models import FakeModels
 from foreman_inator import tracing
-from foreman_inator.config import Config, ModelEndpoint
+from foreman_inator.config import Config, ModelEndpoint, local_tier2_models
 from foreman_inator.proxy.server import ModelProxy
 from foreman_inator.routing import rules
 from foreman_inator.routing.rules import (
@@ -33,7 +33,7 @@ from foreman_inator.routing.rules import (
 from foreman_inator.tickets.lifecycle import TicketRequested, TierOverride
 
 OLLAMA = "http://127.0.0.1:11434/v1"
-CONFIG = Config()  # SPEC defaults: tier 1 inkling, tier 2 qwen (local), tier 3 glm then claude
+CONFIG = Config(models=local_tier2_models())  # #70 opt-in: tier 2 qwen (local), tier 3 glm, claude
 TIER1 = CONFIG.models_for_tier(1)[0]
 
 

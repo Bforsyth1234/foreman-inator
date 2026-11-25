@@ -399,7 +399,7 @@ def test_missing_tools_print_install_commands_and_never_run_them(tmp_path):
 
     gh = FakeGitHub("unused", pulled=["inkling-2-mini:latest"])  # Ollama's name when untagged
     checks = deps.check_all(
-        config.Config(),
+        config.Config(models=config.local_tier2_models()),  # #70: opt-in local tier 2
         which=fake_which({"git": "/usr/bin/git"}),
         run=run,
         transport=httpx.MockTransport(gh),
@@ -419,7 +419,9 @@ def test_ollama_unreachable_is_reported():
     def down(request):
         raise httpx.ConnectError("refused", request=request)
 
-    checks = deps.check_models(config.Config(), transport=httpx.MockTransport(down))
+    checks = deps.check_models(
+        config.Config(models=config.local_tier2_models()), transport=httpx.MockTransport(down)
+    )
     assert len(checks) == 3  # tier 1, tier 2, the embedding model (#51)
     assert all(not c.ok and "not reachable" in c.detail for c in checks)
     assert checks[0].fix.endswith("ollama pull inkling-2-mini")

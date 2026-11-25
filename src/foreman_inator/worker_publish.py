@@ -61,6 +61,8 @@ class PublishSteps:
             return
         if cancel is not None and cancel.is_set():
             return
+        if not self.open_pr_gate(ticket):  # type: ignore[attr-defined]
+            return  # #77: at the open-PR cap; the queue's publish job retries it later
         mirror = self._mirror(ticket.repo)  # type: ignore[attr-defined]
         ordinal = [a.id for a in self.store.list_attempts(ticket.id)].index(att.id) + 1
         try:

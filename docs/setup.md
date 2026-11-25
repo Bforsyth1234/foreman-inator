@@ -9,7 +9,8 @@ Terms used below:
 
 - **Ticket:** the worker's record of one labeled issue.
 - **Attempt:** one run of one model on a ticket: write the change, then run the checks.
-- **Tier:** one of three cost levels: 1 and 2 are local models, 3 is cloud models.
+- **Tier:** one of three cost levels: by default 1 is a local model, 2 is an
+  open-weights cloud model (GLM), 3 is Claude.
 - **Kickback:** a change sent back, by you (request changes) or by the AI
   reviewer, with a note and optionally a tag.
 - **Hand-over:** the worker stops working on a ticket and gives it to you,
@@ -24,9 +25,9 @@ Terms used below:
 | [uv](https://docs.astral.sh/uv/) | Installs the `fman` command (and Python 3.12+ if needed) | see the uv docs |
 | [OpenCode](https://opencode.ai/docs/) | The coding agent each attempt runs | `curl -fsSL https://opencode.ai/v2/install \| bash` or `brew install anomalyco/tap/opencode-v2` |
 | [Ollama](https://ollama.com/download) | Serves the local models | `brew install ollama` or the app |
-| The local models | Tiers 1 and 2, the router and the clarify check | `ollama pull inkling-2-mini` and `ollama pull qwen3.8:27b` |
+| The local model | Tier 1, the router and the clarify check | `ollama pull inkling-2-mini` (and `ollama pull qwen3.8:27b` only for a [local tier 2](#keeping-tier-2-local)) |
 | `embeddinggemma` (optional at first) | The nearest-neighbor router, which starts after 50 accepted tickets | `ollama pull embeddinggemma` |
-| Cloud API keys (optional) | Tier 3 writers and the AI reviewer | a Z.ai GLM Coding Plan key and an Anthropic API key |
+| Cloud API keys | Tier 2 and 3 writers and the AI reviewer | a Z.ai GLM key and an Anthropic API key |
 
 The install commands for git, OpenCode and Ollama are the ones `fman setup`
 prints when a tool is missing. The OpenCode driver was built and smoke-tested
@@ -38,10 +39,19 @@ SPEC.md notes that Inkling 2 Mini needs Ollama 0.40.17 or newer and is about
 20 GB. Start Ollama before running setup, so setup can see which models are
 pulled.
 
-Without cloud keys the worker still runs on the local models. A ticket that
-reaches tier 3 fails there and ends with a hand-over, and the AI review cannot
-make its model call, so PRs reach you without an AI verdict (the reviewer's
-code checks still run).
+Without cloud keys the worker still runs tier 1 on the local model. A ticket
+that reaches tier 2 or 3 fails there and ends with a hand-over, and the AI
+review cannot make its model call, so PRs reach you without an AI verdict (the
+reviewer's code checks still run).
+
+### Keeping tier 2 local
+
+Tier 2 defaults to GLM in the cloud (todo #70): a cloud attempt costs a few
+cents and is much faster than a 27B model on a Mac. To keep tier 2 on your Mac
+instead, `ollama pull qwen3.8:27b` and list the models in
+`~/.foreman-inator/config.toml` with Qwen at tier 2 (the table is in
+[configuration.md](configuration.md#models)). A config file written before
+#70 that already lists Qwen at tier 2 keeps working unchanged.
 
 ## 1. Install the `fman` command
 
@@ -330,6 +340,46 @@ lets the check code send anything it can read:
 [sandbox_network]
 "owner/name" = "allow"
 ```
+
+### Start every open issue at once: `fman sweep`
+
+```bash
+fman sweep <owner/name> --dry-run        # preview only: nothing is labeled
+fman sweep <owner/name> --limit 3        # preview, one confirmation, then label
+```
+
+`fman sweep` labels the repo's open issues `agent` for you. It picks open
+issues with no `agent` label, no open ticket and no `fman/` PR yet; narrow it
+with `--label`, `--exclude-label`, `--author` and `--limit N`. Issues whose
+author is not on `allowed_users` are skipped unless you pass
+`--include-any-author` (the preview says when you did).
+
+The preview lists each issue's predicted files, the tier it would start on and
+its wave. A wave is a group of issues that name no file in common, so they can
+run side by side; issues that name no files are listed apart, since they may
+still collide once they have a diff. Waves are not barriers: the worker starts a
+ticket as soon as its files are free (file locks and `max_parallel_per_repo`).
+The preview ends with the issue count, the waves, and an estimate of the cloud
+spend (issues starting on a cloud tier times your average cost per accepted
+ticket, or "unknown" before you have one) next to what is left of the spend
+caps. Answer the one question (or pass `--yes`) and the labels go on, a second
+or so apart, with progress printed. Running it again is safe: issues already
+labeled are skipped.
+
+The labels are applied with your own GitHub CLI login, never the App's token,
+because the worker only counts an `agent` label put on by an allowed user.
+Install [`gh`](https://cli.github.com/) and log in first; if it is missing or
+logged out, `fman sweep` prints the step and stops:
+
+```bash
+gh auth login --hostname github.com --git-protocol https --web
+```
+
+So that a sweep of 40 issues does not put 40 PRs on you at once, the worker
+opens at most `max_open_prs_per_repo` (default 5; 0 = no cap) open `fman/` PRs
+per repo. Attempts still run; a passed attempt waits to open its PR until one
+of the open ones is merged or closed. That wait is not a failure (nothing is
+counted or flagged), and `fman status` shows it as `waiting: open-PR cap (5/5)`.
 
 ## 5. Review the PR
 
