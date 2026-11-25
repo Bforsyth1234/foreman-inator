@@ -100,6 +100,11 @@ class ReviewSteps:
             return True
         return ci_decided(self.store.get_attempt(attempt.id))
 
+    def _rules_file(self, repo: str) -> Any:
+        """#39: the repo's configured ``rules_file`` (``Config.rules_file_for``), or None."""
+        getter = getattr(self.config, "rules_file_for", None)
+        return getter(repo) if getter is not None else None
+
     def _launch_review(self, **kw: Any) -> rv.ReviewOutcome:
         """Process launch point 3 of 3 (#40): the reviewer's checks (tests, coverage,
         revert, run-app) run inside ``review_change`` under ``sandbox.active``; each check
@@ -192,6 +197,7 @@ class ReviewSteps:
                 timeout=self.review_timeout or rv.DEFAULT_TIMEOUT_S,
                 cancel=cancel,
                 depth=plan.depth,
+                rules_file=self._rules_file(t.repo),  # #39: same rules file the writer gets
             )
         if (cancel is not None and cancel.is_set()) or self.stopping:  # type: ignore[attr-defined]
             log.info("ticket %d: AI review cut short; it runs again", t.id)

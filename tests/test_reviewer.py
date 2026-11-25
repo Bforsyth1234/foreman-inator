@@ -305,6 +305,7 @@ def test_reviewer_signature_cannot_take_writer_reasoning():
         "precomputed",  # #29: another review's checks 1-4 on the same change (no writer text)
         "depth",  # #51: "full" or "light" (checks 1-3, no model)
         "rules_file", "global_rules",  # #39: repo rules, read at the base commit
+        "conventions",  # #43: a replayed rules file (repo input, never writer text)
     }  # fmt: skip
     assert [f.name for f in R.dataclasses.fields(ReviewInput)] == [
         "issue",

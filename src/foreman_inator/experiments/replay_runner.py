@@ -82,9 +82,10 @@ only; the champion keeps the production rules, and model and prompt stay the sam
 both sides, so the comparison isolates the rules. The override text's hash is part of
 the challenger's variant id (``<model>/<prompt>@<hash8>+rules@<rules hash8>``) and its
 full sha256 is in the experiment's result note, so a later edit of the file is a new
-variant and never changes an old result. The reviewer side takes the override only when
-``review_change`` accepts a ``conventions`` argument (``REVIEW_TAKES_CONVENTIONS``);
-until then a reviewer rules replay is refused. A reviewer result's ``detail`` ends with
+variant and never changes an old result. The reviewer side passes the override as
+``review_change``'s ``conventions`` argument (``REVIEW_TAKES_CONVENTIONS``, true since
+wave 15); it reaches the model only through a template with a ``conventions`` section
+(``reviewer-v2``). A reviewer result's ``detail`` ends with
 ``[tag: <tag>]`` when the review tagged a kickback, so ``SideTotals.style_tags`` counts
 ``style`` kickbacks.
 

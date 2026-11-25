@@ -88,8 +88,11 @@ def status_command(
     from foreman_inator import config as config_mod
     from foreman_inator import paths
     from foreman_inator.db.store import Store
-    from foreman_inator.worker_status import render_status
+    from foreman_inator.plugins import load_plugins
+    from foreman_inator.plugins import status_lines as plugin_status_lines
+    from foreman_inator.worker_status import local_ollama_host, ollama_line, render_status
 
+    plugins = load_plugins()  # #45
     db = paths.db_path()
     if not db.exists():
         typer.echo("No tickets yet (the worker has not created its database).")
@@ -101,14 +104,22 @@ def status_command(
             typer.echo(repos_line(c))
             line = sandbox.describe(c.sandbox, dict(c.sandbox_network), dict(c.sandbox_install))  # type: ignore[arg-type]
             typer.echo(f"!!! {line} !!!" if c.sandbox == "off" else line)
+            host = local_ollama_host(c)  # #35
+            if host is not None:
+                typer.echo(ollama_line(host))
+        for pline in plugin_status_lines(plugins):
+            typer.echo(pline)
         return
     try:
         cfg = config_mod.load()
     except config_mod.ConfigError as exc:
         typer.echo(f"(config.toml not readable, spend line skipped: {exc})", err=True)
         cfg = None
+    host = local_ollama_host(cfg) if cfg is not None else None
     with Store(db, read_only=True) as store:
-        typer.echo(render_status(store, closed_limit=closed, config=cfg))
+        typer.echo(
+            render_status(store, closed_limit=closed, config=cfg, ollama_host=host, plugins=plugins)
+        )
 
 
 @app.command("metrics")
@@ -346,6 +357,15 @@ def experiment_run(
     all_: Annotated[
         bool, typer.Option("--all", help="Resume every unfinished replay (the nightly job).")
     ] = False,
+    rules: Annotated[
+        Path | None,
+        typer.Option(
+            "--rules",
+            help="Replay this rules file in place of the repo's rules, challenger side only"
+            " (--challenger may then be omitted).",
+            show_default=False,
+        ),
+    ] = None,
 ) -> None:
     """Replay the champion against a challenger on past tickets (resumable; Ctrl-C stops).
 
@@ -355,7 +375,9 @@ def experiment_run(
     from foreman_inator.worker_experiments import ExperimentError, run_command
 
     try:
-        code = run_command(role=role, challenger=challenger, all_=all_, echo=typer.echo)
+        code = run_command(
+            role=role, challenger=challenger, all_=all_, echo=typer.echo, rules=rules
+        )
     except ExperimentError as exc:
         _fail(exc)
     raise typer.Exit(code)
@@ -558,3 +580,14 @@ def _register_setup() -> None:
 
 
 _register_setup()
+
+
+def _register_plugins() -> None:
+    """#45: installed plugins' extra CLI commands, after every built-in (a plugin can
+    never replace one: ``install_cli_commands`` skips taken names)."""
+    from foreman_inator.plugins import install_cli_commands, load_plugins
+
+    install_cli_commands(app, load_plugins())
+
+
+_register_plugins()

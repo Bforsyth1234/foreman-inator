@@ -599,6 +599,7 @@ def review_change(
     depth: ReviewDepth = "full",
     rules_file: str | Path | None = None,
     global_rules: str | Path | None = None,
+    conventions: conv.Conventions | None = None,
 ) -> ReviewOutcome:
     """Review ``change`` against ``issue``. See the module docstring for the policy.
 
@@ -607,7 +608,9 @@ def review_change(
 
     ``rules_file`` (the repo's configured rules file) and ``global_rules`` (overrides
     ``paths.rules_path()``, for tests) feed ``base_conventions`` when the template has a
-    ``conventions`` section (#39); a template without one ignores them.
+    ``conventions`` section (#39); a template without one ignores them. ``conventions``
+    (#43, the rules replay's challenger side) is used as is instead of gathering them at
+    the base commit; it too is shown only when the template has the section.
 
     ``precomputed`` (#29, the shadow reviewer): results of checks 1-4 already run on this
     exact change (``(tests, coverage, revert, run_app)`` of another review's outcome).
@@ -657,6 +660,7 @@ def review_change(
         precomputed=precomputed,
         rules_file=rules_file,
         global_rules=global_rules,
+        conventions_override=conventions,
     )
     recorder = None
     if recordings_dir is not None and ticket_id is not None:
@@ -984,13 +988,15 @@ class _Run:
         summaries = [r.summary() for r in (self.tests, self.coverage, self.revert, self.run_app)]
         rules = None
         if wants_conventions(self.template):
-            rules = base_conventions(
-                self.change.mirror,
-                self.change.base_sha,
-                changed,
-                rules_file=self.rules_file,
-                global_rules=self.global_rules,
-            )
+            rules = self.conventions_override
+            if rules is None:
+                rules = base_conventions(
+                    self.change.mirror,
+                    self.change.base_sha,
+                    changed,
+                    rules_file=self.rules_file,
+                    global_rules=self.global_rules,
+                )
             otel_trace.get_current_span().set_attribute("review.conventions_sha256", rules.sha256)
         review_input = ReviewInput.build(self.issue, diff, changed, summaries, rules)
         messages = build_messages(review_input, self.template)

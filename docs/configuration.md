@@ -102,6 +102,10 @@ root `AGENTS.md` last; each cut is logged as a warning. Repo files are read only
 from inside the worktree. The attempt's trace span records the hash of the
 block the model saw (`conventions.sha256`).
 
+A `reviewer-v2` review gets the same block, built from the same sources as they
+are at the change's base commit (so a writer's edit to `AGENTS.md` never reaches
+its own reviewer); `reviewer-v1` shows no rules.
+
 ## `[experiments]`
 
 Replays, the shadow reviewer and the nightly run.
@@ -138,6 +142,7 @@ every model is one rung of the escalation ladder.
 | `base_url` | yes | OpenAI-compatible base URL. |
 | `family` | yes | For example `"qwen"` or `"claude"`. The AI reviewer must be from a different family than the writer. |
 | `api_key_ref` | for cloud | `"keychain:foreman-inator/<name>"`. |
+| `wire` | no | How the writer (OpenCode) talks to the model through the proxy: `"openai"` (default, `chat/completions`) or `"anthropic"` (Anthropic's native Messages route, `/v1/messages`, which keeps prompt caching). The reviewer and router use `chat/completions` either way. |
 
 The defaults:
 
@@ -149,8 +154,10 @@ The defaults:
 | `claude-opus` | 3 | cloud | `claude-opus-5-5` | `https://api.anthropic.com/v1` | claude | `keychain:foreman-inator/anthropic` |
 | `claude-fable` | 3 | cloud | `claude-fable-5-2` | `https://api.anthropic.com/v1` | claude | `keychain:foreman-inator/anthropic` |
 
-The Claude models are called through Anthropic's OpenAI-compatible endpoint,
-which has no prompt caching (todo #52).
+The default Claude models have `wire = "anthropic"`: the writer reaches them on
+the proxy's Anthropic Messages route, so prompt caching works and cached input
+tokens are priced at Anthropic's cache-read and cache-write rates (traced on the
+`llm.call` span and in the recording's usage). Other models use `"openai"`.
 
 ## Example
 

@@ -239,7 +239,7 @@ Every ticket is one trace, so when a change is kicked back you can see the exact
   - verdict as a span attribute
 - `github`: PR opened, review received; kickbacks are added as events on the attempt they judge
 
-**Capture:** the worker runs a thin OpenAI-compatible proxy in front of the local model server and the cloud APIs. Every model call passes through it and becomes an `llm.call` span, whatever coding agent is used. Tool calls and edits come from OpenCode's session events and the git diff. Large outputs (file contents, logs) are truncated in spans and saved in full as files next to the trace. Traces stay on your Mac.
+**Capture:** the worker runs a thin OpenAI-compatible proxy plus an Anthropic Messages route for Claude models in front of the local model server and the cloud APIs. Every model call passes through it and becomes an `llm.call` span, whatever coding agent is used. Tool calls and edits come from OpenCode's session events and the git diff. Large outputs (file contents, logs) are truncated in spans and saved in full as files next to the trace. Traces stay on your Mac.
 
 **Failure-step labeling:** when a kickback arrives (yours or the reviewer's), a model reads the trace and labels where it went wrong:
 
@@ -301,6 +301,18 @@ The PR stays a draft through AI review. Only a reviewer-approved PR (or one hand
 **Safety on public repos:** the worker acts only on labels applied by an allowlist of GitHub users (you), only on branches it created, and never runs code from forks or outside PRs. No self-hosted Actions runner is used, because GitHub recommends those for private repositories only.
 
 **bot-inator (optional):** it can open issues from chat or a noticed idea through the GitHub API, show a "PR ready for review" card, and send approve or request-changes from the iPhone remote. Its consent rules still apply on its side: an idea becomes an issue only after its normal idea card.
+
+## Plugins
+
+Installed Python packages can extend foreman-inator through the entry-point group
+`foreman_inator.plugins` (installed packages only; nothing is fetched). Each entry point is a
+module or object with `register(registry)` and the hook API versions it supports. Hook API 1
+has one hook: extra `fman` CLI commands, added after the built-ins (a plugin can never replace
+a built-in command). A plugin that fails to load is logged and skipped; `fman status` and the
+worker's startup log list each plugin with its version. The dependency is one way: plugins
+import foreman-inator, foreman-inator never imports a plugin by name. No hook can relax an
+invariant (7a-7g): plugins get no way around the user's merge, the allowed users, local by
+default, the secrets rules, the retry caps, reviewer independence or the sandbox.
 
 ## Open source and distribution
 
