@@ -65,7 +65,7 @@ in the item, and put the shape you rely on behind one small adapter so a
 change touches one file.
 ============================================================ -->
 
-Next ID: #82
+Next ID: #83
 Legend: `[ ]` todo · `[~]` in progress · `[~] live` built, waiting on its live check · `[x]` done (move to DONE.md)
 
 ## Wave plan
@@ -401,6 +401,14 @@ Files: ⚬ EDITED: src/foreman_inator/runner/sandbox.py (profile rules), tests (
 Verify: a sandboxed process in a worktree with a decoy `.env` in a parent folder sees `os.path.exists` False, and a find_dotenv-style upward search does not raise; the worktree's own `.env` is readable; the existing sensitive-path tests stay green. Non-vacuous: drop the new metadata deny and the decoy test fails with PermissionError.
 Live (user): restart the worker, re-label bot-inator#56: verify collects its tests instead of failing at import.
 Scheduled: wave 16 (built with the wave 16 review fixes).
+Deviations:
+
+#82 — A worker restart throws away an unused spend approval [ ] · Added: 2026-11-25 · Source: user (bot-inator ticket 11, live) · GH #80
+Why: `fman approve-spend` approvals are consumed when the cloud attempt starts (`spend.py` `writer_gate` ~line 665 for thrifty, `_try_grant` ~line 580 for over-cap; that grant lives only in memory). A restart mid-attempt marks the attempt `superseded` (`worker.py` ~line 301) and nothing gives the approval back, so the ticket waits for approval again having spent nothing. Seen 2026-11-25: approval 1 used at 18:37:06, SIGTERM at 18:37:52, ticket 11 paused at the cap again at 18:38:10, cloud spend unchanged. With the editable install every merge means a restart, so this will recur.
+DECISIONS (assistant, 2026-11-25, proposed): record the attempt on the approval (`spend_approvals.attempt_id`, migration); when an attempt ends `superseded` or cancelled having spent $0 under its approval, re-open the approval. If it spent anything, leave it consumed and say why in `fman status` (the approval cap stays hard: no silent extra budget).
+Files: ⚬ EDITED: src/foreman_inator/spend.py, src/foreman_inator/db/store.py, src/foreman_inator/worker.py (startup sweep), new `db/migrations/013_*.sql` (after wave 19's 012), tests (new).
+Verify: fake store + clock: approve, start a thrifty attempt, restart before any call → resumes next pass with no new approval; same with one recorded cloud call → stays consumed, status says why. Non-vacuous: remove the re-open, first test fails. pytest + ruff gate (rule 8).
+Scheduled: after wave 19 merges (wave 19 slot d edits `spend.py`).
 Deviations:
 
 ### Unscheduled (status on the issue, 2026-11-25)
