@@ -8,6 +8,9 @@ On disk, under the recordings directory (`~/.foreman-inator/recordings/`, passed
                                                full text of any llm/tool output longer than
                                                CONTENT_LIMIT (spans carry only 4,000 chars)
     <ticket_id>/<attempt_id>.review.jsonl.gz   the AI review of that attempt (role="review")
+    chat/<session_id>.jsonl.gz                 a chat session (role="chat", no ticket;
+                                               docs/chat-design.md section 9), with
+                                               .jsonl and .files/ as above
 
 The JSONL is written by fde-kit's own `RunRecorder` (one object per line, `kind` first;
 header first, result last) and gzipped on `close()`. `load_recording()` reads either file
@@ -24,6 +27,11 @@ back through fde-kit's `RunRecord.load`. Row shapes (fde-kit's fields first, the
     result  kind, output, stopped_reason, turns, total_ms, sources, cited,
             fabricated_citations, outcome, ...extra (tests_passed, diff_lines, head_commit)
 
+A chat recording's header has `run_id` "chat-<id>", `chat_session_id`, `role` "chat" and
+no ticket or attempt id; `Recorder(dir, None, session_id, role="chat")` (or
+`chat_recorder(dir, session_id)`) opens it and `get_recorder(session_id, "chat")` finds it.
+The registry key includes the role, so a chat id never meets an attempt's.
+
 `turn` is the number of `llm` rows so far (a tool row belongs to the model turn before it).
 
 The model proxy and the OpenCode driver write to the same attempt concurrently, from
@@ -32,7 +40,9 @@ finds the open recorder for an attempt from anywhere in the process.
 
 Retention (`prune`): recordings of merged tickets are kept; the rest are deleted once older
 than 90 days. `foreman_inator.prune.run` calls it (the worker once a day, `fman prune` by
-hand) and also keeps tickets that are still open.
+hand) and also keeps tickets that are still open. `prune` never looks inside `chat/` (not
+an integer name); `prune_chats` applies the same rule there, keyed by session id (kept when
+the session's PR was merged).
 """
 
 from __future__ import annotations
@@ -56,6 +66,8 @@ log = logging.getLogger(__name__)
 
 CONTENT_LIMIT = 4000
 RETENTION_DAYS = 90
+CHAT_ROLE = "chat"
+CHAT_DIR = "chat"  # <recordings>/chat/<session_id>.jsonl.gz
 
 _open: dict[tuple[int, str], Recorder] = {}
 _open_lock = threading.Lock()
@@ -72,6 +84,11 @@ def recording_path(
     return Path(recordings_dir) / str(ticket_id) / f"{attempt_id}{_suffix(role)}.jsonl.gz"
 
 
+def chat_recording_path(recordings_dir: str | Path, session_id: int) -> Path:
+    """Where the finished (gzipped) recording of a chat session lives."""
+    return Path(recordings_dir) / CHAT_DIR / f"{int(session_id)}.jsonl.gz"
+
+
 def get_recorder(attempt_id: int, role: str = "attempt") -> Recorder | None:
     """The open recorder for that attempt (or its review), or None."""
     with _open_lock:
@@ -79,14 +96,17 @@ def get_recorder(attempt_id: int, role: str = "attempt") -> Recorder | None:
 
 
 class Recorder:
-    """Records one attempt (or review). Opening registers it for `get_recorder`; `close`
-    writes the result row, gzips the file and unregisters. Use as a context manager: an
-    exception closes it with stopped_reason="error"."""
+    """Records one attempt (or review, or chat session). Opening registers it for
+    `get_recorder`; `close` writes the result row, gzips the file and unregisters. Use as a
+    context manager: an exception closes it with stopped_reason="error".
+
+    ``role="chat"``: ``attempt_id`` is the chat session id and ``ticket_id`` must be None;
+    the file is `chat_recording_path(recordings_dir, session_id)`."""
 
     def __init__(
         self,
         recordings_dir: str | Path,
-        ticket_id: int,
+        ticket_id: int | None,
         attempt_id: int,
         *,
         role: str = "attempt",
@@ -97,12 +117,19 @@ class Recorder:
         tier: int | None = None,
         **header_extra: Any,
     ):
+        chat = role == CHAT_ROLE
+        if chat and ticket_id is not None:
+            raise ValueError("a chat recording has no ticket; pass ticket_id=None")
         self.ticket_id = ticket_id
         self.attempt_id = attempt_id
         self.role = role
-        self.path = recording_path(recordings_dir, ticket_id, attempt_id, role)
+        if chat:
+            self.path = chat_recording_path(recordings_dir, attempt_id)
+            self.files_dir = self.path.parent / f"{int(attempt_id)}.files"
+        else:
+            self.path = recording_path(recordings_dir, ticket_id, attempt_id, role)  # type: ignore[arg-type]
+            self.files_dir = self.path.parent / f"{attempt_id}{_suffix(role)}.files"
         self.partial_path = self.path.with_suffix("")  # .jsonl
-        self.files_dir = self.path.parent / f"{attempt_id}{_suffix(role)}.files"
         self._lock = threading.RLock()
         self._seq = 0
         self._turns = 0
@@ -112,12 +139,24 @@ class Recorder:
         with _open_lock:
             if key in _open:
                 raise RuntimeError(f"a recorder for {role} {attempt_id} is already open")
+            if chat:
+                ids: dict[str, Any] = {
+                    "run_id": f"chat-{int(attempt_id)}",
+                    "ticket_id": None,
+                    "attempt_id": None,
+                    "chat_session_id": int(attempt_id),
+                }
+            else:
+                ids = {
+                    "run_id": f"t{ticket_id}-a{attempt_id}{_suffix(role).replace('.', '-')}",
+                    "ticket_id": ticket_id,
+                    "attempt_id": attempt_id,
+                }
             header = {
                 "kind": "header",
-                "run_id": f"t{ticket_id}-a{attempt_id}{_suffix(role).replace('.', '-')}",
+                "run_id": ids.pop("run_id"),
                 "model": model,
-                "ticket_id": ticket_id,
-                "attempt_id": attempt_id,
+                **ids,
                 "role": role,
                 "trace_id": trace_id,
                 "base_commit": base_commit,
@@ -306,6 +345,12 @@ class Recorder:
             self.close(stopped_reason="error", error=exc_type.__name__, error_message=str(exc))
 
 
+def chat_recorder(recordings_dir: str | Path, session_id: int, **kwargs: Any) -> Recorder:
+    """Open the recording of chat session ``session_id`` (``Recorder`` keyword arguments:
+    trace_id, base_commit, model, tier, header extras such as repo, ladder, sandbox)."""
+    return Recorder(recordings_dir, None, int(session_id), role=CHAT_ROLE, **kwargs)
+
+
 # --------------------------------------------------------------------------- reading
 
 
@@ -393,6 +438,47 @@ def prune(
             if not dry_run:
                 with contextlib.suppress(OSError):
                     os.rmdir(tdir)  # only if now empty
+    return deleted
+
+
+def prune_chats(
+    recordings_dir: str | Path,
+    *,
+    merged: Container[int] | Callable[[int], bool],
+    max_age_days: float = RETENTION_DAYS,
+    now: float | None = None,
+    dry_run: bool = False,
+) -> list[Path]:
+    """Delete chat recordings (`<recordings_dir>/chat/<id>.jsonl[.gz]` and their `.files/`)
+    older than `max_age_days` by mtime, unless the session's PR was merged (`merged`: a set
+    of session ids, or a `session_id -> bool` callable). The recording of a session whose
+    recorder is still open in this process is never touched. Returns the deleted paths;
+    with `dry_run`, the paths that would be deleted, and nothing is touched."""
+    is_merged = _is_merged(merged)
+    cutoff = (now if now is not None else datetime.now(UTC).timestamp()) - max_age_days * 86400
+    root = Path(recordings_dir) / CHAT_DIR
+    deleted: list[Path] = []
+    if not root.is_dir():
+        return deleted
+    for f in sorted(root.iterdir()):
+        if not f.is_file() or not f.name.endswith((".jsonl.gz", ".jsonl")):
+            continue
+        stem = f.name.removesuffix(".gz").removesuffix(".jsonl")
+        if not stem.isdigit():
+            continue
+        sid = int(stem)
+        if is_merged(sid) or get_recorder(sid, CHAT_ROLE) is not None:
+            continue
+        if f.stat().st_mtime >= cutoff:
+            continue
+        if not dry_run:
+            f.unlink()
+        deleted.append(f)
+        side = root / f"{stem}.files"
+        if side.is_dir() and side not in deleted:
+            if not dry_run:
+                shutil.rmtree(side)
+            deleted.append(side)
     return deleted
 
 
