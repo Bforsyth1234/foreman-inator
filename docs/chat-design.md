@@ -456,3 +456,15 @@ matches `fman status`, `/pr` opens a draft, `/discard` leaves no branch.
 6. Should a chat take file locks on the files it edits, so tickets wait instead of
    producing conflicting PRs?
 7. Is one open session at a time enough (`chat_max_sessions = 1`)?
+
+### Decisions (user, 2026-11-25)
+
+These answer the questions above and override any earlier recommendation in this doc.
+
+1. **Spend:** option C. Chat counts toward `monthly_usd`, capped by `chat_monthly_usd`, default **$20**.
+2. **Local GPU: chat jumps the queue, on a timer.** A chat turn that needs the local slot goes ahead of queued ticket calls (priority, not preemption of a call already running). If the turn would wait more than **5 seconds** (`chat_local_wait_seconds = 5`) for the slot, that turn goes to a **cloud model** instead: the first cloud rung at or above the session's tier. The fallback never applies to a local-only repo (#49, invariant 7c): there the turn keeps waiting. It is also refused, and the turn waits, when the chat sub-cap, the monthly cap or the per-turn budget would be exceeded. The turn's trace and the page say "local slot busy, used <cloud model>". The session's own tier does not change; the next turn tries local again.
+3. **Opening as PR:** a draft PR with **no AI review**: the user was in the loop for every change.
+4. **Network:** closed by default, with a **per-repo opt-in** for chat only (`chat_network`, stored in `repo_settings`, set with `fman repo set-chat-network <repo> on|off` and on `/settings`). When on, the chat sandbox gets the same outbound policy as a first-attempt dependency install (ports 443/80), never the user's credentials or Keychain. Tickets are unaffected.
+5. **Base branch only** at first: a chat never continues an existing `fman/` ticket branch (it could collide with the worker's next attempt).
+6. **File locks: yes.** A chat session takes locks on files it edits (lock holder kind "chat"), so tickets wait instead of producing conflicting PRs; locks are released on `/pr`, `/discard`, or when the session ends. A chat never waits on a ticket's locks to edit (the user decides), but the page shows a warning when a file it edits is held by a ticket.
+7. **One open session** at a time (`chat_max_sessions = 1`).
