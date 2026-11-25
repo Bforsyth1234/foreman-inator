@@ -67,6 +67,7 @@ from foreman_inator.runner import sandbox
 from foreman_inator.runner import verify as verify_mod
 from foreman_inator.runner.worktree import RepoMirror, Worktree, WorktreeError
 from foreman_inator.tickets import conventions as conventions_mod
+from foreman_inator.tickets import images as images_mod
 from foreman_inator.tickets import lifecycle
 from foreman_inator.tickets.lifecycle import AttemptStarted, ChecksFailed, clarify_qa_cursor
 from foreman_inator.tickets.prompt import (
@@ -129,6 +130,8 @@ class AttemptSteps:
     verify_timeout: float
     #: #59: ``ollama host -> span attributes``; an instance attribute replaces it in tests.
     resource_snapshot = staticmethod(memory.snapshot)
+    #: #78: the httpx transport image fetches use (None: the network); tests replace it.
+    image_transport: Any = None
 
     # ------------------------------------------------------------------ seams
     # ``before_route`` (#44) lives in ``worker_clarify``; the sandbox policy in
@@ -437,6 +440,7 @@ class AttemptSteps:
             issue_comments=fetch_issue_comments(  # #25: allowed users' comments, not the Q&A
                 self.api, ticket, is_allowed=self.config.is_allowed_user, clarification=qa
             ),
+            images=self.ticket_images(ticket),  # #78: described attachments
         )
         variant = variants.register(self.store, "writer", endpoint.name, template).id
         att = self.store.update_attempt(att.id, variant_id=variant)
@@ -550,6 +554,44 @@ class AttemptSteps:
             diff.diff_lines,
         )
         return att, passed, vr, diff
+
+    def ticket_images(self, ticket: Ticket) -> str | None:
+        """#78: the images allowed users attached to the issue body, their needs-info
+        answers and comments, fetched here in the worker (never in the sandbox) from
+        GitHub's attachment hosts only, stored under the ticket's trace dir, and
+        described by a vision model (local first; cloud only when the repo allows it,
+        through the proxy and its spend caps). None when there are none. Never raises:
+        a failure costs the attempt its image descriptions, nothing else."""
+        try:
+            comments = list(self.api.list_issue_comments(ticket.repo, ticket.issue_number))
+            if not images_mod.image_urls(ticket.request) and not any(
+                images_mod.image_urls(c.body or "") for c in comments
+            ):
+                return None  # the common case: no GitHub attachment links, no more calls
+            issue = self.api.get_issue(ticket.repo, ticket.issue_number)
+            srcs = images_mod.sources(
+                body=ticket.request,
+                body_author=issue.author,
+                comments=comments,
+                is_allowed=self.config.is_allowed_user,
+                bot_login=self.api.bot_login(),
+            )
+            return images_mod.images_text(
+                srcs,
+                images_mod.images_dir(self.traces_dir, ticket.id),
+                models=getattr(self.config, "models", ()),
+                allow_cloud=self.store.repo_allows_cloud(ticket.repo),
+                proxy=self.proxy,
+                token=self._token(ticket.repo),
+                transport=self.image_transport,
+            )
+        except Exception as exc:  # noqa: BLE001 - images are optional context
+            log.warning(
+                "ticket %d: could not gather the issue's images (%s); going on without them",
+                ticket.id,
+                exc,
+            )
+            return None
 
     def _launch_writer_once_more(self, **kw: Any) -> Any:
         """``_launch_writer``, with exactly one immediate re-run when the run could not
