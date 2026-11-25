@@ -48,6 +48,17 @@ gets traffic). ``run --all`` resumes every unfinished replay; it never promotes.
      history note; without it nothing changes.
 3. promoting writes a ``champion_history`` row and ends V's running experiments as
    ``promoted``; the worker uses the new champion from its next attempt or review.
+
+Rules replays (#43, todo #66)
+-----------------------------
+``run --role R --rules FILE [--challenger V]`` replays FILE in place of the gathered
+rules on the challenger side only (``replay_runner.RulesOverride``); V defaults to the
+champion's own model and prompt, so the comparison isolates the rules. The challenger's
+id is V's id plus ``+rules@<hash8>`` of the file's text, and the text is kept under
+``replays/rules/<sha256>.md`` when the run starts: ``run --all`` resumes with that copy,
+so editing FILE afterwards never changes the old run (a re-run with the edited file is a
+new variant and a new experiment). A rules variant is not promoted: the rules go live by
+editing the rules file itself.
 """
 
 from __future__ import annotations
@@ -74,6 +85,7 @@ from foreman_inator.runner.worktree import MIRROR_DIRNAME, RepoMirror, WorktreeE
 log = logging.getLogger("foreman_inator.experiments")
 
 REPLAYS_DIRNAME = "replays"
+RULES_DIRNAME = "rules"  # replays/rules/<sha256>.md: rules override texts, as run (#43)
 LOCK_NAME = "run.lock"
 KEEP_REF = "refs/fman-keep/"
 
@@ -262,9 +274,56 @@ def _register(store: Store, role: rr.Role, v: rr.Variant) -> None:
     variants.register(store, role, v.endpoint.name, ref)
 
 
-def _variant_from_id(config: Config, role: rr.Role, vid: str) -> rr.Variant:
-    p = variants.parse_variant_id(vid)
-    return _variant(config, role, p.model, p.prompt_name, p.hash8)
+def _variant_from_id(
+    config: Config, role: rr.Role, vid: str, home: Path | None = None
+) -> rr.Variant:
+    base, rules_hash = rr.split_rules_id(vid)
+    p = variants.parse_variant_id(base)
+    v = _variant(config, role, p.model, p.prompt_name, p.hash8)
+    return v if rules_hash is None else rr.with_rules(v, load_rules(rules_hash, home))
+
+
+# =========================================================================== rules (#43)
+
+
+def _rules_dir(home: Path | None = None) -> Path:
+    d = replays_root(home) / RULES_DIRNAME
+    d.mkdir(mode=paths.DIR_MODE, parents=True, exist_ok=True)
+    return d
+
+
+def read_rules(path: Path | str) -> rr.RulesOverride:
+    """The override from ``--rules FILE`` (refused when missing or empty)."""
+    p = Path(path).expanduser()
+    try:
+        rules = rr.RulesOverride.from_path(p)
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ExperimentError(f"--rules {p}: {exc}") from None
+    if not rules.text.strip():
+        raise ExperimentError(f"--rules {p} is empty")
+    return rules
+
+
+def keep_rules(rules: rr.RulesOverride, home: Path | None = None) -> Path:
+    """Store the override's text by its hash (what a resumed run replays)."""
+    dest = _rules_dir(home) / f"{rules.sha256}.md"
+    if not dest.exists():
+        tmp = dest.with_suffix(".tmp")
+        tmp.write_text(f"{rules.name}\n{rules.text}", encoding="utf-8")
+        tmp.chmod(0o600)
+        tmp.replace(dest)
+    return dest
+
+
+def load_rules(hash8: str, home: Path | None = None) -> rr.RulesOverride:
+    """The kept override whose sha256 starts with ``hash8`` (its hash re-checked)."""
+    found = sorted(_rules_dir(home).glob(f"{hash8}*.md")) if hash8.isalnum() else []
+    for path in found:
+        name, _, text = path.read_text(encoding="utf-8").partition("\n")
+        rules = rr.RulesOverride(text, name or "AGENTS.md")
+        if rules.sha256 == path.stem:
+            return rules
+    raise ExperimentError(f"no kept rules text for +rules@{hash8}; run it again with --rules")
 
 
 def ensure_shadow(store: Store, champion: str, challenger: str) -> Experiment:
@@ -290,6 +349,7 @@ class RunEnv:
     config: Config
     deps: rr.ReplayDeps
     cancel: threading.Event = field(default_factory=threading.Event)
+    home: Path | None = None  # replays root parent (kept rules texts); None = paths.home()
 
 
 def make_proxy(config: Config, store: Store, spend: Any, local_slots: Any = None) -> Any:
@@ -343,16 +403,38 @@ def build_deps(
     )
 
 
-def run_experiment(env: RunEnv, role: str, challenger: str) -> rr.Comparison:
+def run_experiment(
+    env: RunEnv,
+    role: str,
+    challenger: str | None,
+    *,
+    rules: Path | str | None = None,
+    home: Path | None = None,
+) -> rr.Comparison:
     """Start or resume the replay of the champion against ``challenger`` (and, for a
-    reviewer, its shadow experiment)."""
+    reviewer, its shadow experiment). ``rules`` (#43): a rules file replayed on the
+    challenger side only, in place of the gathered rules; ``challenger`` then defaults
+    to the champion's model and prompt."""
     r = _role(role)
     champ = champion_variant(env.store, env.config, r)
-    chall = resolve_challenger(env.store, env.config, r, challenger)
+    if challenger is None and rules is None:
+        raise ExperimentError("give --challenger (or --rules)")
+    spec = challenger if challenger is not None else champ.variant_id
+    chall = resolve_challenger(env.store, env.config, r, rr.split_rules_id(spec)[0])
+    if rules is not None:
+        override = read_rules(rules)
+        if r == "reviewer" and not rr.REVIEW_TAKES_CONVENTIONS:
+            raise ExperimentError(
+                "the reviewer does not read repo rules yet, so a reviewer --rules replay"
+                " would compare nothing; use --role writer"
+            )
+        chall = rr.with_rules(chall, override)
+        keep_rules(override, home)
     if chall.variant_id == champ.variant_id:
         raise ExperimentError(f"{chall.variant_id} is the {r} champion")
     _register(env.store, r, chall)
-    if r == "reviewer":
+    if r == "reviewer" and chall.rules is None:
+        # a rules variant has no live shadow: the worker's reviewer reads the real rules
         ensure_shadow(env.store, champ.variant_id, chall.variant_id)
     done = _newest(env.store, r, chall.variant_id, "replay")
     if done is not None and done.champion_variant == champ.variant_id:
@@ -397,11 +479,11 @@ def run_all(env: RunEnv, echo: Callable[[str], None] = print) -> list[rr.Compari
             continue
         try:
             champ = champion_variant(env.store, env.config, role)
-            chall = _variant_from_id(env.config, role, exp.challenger_variant)
+            chall = _variant_from_id(env.config, role, exp.challenger_variant, env.home)
         except (ExperimentError, variants.VariantError) as exc:
             echo(f"#{exp.id}: skipped: {exc}")
             continue
-        if role == "reviewer":
+        if role == "reviewer" and chall.rules is None:
             ensure_shadow(env.store, champ.variant_id, chall.variant_id)
         c = rr.run_replay(
             env.deps,
@@ -454,16 +536,22 @@ def run_command(
     driver_factory: Callable[[], Any] | None = None,
     config: Config | None = None,
     local_slots: Any = None,
+    rules: Path | str | None = None,
 ) -> int:
     """``fman experiment run``: its own proxy, its own mirrors, the run lock, clean stops.
-    ``local_slots``: the worker proxy's ``slots`` when run inside the worker (#34)."""
+    ``local_slots``: the worker proxy's ``slots`` when run inside the worker (#34).
+    ``rules`` (#43, ``--rules FILE``): replay FILE in place of the gathered rules on the
+    challenger side only; ``challenger`` may then be omitted (the champion's model and
+    prompt)."""
     from foreman_inator import config as config_mod
     from foreman_inator.spend import Spend
 
-    if all_ == bool(role or challenger):
-        raise ExperimentError("give --role and --challenger, or --all")
-    if not all_ and not (role and challenger):
-        raise ExperimentError("give both --role and --challenger")
+    if all_ == bool(role or challenger or rules):
+        raise ExperimentError("give --role and --challenger (or --rules), or --all")
+    if not all_ and not (role and (challenger or rules)):
+        raise ExperimentError("give --role and --challenger (or --rules)")
+    if rules is not None:
+        read_rules(rules)  # refuse a missing or empty file before taking the lock
     cfg = config or config_mod.load()
     if not paths.db_path().exists():
         raise ExperimentError("no database yet: run the worker first")
@@ -489,7 +577,7 @@ def run_command(
             if all_:
                 run_all(env, echo)
             else:
-                c = run_experiment(env, role or "", challenger or "")
+                c = run_experiment(env, role or "", challenger, rules=rules)
                 echo(rr.comparison_note(c))
                 echo(f"Experiment #{c.experiment_id}: `fman experiment status {c.experiment_id}`")
         finally:
@@ -533,9 +621,12 @@ __all__ = [
     "champion_variant",
     "ensure_shadow",
     "install_cancel_handlers",
+    "keep_rules",
+    "load_rules",
     "make_proxy",
     "mirror_for",
     "promote",
+    "read_rules",
     "replay_command",
     "replay_report",
     "resolve_challenger",
