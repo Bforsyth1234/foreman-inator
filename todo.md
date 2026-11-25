@@ -65,7 +65,7 @@ in the item, and put the shape you rely on behind one small adapter so a
 change touches one file.
 ============================================================ -->
 
-Next ID: #80
+Next ID: #81
 Legend: `[ ]` todo · `[~]` in progress · `[~] live` built, waiting on its live check · `[x]` done (move to DONE.md)
 
 ## Wave plan
@@ -430,3 +430,14 @@ Why: there is no retry command. To start a ticket over today the user removes th
 Idea: a "Retry" button on each flagged ticket on the activity page (#76), with a choice of "same tier" or "move up a tier". It clears the flag and puts the ticket back in the queue, keeping its history (attempts, traces, PR branch), so the metrics count it as one ticket. Add the same as a CLI command (`fman retry <repo>#<issue> [--tier N]`) and have the button call that code. The retry limits still apply: a retry gives a fixed number of extra attempts (for example one round), not a reset, and a `spend_cap` flag can't be retried while the cap is still reached (show why instead). A retry made by hand is recorded on the ticket so the router can tell it apart from an automatic escalation. Uses the shared POST protection from #67 / #73.
 Verify: retrying a `checks_failed` ticket clears the flag, queues it once and keeps its attempt rows; "move up a tier" starts the next attempt one tier higher; retry while the spend cap is reached is refused with the reason and changes nothing; two clicks queue it once; a POST without the token is refused with 403. Non-vacuous: drop the once-only guard and the double-click test queues two attempts.
 Estimate: about half a day with tests, after #76. Related: #67, #73, #76.
+
+### Unscheduled (second live run, bot-inator, 2026-11-25)
+
+#80 — The sandbox shows `~/.env` exists but refuses to read it, so `load_dotenv()` crashes verify [ ] · Added: 2026-11-25 · Source: user (bot-inator ticket 10, attempt 33 trace)
+Why: python-dotenv's `load_dotenv()` with no path walks up from the worktree (`~/.foreman-inator/worktrees/...`) to `/Users/<user>/` looking for `.env`. The sandbox profile allows `file-read-metadata` on `/` (`runner/sandbox.py`, ~line 767) but denies the contents of sensitive files, so `~/.env` passes `os.path.isfile` and then `open()` raises `PermissionError`. On bot-inator, `smolagents/remote_executors.py:48` calls it at import time, which crashed collection of all 136 test files: verify failed for every attempt whatever the change, and the writer spent its turns working around it. Any repo whose dependencies call `load_dotenv()` at import (FastAPI, Django and most agent frameworks) hits the same wall.
+DECISIONS (assistant, 2026-11-25): Make the files invisible, not readable. Deny `file-read*` including metadata for `.env`-style files (`.env`, `.env.local`, `.env.*`) in every ancestor directory of the worktree that is outside the worktree, so code in the sandbox sees "no such file" and moves on. The worktree's own `.env` files stay readable. Nothing that was unreadable becomes readable (invariant 7d: secrets never reach the attempt).
+Files: ⚬ EDITED: src/foreman_inator/runner/sandbox.py (profile rules), tests (new, macOS-only like the other sandbox tests).
+Verify: a sandboxed process in a worktree with a decoy `.env` in a parent folder sees `os.path.exists` False, and a find_dotenv-style upward search does not raise; the worktree's own `.env` is readable; the existing sensitive-path tests stay green. Non-vacuous: drop the new metadata deny and the decoy test fails with PermissionError.
+Live (user): restart the worker, re-label bot-inator#56: verify collects its tests instead of failing at import.
+Scheduled: wave 16 (built with the wave 16 review fixes).
+Deviations:
