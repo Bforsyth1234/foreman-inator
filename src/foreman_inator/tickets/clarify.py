@@ -65,6 +65,8 @@ PROXY_LABEL = "clarify"
 
 MAX_QUESTIONS = 3
 DEFAULT_TIMEOUT = 30.0  # seconds, the whole call; the runner passes router_timeout_seconds
+# Extra seconds when Ollama has the classifier unloaded (issue #52); see rules "Cold loads".
+DEFAULT_COLD_LOAD_ALLOWANCE = rules.DEFAULT_COLD_LOAD_ALLOWANCE
 
 # Budgets (characters).
 TITLE_BUDGET = 300
@@ -266,11 +268,15 @@ def assess(
     allow_cloud_classifier: bool = False,
     timeout: float = DEFAULT_TIMEOUT,
     template: PromptRef | None = None,
+    watch: rules.ModelWatch | None = None,
+    cold_load_allowance: float = DEFAULT_COLD_LOAD_ALLOWANCE,
 ) -> Assessment:
     """Can ``ticket`` (anything with ``title``, ``request``, ``repo``) be worked on as
     written? One model call, inside a ``clarify`` span. Never raises; any failure is
     ``Clear`` with a ``clarify fallback:`` reason. ``proxy`` / ``base_url`` /
-    ``classifier`` / ``allow_cloud_classifier`` work as in ``routing.route``."""
+    ``classifier`` / ``allow_cloud_classifier`` / ``watch`` / ``cold_load_allowance`` work
+    as in ``routing.route``: a classifier Ollama has unloaded gets ``timeout +
+    cold_load_allowance`` and the log says "waiting for cold load of <model>"."""
     models = config.models if isinstance(config, Config) else tuple(config)
     with tracing.span(SPAN_NAME) as span:
         result = _assess(
@@ -282,6 +288,8 @@ def assess(
             allow_cloud_classifier=allow_cloud_classifier,
             timeout=timeout,
             template=template,
+            watch=watch,
+            cold_load_allowance=cold_load_allowance,
         )
         attrs = {
             "clarify.result": "needs_info" if isinstance(result, NeedsInfo) else "clear",
@@ -306,6 +314,8 @@ def _assess(
     allow_cloud_classifier: bool,
     timeout: float,
     template: PromptRef | None,
+    watch: rules.ModelWatch | None = None,
+    cold_load_allowance: float = DEFAULT_COLD_LOAD_ALLOWANCE,
 ) -> Assessment:
     name: str | None = None
     digest: str | None = None
@@ -338,13 +348,14 @@ def _assess(
             template=ref,
         )
         pv = _prompt_version(name, digest)
+        wait = (timeout, watch, cold_load_allowance)
         if proxy is not None:
             with proxy.context(label=PROXY_LABEL, prompt_version=pv) as ctx:
-                raw = _call(ctx.base_url, clf, messages, pv, timeout)
+                raw = _call(ctx.base_url, clf, messages, pv, *wait)
         elif base_url is not None:
             if not rules._is_loopback(urlparse(base_url).hostname or ""):
                 return fallback("base_url is not the local model proxy; refusing to send")
-            raw = _call(base_url, clf, messages, pv, timeout)
+            raw = _call(base_url, clf, messages, pv, *wait)
         else:
             return fallback("no model proxy given")
         questions = parse_answer(raw)
@@ -372,6 +383,8 @@ def _call(
     messages: list[dict[str, str]],
     prompt_version: str | None,
     timeout: float,
+    watch: rules.ModelWatch | None = None,
+    cold_load_allowance: float = DEFAULT_COLD_LOAD_ALLOWANCE,
 ) -> str:
     body: dict[str, Any] = {
         "model": clf.name,
@@ -385,7 +398,15 @@ def _call(
     headers = {"content-type": "application/json"}
     if prompt_version:
         headers[rules.PROMPT_VERSION_HEADER] = prompt_version
-    data = rules._post_with_deadline(url.rstrip("/") + "/chat/completions", body, headers, timeout)
+    data = rules.post_classifier(
+        url.rstrip("/") + "/chat/completions",
+        body,
+        headers,
+        classifier=clf,
+        timeout=timeout,
+        watch=watch,
+        cold_load_allowance=cold_load_allowance,
+    )
     return rules._answer_text(data)
 
 
