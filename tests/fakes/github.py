@@ -439,6 +439,22 @@ class FakeGitHub:
         self._write("post_comment", repo=repo, number=number, body=body)
         return self._comment(self._item(repo, number), body, self._bot)
 
+    def update_comment(self, repo: str, comment_id: int, body: str) -> Comment:
+        """#77: edit a comment in place (same id, new body and ``updated_at``). Like
+        GitHub, the id is repo-scoped; an unknown id is a 404."""
+        self._write("update_comment", repo=repo, comment_id=comment_id, body=body)
+        for item in self._repo(repo).items.values():
+            for i, c in enumerate(item.comments):
+                if c.id == comment_id:
+                    now = self.clock()
+                    new = Comment(c.id, body, c.author, c.created_at, now)
+                    item.comments[i] = new
+                    item.updated_at = now
+                    return new
+        raise GitHubNotFound(
+            404, "Not Found", "PATCH", f"/repos/{repo}/issues/comments/{comment_id}"
+        )
+
     def add_labels(self, repo: str, number: int, labels: Sequence[str]) -> list[str]:
         self._write("add_labels", repo=repo, number=number, labels=list(labels))
         item = self._item(repo, number)

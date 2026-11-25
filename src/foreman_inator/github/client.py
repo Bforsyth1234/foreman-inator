@@ -13,6 +13,11 @@ Endpoints relied on (rule 12, read 2026-11-23, API version 2026-03-10):
   and ``label.name``. https://docs.github.com/en/rest/issues/events
 - comments: ``GET|POST /repos/{o}/{r}/issues/{n}/comments`` (since)
   https://docs.github.com/en/rest/issues/comments
+- edit a comment (#77 / todo 81, rule 12, read 2026-11-25): "Update an issue comment",
+  ``PATCH /repos/{o}/{r}/issues/comments/{comment_id}`` ``{"body": ...}`` (body required)
+  -> 200 with the comment, 422 on validation failure or spam. The comment id is
+  repo-scoped (no issue number in the path).
+  https://docs.github.com/en/rest/issues/comments#update-an-issue-comment
 - labels: ``POST /repos/{o}/{r}/issues/{n}/labels`` ``{"labels": [...]}``,
   ``DELETE .../labels/{name}`` (404 when absent) https://docs.github.com/en/rest/issues/labels
 - refs: ``GET /repos/{o}/{r}/git/ref/heads/{b}``, ``POST .../git/refs``,
@@ -253,6 +258,7 @@ class GitHubAPI(Protocol):
         self, repo: str, number: int, *, since: datetime | None = None
     ) -> list[Comment]: ...
     def post_comment(self, repo: str, number: int, body: str) -> Comment: ...
+    def update_comment(self, repo: str, comment_id: int, body: str) -> Comment: ...
     def add_labels(self, repo: str, number: int, labels: Sequence[str]) -> list[str]: ...
     def remove_label(self, repo: str, number: int, label: str) -> list[str]: ...
     def close_issue(self, repo: str, number: int, *, reason: str = "completed") -> Issue: ...
@@ -292,6 +298,7 @@ class GitHubAPI(Protocol):
 WRITE_METHODS = frozenset(
     {
         "post_comment",
+        "update_comment",
         "add_labels",
         "remove_label",
         "close_issue",
@@ -657,6 +664,14 @@ class GitHubClient:
     def post_comment(self, repo: str, number: int, body: str) -> Comment:
         o, r = _split(repo)
         data = self._json("POST", f"/repos/{o}/{r}/issues/{number}/comments", json={"body": body})
+        return comment_from_json(data)
+
+    def update_comment(self, repo: str, comment_id: int, body: str) -> Comment:
+        """Replace the body of an issue comment (#77): ``PATCH .../issues/comments/{id}``."""
+        o, r = _split(repo)
+        data = self._json(
+            "PATCH", f"/repos/{o}/{r}/issues/comments/{int(comment_id)}", json={"body": body}
+        )
         return comment_from_json(data)
 
     def add_labels(self, repo: str, number: int, labels: Sequence[str]) -> list[str]:
