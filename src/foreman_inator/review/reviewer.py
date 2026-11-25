@@ -37,9 +37,19 @@ check 5 are recorded as skipped spans; no model is called, so the reviewer endpo
 not used, the family check (7f) is not in play, and the row's ``reviewer_model`` is
 ``LIGHT_REVIEWER_MODEL`` with no variant. Timeouts and errors hand over as above.
 
+Conventions (#39). A reviewer template with a ``conventions`` section (``reviewer-v2``)
+also sees the repo's rules, ``tickets.conventions.gather`` / ``render`` exactly as the
+writer gets them (global, per-repo rules file, root and nested ``AGENTS.md`` /
+``CLAUDE.md``, one shared budget), with the change's files standing in for
+``owned_files``. The repo files are read from the change's BASE commit
+(``base_conventions``), never its head, so a writer that edits ``AGENTS.md`` cannot steer
+its own reviewer. A template without the section (``reviewer-v1``) gathers nothing and its
+messages are byte-for-byte what they were.
+
 Invariant 7f: check 5's input is exactly ``ReviewInput`` (issue title and body, the diff
 bounded with a visible truncation marker, the changed-file list, the checks 1-4
-summaries). ``review_change`` is keyword-only with no ``**kwargs`` and takes no writer
+summaries, and the base commit's conventions: repo input, not the writer's reasoning).
+``review_change`` is keyword-only with no ``**kwargs`` and takes no writer
 transcript, reasoning, final message or writer prompt; only the writer's
 ``ModelEndpoint`` (for the family check).
 
@@ -57,8 +67,10 @@ import contextlib
 import dataclasses
 import itertools
 import json
+import os
 import re
 import secrets
+import tempfile
 import time
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
@@ -70,6 +82,7 @@ from typing import Any, Literal, Protocol
 
 import httpx
 from fde_kit.prompts import PromptRef, load_prompt
+from opentelemetry import trace as otel_trace
 
 from foreman_inator import tracing
 from foreman_inator.config import Config, ModelEndpoint
@@ -77,7 +90,8 @@ from foreman_inator.db.store import TAGS, Kickback, Review, Store
 from foreman_inator.proxy import pricing
 from foreman_inator.proxy.server import scrub_secrets, upstream_error_message
 from foreman_inator.runner import verify
-from foreman_inator.runner.worktree import RepoMirror, Worktree
+from foreman_inator.runner.worktree import RepoMirror, Worktree, _git
+from foreman_inator.tickets import conventions as conv
 from foreman_inator.tickets.prompt import clip_head, defuse
 
 from . import checks as C
@@ -94,6 +108,8 @@ ISSUE_BODY_BUDGET = 12_000
 DIFF_BUDGET = 60_000
 CHANGED_FILES_MAX = 200
 NOTE_BUDGET = 1_500
+#: #39: what a conventions-aware template shows when the base commit has no rules.
+NO_CONVENTIONS = "The repository has no instructions file (AGENTS.md or CLAUDE.md)."
 COMMENT_MARKER = "<!-- foreman-inator:ai-review -->"
 #: #51: ``review_change``'s depth (``routing.profile.ReviewPlan.depth``).
 ReviewDepth = Literal["full", "light"]
@@ -202,17 +218,79 @@ class ReviewInput:
     diff: str  # already bounded, with a visible truncation marker
     changed_files: tuple[str, ...]
     checks: tuple[str, ...]  # checks 1-4 summaries, in order
+    # #39: the repo's rules read at the BASE commit (``base_conventions``); None for a
+    # template without a ``conventions`` section.
+    conventions: conv.Conventions | None = None
 
     @classmethod
     def build(
-        cls, issue: IssueText, diff: str, changed_files: Sequence[str], checks: Sequence[str]
+        cls,
+        issue: IssueText,
+        diff: str,
+        changed_files: Sequence[str],
+        checks: Sequence[str],
+        conventions: conv.Conventions | None = None,
     ) -> ReviewInput:
         return cls(
             IssueText(issue.number, issue.title, issue.body),
             clip_head(diff, DIFF_BUDGET),
             tuple(changed_files),
             tuple(checks),
+            conventions,
         )
+
+
+def wants_conventions(template: PromptRef) -> bool:
+    """True when the reviewer template has a ``conventions`` section (#39)."""
+    return "conventions" in _sections(template.text)
+
+
+def base_conventions(
+    mirror: RepoMirror,
+    base_sha: str,
+    changed_files: Sequence[str] = (),
+    *,
+    rules_file: str | Path | None = None,
+    global_rules: str | Path | None = None,
+    warn: Callable[[str], None] | None = None,
+) -> conv.Conventions:
+    """``conventions.gather`` over the repo's rules files as they are at ``base_sha``.
+
+    Only the files ``gather`` could read (root and nested ``AGENTS.md`` / ``CLAUDE.md`` on
+    the paths of ``changed_files``) are copied out of the mirror with ``git cat-file``
+    into a private temp folder, and ``gather`` runs there. Reading the base, not the head,
+    means the change under review cannot edit the rules it is judged by. A symlink is
+    recreated as a symlink, so ``gather``'s inside-the-tree check still applies."""
+    wanted = [*conv.FILE_NAMES]
+    for folder in conv._nested_folders(changed_files):
+        wanted += [f"{folder}/{name}" for name in conv.FILE_NAMES]
+    with tempfile.TemporaryDirectory(prefix="fman-review-rules-") as tmp:
+        root = Path(tmp)
+        for mode, oid, rel in _ls_tree(mirror, base_sha, wanted):
+            dest = root / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            blob = _git(["cat-file", "blob", oid], cwd=mirror.mirror_path).stdout
+            if mode == "120000":
+                os.symlink(blob.strip(), dest)
+            else:
+                dest.write_text(blob[: conv.READ_CAP], encoding="utf-8")
+        return conv.gather(
+            root, changed_files, global_path=global_rules, rules_file=rules_file, warn=warn
+        )
+
+
+def _ls_tree(mirror: RepoMirror, sha: str, paths: Sequence[str]) -> list[tuple[str, str, str]]:
+    """``(mode, oid, path)`` of the blobs and symlinks among ``paths`` at ``sha``."""
+    proc = _git(["--literal-pathspecs", "ls-tree", "-z", sha, "--", *paths], cwd=mirror.mirror_path)
+    out = []
+    for entry in proc.stdout.split("\0"):
+        if not entry:
+            continue
+        meta, _, rel = entry.partition("\t")
+        mode, kind, oid = meta.split()
+        if kind == "blob" and mode in ("100644", "100755", "120000") and rel in paths:
+            out.append((mode, oid, rel))
+    return out
 
 
 @dataclass(frozen=True)
@@ -380,7 +458,17 @@ def build_messages(review_input: ReviewInput, template: PromptRef) -> list[dict[
     shown = [f"- {defuse(clip_head(p, 200))}" for p in files[:CHANGED_FILES_MAX]]
     if len(files) > CHANGED_FILES_MAX:
         shown.append(f"[... truncated: {len(files) - CHANGED_FILES_MAX} more files not shown ...]")
+    block = ""
+    if "conventions" in s:
+        rules = review_input.conventions
+        if rules is None or rules.empty:
+            block = NO_CONVENTIONS
+        else:
+            block = s["conventions"].substitute(
+                conventions_name=rules.names, conventions=rules.render()
+            )
     user = s["user"].substitute(
+        conventions_block=block,
         issue_number=issue.number,
         issue_title=defuse(clip_head(issue.title.strip(), TITLE_BUDGET)),
         issue_body=defuse(clip_head(issue.body.strip(), ISSUE_BODY_BUDGET)) or "(no description)",
@@ -509,11 +597,17 @@ def review_change(
     clock: Callable[[], float] = time.monotonic,
     precomputed: Precomputed | None = None,
     depth: ReviewDepth = "full",
+    rules_file: str | Path | None = None,
+    global_rules: str | Path | None = None,
 ) -> ReviewOutcome:
     """Review ``change`` against ``issue``. See the module docstring for the policy.
 
     ``depth`` (#51): ``"full"``, or ``"light"`` for checks 1-3 and a verdict from hard
     findings alone, with no model call (``reviewer`` is then not used).
+
+    ``rules_file`` (the repo's configured rules file) and ``global_rules`` (overrides
+    ``paths.rules_path()``, for tests) feed ``base_conventions`` when the template has a
+    ``conventions`` section (#39); a template without one ignores them.
 
     ``precomputed`` (#29, the shadow reviewer): results of checks 1-4 already run on this
     exact change (``(tests, coverage, revert, run_app)`` of another review's outcome).
@@ -561,6 +655,8 @@ def review_change(
         cancel=cancel,
         clock=clock,
         precomputed=precomputed,
+        rules_file=rules_file,
+        global_rules=global_rules,
     )
     recorder = None
     if recordings_dir is not None and ticket_id is not None:
@@ -886,7 +982,17 @@ class _Run:
 
     def ask_model(self, diff: str, changed: Sequence[str]) -> ModelVerdict | None:
         summaries = [r.summary() for r in (self.tests, self.coverage, self.revert, self.run_app)]
-        review_input = ReviewInput.build(self.issue, diff, changed, summaries)
+        rules = None
+        if wants_conventions(self.template):
+            rules = base_conventions(
+                self.change.mirror,
+                self.change.base_sha,
+                changed,
+                rules_file=self.rules_file,
+                global_rules=self.global_rules,
+            )
+            otel_trace.get_current_span().set_attribute("review.conventions_sha256", rules.sha256)
+        review_input = ReviewInput.build(self.issue, diff, changed, summaries, rules)
         messages = build_messages(review_input, self.template)
         retry = _sections(self.template.text)["retry"]
         if self.recorder is not None:
