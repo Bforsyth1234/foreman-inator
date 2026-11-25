@@ -260,6 +260,7 @@ def render_body(
     review: Review | None = None,
     handover: Handover | None = None,
     sandbox: str | None = None,
+    profile: str | None = None,
 ) -> str:
     """The full PR body. Pure: same inputs, same text.
 
@@ -267,7 +268,8 @@ def render_body(
     contain ``current``. ``review`` (the AI verdict) and ``handover`` are #21's inputs; their
     sections sit between ``REVIEW_START``/``REVIEW_END`` and ``HANDOVER_START``/``HANDOVER_END``.
     ``sandbox`` is ``runner.sandbox.describe(...)`` (#40); the attempt's ``ci_status``
-    gives the CI line (#41). Both go at the end of the Verify section.
+    gives the CI line (#41). Both go at the end of the Verify section, then ``profile``
+    (#51: ``routing.profile.pr_line``, given only for a repo whose profile is not default).
     """
     ids = [a.id for a in attempts]
     if current.id not in ids:
@@ -287,6 +289,7 @@ def render_body(
         "",
         *_verify(current, verify),
         *_ci_and_sandbox(current, sandbox),
+        *([_text(profile)] if profile else []),
         "",
         *_review(review),
         "",
@@ -350,6 +353,7 @@ class Publisher:
             review=review,
             handover=handover,
             sandbox=self.sandbox_line,
+            profile=self._profile_line(ticket.repo),
         )
 
         pr = self._existing_pr(ticket, head)
@@ -371,6 +375,13 @@ class Publisher:
             action = "updated"
         note = None if pr.draft else "PR is no longer a draft (changed by a person); left as is"
         return PublishResult(pr, action, body, note)
+
+    def _profile_line(self, repo: str) -> str | None:
+        """#51: the repo profile line, or None for the default profile."""
+        from foreman_inator.routing import profile as prof
+
+        p = prof.profile_of(self.store.get_repo_settings(repo))
+        return None if p == prof.DEFAULT else prof.pr_line(p)
 
     def mark_ready(self, ticket: Ticket, *, reason: ReadyReason) -> PullRequest:
         """Mark the ticket's PR ready for review. Worker only, never called from this module.

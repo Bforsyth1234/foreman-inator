@@ -19,6 +19,7 @@ SECRET_FILE_MODE = 0o600
 APP_KEY_NAME = "app.pem"
 CONFIG_NAME = "config.toml"
 DB_NAME = "foreman-inator.db"
+RULES_NAME = "AGENTS.md"
 
 
 def _ensure_dir(path: Path) -> Path:
@@ -50,6 +51,12 @@ def db_path() -> Path:
     return home() / DB_NAME
 
 
+def rules_path() -> Path:
+    """Path of the user's global rules for every repo, ``AGENTS.md`` (#38). The file may
+    not exist; when it does it should be mode 600 (``write_secret_file`` writes it so)."""
+    return home() / RULES_NAME
+
+
 def traces_dir() -> Path:
     """Folder for traces and the full outputs saved next to them (mode 700)."""
     return _ensure_dir(home() / "traces")
@@ -58,6 +65,11 @@ def traces_dir() -> Path:
 def recordings_dir() -> Path:
     """Folder for run recordings (mode 700)."""
     return _ensure_dir(home() / "recordings")
+
+
+def run_dir() -> Path:
+    """Folder for cross-process lock files, e.g. the local-inference slots (mode 700)."""
+    return _ensure_dir(home() / "run")
 
 
 def worktrees_dir() -> Path:

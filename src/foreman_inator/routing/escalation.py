@@ -59,6 +59,18 @@ review with verdict ``request_changes``, that review counts as one AI kickback (
 fallback as ``tickets.prompt.load_history``). A ``kicked_back`` attempt with neither
 counts as one user kickback (v1 rows). The latest kickback decides which rule applies.
 
+**Limits** (#51, repo profiles). The counts above are ``Limits``' fields; ``next_step``,
+``make_policy`` and ``attempt_bound`` take a ``limits=`` argument whose default (None)
+is exactly the module constants, read at call time (``DEFAULT_LIMITS`` holds the same
+values), so a repo with no profile decides as before. ``routing.profile.limits_for``
+builds the other profiles' limits (``thrifty``: three check attempts per segment;
+``fast``: one; ``strict`` review: one AI kickback moves up).
+Every field is at least 1, so every profile keeps a finite bound (7e). A profile's start
+shift is not applied here: the worker stores the shifted start when it routes the ticket
+and passes it as ``History.start_tier`` (``routed_tier`` stays the router's own pick, which
+#23's kNN router learns from). The per-attempt budget hand-over (#58) comes before every
+count, so it holds for every profile.
+
 Return types subclass v1's ``worker_policy.Retry`` / ``HandToUser``, so code that checks
 ``isinstance(step, worker_policy.Retry)`` keeps working; they add the model to run
 (``model``) and, for a hand-over, whether to mark the PR ready (``mark_ready``).
@@ -98,9 +110,51 @@ FLAG_NO_MODEL = "no_model"
 FLAG_ATTEMPT_BUDGET = "attempt_budget"
 
 
-def attempt_bound(rungs: int) -> int:
+@dataclass(frozen=True)
+class Limits:
+    """The escalation counts for one repo profile (#51). The defaults are today's rules.
+
+    ``start_shift``, ``explore_rate`` and ``cloud_approval`` are not read by ``next_step``:
+    the worker applies them when it routes (``profile.shift_start``, the explore draw) and
+    before a cloud writer attempt (``Spend.writer_gate``). ``explore_rate`` None means the
+    config's ``explore_rate`` (the ``normal`` writer mode, unchanged)."""
+
+    max_check_attempts: int = MAX_CHECK_ATTEMPTS
+    max_user_kickbacks: int = MAX_USER_KICKBACKS
+    max_ai_kickbacks: int = MAX_AI_KICKBACKS
+    start_shift: int = 0
+    explore_rate: float | None = None
+    cloud_approval: bool = False
+
+    def __post_init__(self) -> None:
+        for name in ("max_check_attempts", "max_user_kickbacks", "max_ai_kickbacks"):
+            if int(getattr(self, name)) < 1:
+                raise ValueError(f"Limits.{name} must be at least 1 (invariant 7e)")
+        if self.start_shift < 0:
+            raise ValueError("Limits.start_shift must not be negative (rungs only go up)")
+
+    @property
+    def attempts_per_rung(self) -> int:
+        """Most attempts one stint can hold: segments × check attempts per segment."""
+        segments = 1 + (self.max_user_kickbacks - 1) + (self.max_ai_kickbacks - 1)
+        return segments * self.max_check_attempts
+
+
+#: Today's rules: what a repo with no profile (``normal`` + ``normal``) gets.
+DEFAULT_LIMITS = Limits()
+
+
+def _limits(limits: Limits | None) -> Limits:
+    """``limits``, or (None) today's rules read from the module constants at call time,
+    so a test or a replay that patches a constant still changes the decision."""
+    if limits is not None:
+        return limits
+    return Limits(MAX_CHECK_ATTEMPTS, MAX_USER_KICKBACKS, MAX_AI_KICKBACKS)
+
+
+def attempt_bound(rungs: int, limits: Limits | None = None) -> int:
     """Most attempts a ticket can get on a ladder of ``rungs`` rungs before the user."""
-    return rungs * MAX_ATTEMPTS_PER_RUNG + MAX_INTERRUPTED
+    return rungs * _limits(limits).attempts_per_rung + MAX_INTERRUPTED
 
 
 #: The bound for the default ladder (tier 1, tier 2, tier 3 GLM, Claude Opus, Claude Fable).
@@ -151,6 +205,9 @@ class History:
     routed_tier: int | None = None
     #: #23: start one tier below ``routed_tier`` with trigger ``explore``.
     explore: bool = False
+    #: #51: the start after a profile's shift (``profile.shift_start``), stored when the
+    #: ticket was routed. None: start on ``routed_tier``.
+    start_tier: int | None = None
 
 
 @dataclass(frozen=True)
@@ -186,13 +243,19 @@ Step = Retry | Escalate | HandToUser
 # --------------------------------------------------------------------------- decision
 
 
-def next_step(history: History | Sequence[Attempt], ladder: Sequence[Rung]) -> Step | None:
+def next_step(
+    history: History | Sequence[Attempt],
+    ladder: Sequence[Rung],
+    limits: Limits | None = None,
+) -> Step | None:
     """The next step for a ticket, or None when there is nothing to start (an attempt is
     running, passed its checks and waits on review or publish, or was accepted).
+    ``limits``: the repo profile's counts (#51); None is today's rules.
 
     ``history`` may be a bare attempt list (v1's call shape): then every kicked-back
     attempt counts as a user kickback and the ticket starts on the lowest rung."""
     h = history if isinstance(history, History) else History(tuple(history))
+    limits = _limits(limits)
     rungs: Ladder = tuple(ladder)
     if not rungs:
         return HandToUser(f"{FLAG_NO_MODEL}: no writer model is configured on any tier")
@@ -223,7 +286,7 @@ def next_step(history: History | Sequence[Attempt], ladder: Sequence[Rung]) -> S
     kicks = _kicks_by_attempt(h)
 
     if stint[0].trigger == "explore":
-        target = _start_index(h.routed_tier, rungs)
+        target = _start_index(_start(h), rungs)
         what = "failed its checks" if last.outcome == "failed_checks" else "was kicked back"
         return _up(
             rungs,
@@ -238,7 +301,7 @@ def next_step(history: History | Sequence[Attempt], ladder: Sequence[Rung]) -> S
         by, tag = kicks.get(last.id, [("user", None)])[-1]
         if by == "reviewer":
             n = _count(stint, kicks, "reviewer")
-            if n >= MAX_AI_KICKBACKS:
+            if n >= limits.max_ai_kickbacks:
                 return _up(
                     rungs,
                     idx,
@@ -252,13 +315,13 @@ def next_step(history: History | Sequence[Attempt], ladder: Sequence[Rung]) -> S
         n = _count(stint, kicks, "user")
         if tag == "wrong":
             return _up(rungs, idx, FLAG_KICKBACK_WRONG, "the change was kicked back as wrong", last)
-        if n >= MAX_USER_KICKBACKS:
+        if n >= limits.max_user_kickbacks:
             return _up(rungs, idx, FLAG_KICKBACK_CAP, f"changes were requested {n} times", last)
         return Retry("kickback", here.tier, f"user kickback {n} on {_name(here)}", here.model)
 
     # failed_checks
     failed = sum(a.outcome == "failed_checks" for a in _segment(stint))
-    if failed >= MAX_CHECK_ATTEMPTS:
+    if failed >= limits.max_check_attempts:
         return _up(
             rungs, idx, FLAG_CHECKS_FAILED, f"the checks failed {failed} times in a row", last
         )
@@ -267,9 +330,10 @@ def next_step(history: History | Sequence[Attempt], ladder: Sequence[Rung]) -> S
     )
 
 
-def make_policy(ladder: Sequence[Rung]) -> Callable[[History | Sequence[Attempt]], Step | None]:
-    """``next_step`` bound to one ladder: the worker's ``policy=`` callable."""
-    return functools.partial(next_step, ladder=tuple(ladder))
+def make_policy(ladder: Sequence[Rung], limits: Limits | None = None) -> Callable[..., Step | None]:
+    """``next_step`` bound to one ladder (and limits): the worker's ``policy=`` callable.
+    A call may still pass ``limits=`` to use one repo's profile."""
+    return functools.partial(next_step, ladder=tuple(ladder), limits=limits)
 
 
 # --------------------------------------------------------------------------- helpers
@@ -289,10 +353,18 @@ def _start_index(routed_tier: int | None, rungs: Ladder) -> int:
     return len(rungs) - 1
 
 
+def _start(h: History) -> int | None:
+    """The tier the ticket starts on: the profile-shifted start, else the router's pick."""
+    return h.start_tier if h.start_tier is not None else h.routed_tier
+
+
 def _first(h: History, rungs: Ladder) -> Retry:
-    start = _start_index(h.routed_tier, rungs)
+    start = _start_index(_start(h), rungs)
     r = rungs[start]
-    if h.routed_tier is None:
+    if h.start_tier is not None and h.start_tier != h.routed_tier:
+        why = f"first attempt on {_name(r)}: the repo profile moved the start up from tier "
+        why += f"{h.routed_tier}"
+    elif h.routed_tier is None:
         why = f"first attempt on the lowest configured tier, {_name(r)}"
     elif r.tier == h.routed_tier:
         why = f"first attempt on the routed tier, {_name(r)}"
@@ -406,10 +478,12 @@ __all__ = [
     "MAX_INTERRUPTED",
     "MAX_USER_KICKBACKS",
     "SPEC_LADDER_WORST_CASE",
+    "DEFAULT_LIMITS",
     "Escalate",
     "HandToUser",
     "History",
     "Ladder",
+    "Limits",
     "Retry",
     "Rung",
     "Step",

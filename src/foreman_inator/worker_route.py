@@ -36,6 +36,18 @@ transaction as ``routed_tier`` and ``route_reason``; ``Worker.explore`` reads it
 restart or a config change gives the same answer. A later ``tier:N`` label before any
 attempt routes again through the override path, which stores "0".
 
+Repo profiles (#51)
+-------------------
+The repo's profile (``repo_profile``: its ``repo_settings`` row) changes two things here,
+both decided once and stored in the routing transaction: the explore draw uses the
+profile's rate (thrifty 25%, fast 0; ``normal`` keeps ``config.explore_rate``), and the
+start is shifted (``profile.shift_start``: ``fast`` starts one configured tier up, capped
+at the top; never a ``tier:N`` override). ``routed_tier`` stays the router's own pick
+(#23 learns from it); the start goes in the ``start:<ticket>`` cursor (``start_tier``,
+read into ``History.start_tier``) and ``route_reason`` gains ``"; profile fast: tier 1
+-> 2"``. ``limits(ticket)`` is the profile's escalation limits for the policy (None for
+today's rules).
+
 Crash safety (routing): killed after ``route_knn`` but before that transaction, nothing
 is stored (``routed_tier`` NULL), so the ticket is routed again; the new ticket's vector
 was stored by ``route_knn``, so no second embedding call, and the explore draw is
@@ -59,6 +71,8 @@ from foreman_inator import routing
 from foreman_inator.db.store import Ticket
 from foreman_inator.github.app_auth import GitHubNotFound
 from foreman_inator.routing import explore, knn
+from foreman_inator.routing import profile as prof
+from foreman_inator.routing.escalation import DEFAULT_LIMITS, Limits
 from foreman_inator.tickets import clarify
 from foreman_inator.tickets.lifecycle import clarify_cursor
 
@@ -69,6 +83,12 @@ log = logging.getLogger("foreman_inator.worker")
 
 #: Clarification states after which the ticket is routed without asking.
 CLARIFY_DONE = ("clear", "resumed")
+#: #51: the ``poll_cursors`` row holding a ticket's (profile-shifted) start tier.
+START_CURSOR_PREFIX = "start:"
+
+
+def start_cursor(ticket_id: int) -> str:
+    return f"{START_CURSOR_PREFIX}{int(ticket_id)}"
 
 
 class RouteSteps:
@@ -123,6 +143,8 @@ class RouteSteps:
                 config=self.config,
                 proxy=self.proxy,
                 timeout=float(self.config.router_timeout_seconds),
+                watch=self.ollama_watch,  # type: ignore[attr-defined]
+                cold_load_allowance=float(self.config.cold_load_timeout_seconds),
             )
         if isinstance(result, clarify.Clear):
             self.store.set_cursor(t.repo, "clear", key)
@@ -179,25 +201,36 @@ class RouteSteps:
                     config=self.config,
                     proxy=self.proxy,
                     timeout=float(self.config.router_timeout_seconds),
+                    watch=self.ollama_watch,  # type: ignore[attr-defined]
+                    cold_load_allowance=float(self.config.cold_load_timeout_seconds),
                 )
+        p = self.repo_profile(t)
+        limits = prof.limits_for(p)
+        is_override = r.source == "override"
+        start = prof.shift_start(
+            r.tier, (m.tier for m in self.config.models), limits, override=is_override
+        )
+        reason = r.reason + prof.shift_reason(p, r.tier, start)
         ex = explore.should_explore(
             t.id,
-            float(self.config.explore_rate),
-            routed_tier=r.tier,
+            prof.explore_rate(limits, float(self.config.explore_rate)),
+            routed_tier=start,
             tiers=self.config,
-            override=r.source == "override",
+            override=is_override,
         )
         with self.store.transaction():
             cur = self.store.get_ticket(t.id)
             if override is None and cur.routed_tier is not None:
                 return cur
-            cur = self.store.update_ticket(t.id, routed_tier=r.tier, route_reason=r.reason)
+            cur = self.store.update_ticket(t.id, routed_tier=r.tier, route_reason=reason)
             self.store.set_cursor(t.repo, explore.encode(ex), explore.explore_cursor(t.id))
+            self.store.set_cursor(t.repo, str(start), start_cursor(t.id))
         log.info(
-            "ticket %d: routed to tier %d (%s)%s",
+            "ticket %d: routed to tier %d (%s)%s%s",
             t.id,
             r.tier,
             r.source,
+            f"; profile {p.writer} starts on tier {start}" if start != r.tier else "",
             "; exploring one tier lower" if ex else "",
         )
         return cur
@@ -218,10 +251,31 @@ class RouteSteps:
             allow_cloud_embedder=bool(self.config.allow_cloud_embedder),
         )
 
+    # ------------------------------------------------------------------ profiles (#51)
+
+    def repo_profile(self, ticket: Ticket) -> prof.Profile:
+        """The ticket's repo profile now (no row, or NULL columns: ``normal``)."""
+        return prof.profile_of(self.store.get_repo_settings(ticket.repo))
+
+    def limits(self, ticket: Ticket) -> Limits | None:
+        """The repo profile's escalation limits for the policy; None for today's rules
+        (so the module constants decide, exactly as before)."""
+        limits = prof.limits_for(self.repo_profile(ticket))
+        return None if limits == DEFAULT_LIMITS else limits
+
+    def start_tier(self, ticket: Ticket) -> int | None:
+        """The stored start (``start:<ticket>`` cursor, written with the route); None for
+        tickets routed before #51 (escalation then starts on ``routed_tier``)."""
+        value = self.store.get_cursor(ticket.repo, start_cursor(ticket.id))
+        try:
+            return int(value) if value is not None else None
+        except ValueError:
+            return None
+
     def explore(self, ticket: Ticket) -> bool:
         """#23's stored decision (``explore:<ticket>`` cursor, written with the route). No
         row (routed before wave 9, or not routed yet) means no exploration."""
         return explore.decode(self.store.get_cursor(ticket.repo, explore.explore_cursor(ticket.id)))
 
 
-__all__ = ["CLARIFY_DONE", "RouteSteps"]
+__all__ = ["CLARIFY_DONE", "START_CURSOR_PREFIX", "RouteSteps", "start_cursor"]

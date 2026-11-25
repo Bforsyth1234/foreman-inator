@@ -518,6 +518,50 @@ def test_writer_replay_known_outcomes_give_the_expected_comparison(world: World)
     assert (c2.wins, c2.losses, c2.ties, c2.verdict) == (1, 0, 2, "wins")
 
 
+def test_writer_replay_uses_the_production_conventions(
+    world: World, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The replay's writer prompt carries the same rules a live attempt gets
+    (`conventions.gather`: global rules, the repo's rules_file, AGENTS.md *and*
+    CLAUDE.md), and the hash of what it saw is in the run's per-case log line.
+    Non-vacuity: with `read_conventions` back in `_writer_side`, only AGENTS.md reaches
+    the prompt (no global, rules_file or CLAUDE.md marker) and no hash is logged."""
+    import logging
+    import re
+    from dataclasses import replace
+
+    from foreman_inator import paths
+    from foreman_inator.tickets import conventions as conventions_mod
+
+    w = world
+    for name, text in (("AGENTS.md", "AGENTS-MARKER"), ("CLAUDE.md", "CLAUDE-MARKER")):
+        (w.seed / name).write_text(text + "\n")
+    git("add", "-A", cwd=w.seed)
+    git("commit", "-q", "-m", "rules", cwd=w.seed)
+    git("push", "-q", "origin", "main", cwd=w.seed)
+    paths.rules_path().write_text("GLOBAL-RULES-MARKER\n")
+    team = tmp_path / "team-rules.md"
+    team.write_text("TEAM-RULES-MARKER\n")
+    cfg = Config(app_id=1, repos=(REPO,), rules_file=((REPO, str(team)),))
+    w.merged_ticket("a")
+    w.sync()
+    champ, chall = writer_pair(w)
+    w.driver.choose = plan({"champion": {"a": "ok"}, "challenger": {"a": "ok"}})
+    caplog.set_level(logging.INFO, logger=rr.log.name)
+    rr.run_replay(replace(w.deps(), config=cfg), role="writer", champion=champ,
+                  challenger=chall, settings=rr.ReplaySettings(min_cases=1))  # fmt: skip
+    assert len(w.driver.runs) == 2
+    for r in w.driver.runs:
+        for marker in ("GLOBAL-RULES-MARKER", "TEAM-RULES-MARKER", "AGENTS-MARKER",
+                       "CLAUDE-MARKER"):  # fmt: skip
+            assert marker in r["prompt"], marker
+    hashes = re.findall(r"conventions sha256 ([0-9a-f]{64})", caplog.text)
+    assert len(hashes) == 2 and len(set(hashes)) == 1  # both sides saw the same rules
+    assert hashes[0] == conventions_mod.gather(w.seed, (), rules_file=team).sha256
+    # #34 P2: each replay run's queue-wait total was dropped when it ended
+    assert w.proxy._waits == {}
+
+
 def test_replays_never_call_the_github_write_api(world: World, monkeypatch) -> None:
     """Verify bullet 2. FakeGitHub forbids writes (a write would raise) and records any;
     the remote's refs stay as they were (nothing pushed), no Worktree push is tried, and

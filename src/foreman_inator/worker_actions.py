@@ -180,12 +180,11 @@ class ActionHandlers:
                 # #41: the review job does the review:skip hand-over once CI decided.
                 log.info("ticket %d: waiting on GitHub CI before handing over", ctx.ticket.id)
                 return
-            self.hand_over(  # type: ignore[attr-defined]
-                ctx.ticket,
-                f"{FLAG_REVIEW_SKIPPED}: the review:skip label was applied by an allowed user",
-                ready=True,
-                attempt=ctx.attempt,
+            # #51: the repo profile's review = off, or the label (strict ignores it).
+            reason = self.skip_reason(ctx.ticket) or (  # type: ignore[attr-defined]
+                f"{FLAG_REVIEW_SKIPPED}: the review:skip label was applied by an allowed user"
             )
+            self.hand_over(ctx.ticket, reason, ready=True, attempt=ctx.attempt)  # type: ignore[attr-defined]
         else:  # pragma: no cover - the lifecycle never asks for this
             raise RuntimeError(f"refusing to mark a PR ready on {type(ev).__name__} (7a)")
 
@@ -458,6 +457,13 @@ _FLAG_TEXT = {
 }
 
 
+#: #51: the hand-over comment when the repo profile turns the AI review off.
+REVIEW_OFF_TEXT = (
+    "This repository's profile turns the AI review off (`fman repo set-profile`), so the "
+    "change goes to you without one."
+)
+
+
 def flag_comment(ticket: Ticket, reason: str, *, pr_number: int | None = None) -> str:
     """The issue comment for a hand-over: what happened, why, and what to do next.
 
@@ -475,6 +481,8 @@ def flag_comment(ticket: Ticket, reason: str, *, pr_number: int | None = None) -
             "Work starts on the next poll after that."
         )
     text = _FLAG_TEXT.get(kind, "foreman-inator stopped working on this issue.")
+    if kind == FLAG_REVIEW_SKIPPED and "profile" in detail:  # #51: review = off
+        text = REVIEW_OFF_TEXT
     lines = [marker, text]
     if detail.strip():
         lines += ["", f"Why: {_safe_text(' '.join(detail.split()))[:600]}"]

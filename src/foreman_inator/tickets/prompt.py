@@ -49,12 +49,15 @@ from dataclasses import dataclass
 from importlib import resources
 from pathlib import Path
 from string import Template
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from fde_kit.prompts import PromptRef, load_prompt
 
 from foreman_inator.db.store import KICKBACK_BY, TAGS, Attempt, Kickback, Review, Store, Ticket
 from foreman_inator.tickets.lifecycle import clarify_qa_cursor, split_kickback_note
+
+if TYPE_CHECKING:  # conventions imports this module's bounding helpers
+    from foreman_inator.tickets.conventions import Conventions
 
 WRITER_PROMPT_NAME = "writer-v1"
 
@@ -62,7 +65,7 @@ WRITER_PROMPT_NAME = "writer-v1"
 # which leaves room in a 32k-token local model for the files the agent reads.
 TITLE_BUDGET = 300
 ISSUE_BODY_BUDGET = 12_000
-CONVENTIONS_BUDGET = 6_000
+CONVENTIONS_BUDGET = 6_000  # shared by every rules source (tickets/conventions.py)
 FAILURE_OUTPUT_BUDGET = 4_000  # the tail is kept: the end of a test run says what failed
 NOTE_BUDGET = 2_000  # per note
 NOTES_TOTAL_BUDGET = 6_000  # all notes; the newest are kept
@@ -72,7 +75,7 @@ OWNED_FILES_MAX = 40  # list entries
 OWNED_FILE_BUDGET = 200  # per path
 HISTORY_MAX = 10  # attempts listed; the newest are kept
 
-CONVENTIONS_FILES = ("AGENTS.md", "CLAUDE.md")  # first one found wins
+CONVENTIONS_FILES = ("AGENTS.md", "CLAUDE.md")  # legacy read_conventions: first one wins
 
 Situation = Literal["first", "retry", "kickback", "escalation", "rebase"]
 
@@ -212,7 +215,7 @@ def build_writer_prompt(
     history: Sequence[PriorAttempt] = (),
     *,
     verify_command: str | None,
-    conventions: str | None = None,
+    conventions: str | Conventions | None = None,
     conventions_name: str = "AGENTS.md",
     template: PromptRef | None = None,
     conflicted_files: Sequence[str] = (),
@@ -222,7 +225,9 @@ def build_writer_prompt(
 
     ``history`` is the ticket's earlier attempts, oldest first (``load_history``).
     ``verify_command`` is ``VerifyCommand.display`` (None when the repo has none).
-    ``conventions`` is the text of the repo's AGENTS.md / CLAUDE.md (``read_conventions``).
+    ``conventions`` is either ``conventions.gather``'s result (#38, #40: every source,
+    labelled, already fitted to the shared budget; ``conventions_name`` is then ignored)
+    or, the legacy form, the text of one file from ``read_conventions``.
     ``template`` defaults to the packaged ``writer-v1``; replays pass a recorded one.
     ``conflicted_files`` is ``Replay.conflicted`` for a ``rebase`` attempt (#43).
     ``clarification`` is the Q&A text of the worker's clarifying questions (#44,
@@ -256,11 +261,18 @@ def build_writer_prompt(
                 clarification=defuse(clip_head(clarification.strip(), CLARIFICATION_BUDGET))
             )
         )
-    if conventions and conventions.strip():
+    if isinstance(conventions, str):
+        if conventions.strip():
+            blocks.append(
+                s["conventions"].substitute(
+                    conventions_name=conventions_name,
+                    conventions=defuse(clip_head(conventions, CONVENTIONS_BUDGET)),
+                )
+            )
+    elif conventions is not None and not conventions.empty:
         blocks.append(
             s["conventions"].substitute(
-                conventions_name=conventions_name,
-                conventions=defuse(clip_head(conventions, CONVENTIONS_BUDGET)),
+                conventions_name=conventions.names, conventions=conventions.render()
             )
         )
     if ticket.owned_files:
@@ -410,7 +422,9 @@ def _notes_block(
 def read_conventions(worktree: str | Path) -> tuple[str, str] | None:
     """``(file name, text)`` of the repo's AGENTS.md or CLAUDE.md, or None.
 
-    Reads at most a little over the budget, so a huge file costs nothing extra."""
+    Legacy, kept for callers that still pass one file's text (replay_runner); new code
+    uses ``conventions.gather``, which reads both files, nested ones and the global
+    rules. Reads at most a little over the budget, so a huge file costs nothing extra."""
     for name in CONVENTIONS_FILES:
         path = Path(worktree) / name
         if path.is_file():
@@ -467,18 +481,23 @@ def writer_prompt_for(
     worktree: str | Path,
     verify_command: str | None,
     conflicted_files: Sequence[str] = (),
+    rules_file: str | Path | None = None,
+    global_rules: str | Path | None = None,
 ) -> WriterPrompt:
     """Caller-side convenience for the worker (#14): read everything, then build.
     ``conflicted_files``: ``Replay.conflicted`` for a ``rebase`` attempt (#43). The
-    clarification Q&A (#44) is read from the store's ``clarify-qa:<ticket>`` cursor."""
-    conv = read_conventions(worktree)
+    clarification Q&A (#44) is read from the store's ``clarify-qa:<ticket>`` cursor.
+    ``rules_file`` is the repo's configured rules file (#38); ``global_rules`` overrides
+    ``paths.rules_path()`` (tests)."""
+    from foreman_inator.tickets.conventions import gather
+
+    conv = gather(worktree, ticket.owned_files, global_path=global_rules, rules_file=rules_file)
     return build_writer_prompt(
         ticket,
         attempt,
         load_history(store, ticket.id, before=attempt.id),
         verify_command=verify_command,
-        conventions=conv[1] if conv else None,
-        conventions_name=conv[0] if conv else "AGENTS.md",
+        conventions=conv,
         conflicted_files=conflicted_files,
         clarification=store.get_cursor(ticket.repo, clarify_qa_cursor(ticket.id)),
     )

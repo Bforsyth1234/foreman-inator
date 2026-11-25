@@ -55,17 +55,19 @@ from foreman_inator.config import ConfigError, ModelEndpoint
 from foreman_inator.db.store import Attempt, Ticket
 from foreman_inator.experiments import variants
 from foreman_inator.pr.publisher import pr_head_branch
+from foreman_inator.resources import memory
 from foreman_inator.routing import escalation as esc
+from foreman_inator.routing import profile as prof
 from foreman_inator.runner import sandbox
 from foreman_inator.runner import verify as verify_mod
 from foreman_inator.runner.worktree import RepoMirror, Worktree, WorktreeError
+from foreman_inator.tickets import conventions as conventions_mod
 from foreman_inator.tickets import lifecycle
 from foreman_inator.tickets.lifecycle import AttemptStarted, ChecksFailed, clarify_qa_cursor
 from foreman_inator.tickets.prompt import (
     WRITER_PROMPT_NAME,
     build_writer_prompt,
     load_history,
-    read_conventions,
 )
 from foreman_inator.worker_policy import (
     FLAG_NO_VERIFY,
@@ -119,6 +121,8 @@ class AttemptSteps:
     traces_dir: Path
     attempt_timeout: float | None
     verify_timeout: float
+    #: #59: ``ollama host -> span attributes``; an instance attribute replaces it in tests.
+    resource_snapshot = staticmethod(memory.snapshot)
 
     # ------------------------------------------------------------------ seams
     # ``before_route`` (#44) lives in ``worker_clarify``; the sandbox policy in
@@ -147,6 +151,10 @@ class AttemptSteps:
             return self.driver.run(**kw, sandbox=policy)
         finally:
             self._drop_scratch(policy)  # type: ignore[attr-defined]
+            # #34: the writer run is over; its queue-wait total is no longer read.
+            forget = getattr(getattr(self, "proxy", None), "forget_queue_wait", None)
+            if forget is not None:
+                forget(kw["attempt_id"])
 
     def _launch_verify(
         self, cmd: verify_mod.VerifyCommand, cwd: Path, *, ticket: Ticket, attempt_id: int,
@@ -190,7 +198,11 @@ class AttemptSteps:
             return
         endpoint = self._writer_endpoint(step)
         if endpoint.is_cloud:
-            refusal = self.spend.blocked(ticket.id)
+            # #51: a thrifty repo's cloud writer attempt also waits for an approval.
+            refusal = self.spend.writer_gate(
+                ticket.id,
+                approval_required=prof.limits_for(self.repo_profile(ticket)).cloud_approval,  # type: ignore[attr-defined]
+            )
             if refusal is not None:
                 self.pause_for_spend(ticket, refusal)  # type: ignore[attr-defined]
                 return
@@ -372,14 +384,16 @@ class AttemptSteps:
         conflicted: Sequence[str] = (),
     ) -> tuple[Attempt, bool, Any, Any]:
         template = self.writer_template()
-        conv = read_conventions(wt.path)
+        # #38, #40: global rules, the repo's rules_file, AGENTS.md + CLAUDE.md, nested files.
+        conv = conventions_mod.gather(
+            wt.path, ticket.owned_files, rules_file=_rules_file(self.config, ticket.repo)
+        )
         prompt = build_writer_prompt(  # ``writer_prompt_for`` with the champion's template
             ticket,
             att,
             load_history(self.store, ticket.id, before=att.id),
             verify_command=cmd.display,
-            conventions=conv[1] if conv else None,
-            conventions_name=conv[0] if conv else "AGENTS.md",
+            conventions=conv,
             template=template,
             conflicted_files=conflicted,
             clarification=self.store.get_cursor(ticket.repo, clarify_qa_cursor(ticket.id)),
@@ -409,7 +423,13 @@ class AttemptSteps:
                 variant_id=variant,
                 tier=att.tier,
             ) as rec,
+            memory.attempt_snapshots(  # #59: memory + Ollama state at start and end
+                span,
+                memory.local_ollama_host(endpoint, getattr(self.config, "models", ())),
+                snap=self.resource_snapshot,
+            ),
         ):
+            span.set_attribute("conventions.sha256", conv.sha256)  # #38: which rules
             try:
                 self.prepare_worktree(ticket, att, wt)
                 result = self._launch_writer_once_more(
@@ -574,6 +594,12 @@ def _budget_stop(spend: Any, attempt_id: int) -> Any:
 def _write(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text + "\n", encoding="utf-8")
+
+
+def _rules_file(config: Any, repo: str) -> Any:
+    """#38: the repo's configured ``rules_file`` (None when unset or no such config)."""
+    getter = getattr(config, "rules_file_for", None)
+    return getter(repo) if getter is not None else None
 
 
 def _write_excludes(mirror: RepoMirror) -> None:

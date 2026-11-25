@@ -27,6 +27,8 @@ Layout (every key optional; missing keys take the defaults below)::
     attempt_budget_usd = 1.50   # one attempt's cloud spend; over it the ticket is handed over (#58)
     retention_days = 90  # `fman prune` and the worker's daily prune keep this long (#56)
     install_refill_cache = true  # refill an empty install cache from the base commit (#57)
+    cold_load_timeout_seconds = 120  # extra wait when the clarity/router model is not loaded (#52)
+    max_local_inference = 1  # local-model calls at once, process-wide (#34)
 
     [experiments]        # replays (#25) and the shadow reviewer (#26), wave 9 (#29)
     run_budget_usd = 2.0
@@ -39,6 +41,9 @@ Layout (every key optional; missing keys take the defaults below)::
 
     [sandbox_install]    # per repo (#45): "off" skips the dependency-install step
     "you/project" = "on" # (default on: sandboxed, network to ports 443/80 for base files)
+
+    [rules_file]         # per repo (#38): one more rules file for the writer prompt
+    "you/project" = "~/notes/project-rules.md"
 
     [spend_caps]
     daily_usd = 5.0
@@ -282,6 +287,17 @@ class Config:
     #: for that repo; verify then needs the dependencies some other way). Sorted pairs,
     #: like ``sandbox_network``.
     sandbox_install: tuple[tuple[str, str], ...] = ()
+    #: #38, per repo ("owner/name" -> path): one more rules file read into the writer
+    #: prompt's conventions after the global ``~/.foreman-inator/AGENTS.md`` and before
+    #: the repo's own files. ``~`` is expanded. Sorted pairs, like ``sandbox_network``.
+    rules_file: tuple[tuple[str, str], ...] = ()
+    #: #52: when Ollama says the clarity/router model is not loaded, its call gets this
+    #: many more seconds on top of ``router_timeout_seconds`` (a cold load), and a
+    #: timeout while it loads is retried once.
+    cold_load_timeout_seconds: float = 120.0
+    #: #34: local-model completion calls in flight at once, across the worker and its
+    #: experiment runs (one local GPU: 1). Queued time never counts against an attempt.
+    max_local_inference: int = 1
     #: #45: bound on one dependency install (the step fails, and the ticket is flagged).
     install_timeout_seconds: float = 900.0
     #: #57: when an offline install (after a model edit) misses the package cache and the
@@ -324,7 +340,7 @@ class Config:
     experiments: ExperimentSettings = field(default_factory=ExperimentSettings)
 
     def __post_init__(self) -> None:
-        for name in ("sandbox_network", "sandbox_install"):
+        for name in ("sandbox_network", "sandbox_install", "rules_file"):
             value = getattr(self, name)
             if isinstance(value, Mapping):
                 object.__setattr__(self, name, tuple(sorted(value.items())))
@@ -382,6 +398,12 @@ class Config:
         lowered = {k.lower(): v for k, v in self.sandbox_install}
         return lowered.get(repo.lower(), "on")
 
+    def rules_file_for(self, repo: str) -> Path | None:
+        """#38: ``repo``'s configured rules file (``~`` expanded), or None."""
+        lowered = {k.lower(): v for k, v in self.rules_file}
+        value = lowered.get(repo.lower())
+        return Path(value).expanduser() if value else None
+
 
 # --------------------------------------------------------------------------- validation
 
@@ -417,6 +439,15 @@ def _validate(cfg: Config) -> None:
             raise ConfigError(
                 f"sandbox_install.{repo} must be one of {', '.join(SANDBOX_INSTALLS)}"
             )
+    for repo, path in cfg.rules_file:
+        if not re.match(r"^[\w.-]+/[\w.-]+$", repo):
+            raise ConfigError(f"rules_file: repo {repo!r} must look like 'owner/name'")
+        if not path.strip():
+            raise ConfigError(f"rules_file.{repo} must be a file path")
+    if not 0 <= cfg.cold_load_timeout_seconds <= 3600:
+        raise ConfigError("cold_load_timeout_seconds must be >= 0 and <= 3600")
+    if not 1 <= cfg.max_local_inference <= MAX_PARALLEL_PER_REPO:
+        raise ConfigError(f"max_local_inference must be between 1 and {MAX_PARALLEL_PER_REPO}")
     if not 0 < cfg.install_timeout_seconds <= 24 * 3600:
         raise ConfigError("install_timeout_seconds must be > 0 and <= 86400")
     if not cfg.attempt_budget_usd > 0:
@@ -611,13 +642,17 @@ def from_dict(data: Mapping[str, Any]) -> Config:
         kw["install_refill_cache"] = _typed(
             data["install_refill_cache"], bool, "install_refill_cache"
         )
-    for key in ("attempt_budget_usd", "retention_days"):
+    for key in ("attempt_budget_usd", "retention_days", "cold_load_timeout_seconds"):
         if key in data:
             kw[key] = float(_typed(data[key], (int, float), key))
-    for key in ("attempt_max_input_tokens_cloud", "attempt_max_input_tokens_local"):
+    for key in (
+        "attempt_max_input_tokens_cloud",
+        "attempt_max_input_tokens_local",
+        "max_local_inference",
+    ):
         if key in data:
             kw[key] = _typed(data[key], int, key)
-    for table in ("sandbox_network", "sandbox_install"):
+    for table in ("sandbox_network", "sandbox_install", "rules_file"):
         if table in data:
             raw = _typed(data[table], dict, table)
             kw[table] = {
@@ -698,6 +733,10 @@ def to_dict(cfg: Config) -> dict[str, Any]:
         out["sandbox_network"] = dict(cfg.sandbox_network)
     if cfg.sandbox_install:
         out["sandbox_install"] = dict(cfg.sandbox_install)
+    if cfg.rules_file:
+        out["rules_file"] = dict(cfg.rules_file)
+    out["cold_load_timeout_seconds"] = cfg.cold_load_timeout_seconds
+    out["max_local_inference"] = cfg.max_local_inference
     out["install_timeout_seconds"] = cfg.install_timeout_seconds
     out["install_refill_cache"] = cfg.install_refill_cache
     out["attempt_budget_usd"] = cfg.attempt_budget_usd

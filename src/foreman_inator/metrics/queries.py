@@ -249,6 +249,10 @@ started AS (
              WHERE ra.ticket_id = s.id AND r.shadow = 0) AS spend_usd,
         (SELECT COALESCE(SUM(a.cost_usd), 0) FROM attempts a
          WHERE a.ticket_id = s.id) AS attempt_spend_usd,
+        (SELECT COALESCE(SUM(a.seconds), 0) FROM attempts a
+         WHERE a.ticket_id = s.id) AS attempt_seconds,
+        (SELECT COUNT(*) FROM kickbacks k JOIN attempts ka ON ka.id = k.attempt_id
+         WHERE ka.ticket_id = s.id AND k."by" = 'user') AS user_kickbacks,
         EXISTS (SELECT 1 FROM reviews r JOIN attempts ra ON ra.id = r.attempt_id
                 WHERE ra.ticket_id = s.id AND r.shadow = 0) AS reviewed,
         (SELECT COUNT(*) FROM attempts a WHERE a.ticket_id = s.id) AS n_attempts,
@@ -362,6 +366,41 @@ def cost_per_accepted_ticket(store: Store, filt: MetricsFilter | None = None) ->
     """
     sql = _STARTED + (
         "SELECT COALESCE(SUM(spend_usd), 0) AS total, COUNT(*) AS n FROM started WHERE closed"
+    )
+    row = store.query(sql, _p(filt))[0]
+    return Mean(float(row["total"]), int(row["n"]))
+
+
+def attempt_minutes_per_accepted_ticket(store: Store, filt: MetricsFilter | None = None) -> Mean:
+    """Attempt minutes per accepted ticket (todo #46).
+
+    Why: a local model costs $0 per token, so cost per accepted ticket shows a local
+    model that took three attempts as free. Attempt time is its real price.
+
+    Implemented: for closed tickets started on the model, the sum of every attempt's
+    ``seconds`` (failed, superseded and explore attempts included, like the ticket's
+    spend; an attempt with no recorded ``seconds`` adds 0) in minutes ÷ the number of
+    those tickets.
+    """
+    sql = _STARTED + (
+        "SELECT COALESCE(SUM(attempt_seconds), 0) AS total, COUNT(*) AS n FROM started WHERE closed"
+    )
+    row = store.query(sql, _p(filt))[0]
+    return Mean(float(row["total"]) / 60.0, int(row["n"]))
+
+
+def user_reviews_per_accepted_ticket(store: Store, filt: MetricsFilter | None = None) -> Mean:
+    """Your reviews per accepted ticket (todo #46).
+
+    Implemented: for closed tickets started on the model, your kickbacks (``by =
+    user``) on any of the ticket's attempts plus 1 for the review that accepted it ÷ the
+    number of those tickets. Your kickbacks on attempts hidden from model metrics
+    (failed explore or rebase, set aside) still count: you reviewed them all the same.
+    AI reviewer kickbacks are not yours and are left out.
+    """
+    sql = _STARTED + (
+        "SELECT COALESCE(SUM(user_kickbacks + 1), 0) AS total, COUNT(*) AS n "
+        "FROM started WHERE closed"
     )
     row = store.query(sql, _p(filt))[0]
     return Mean(float(row["total"]), int(row["n"]))
@@ -612,6 +651,8 @@ class WriterRow:
     kickbacks_per_ticket: KickbackStats
     escalation_rate: Rate
     cost_per_accepted_ticket: Mean
+    attempt_minutes_per_accepted_ticket: Mean
+    user_reviews_per_accepted_ticket: Mean
     time_to_accept: Duration
     router_hit_rate: Rate
     ai_kickbacks_per_ticket: Mean
@@ -643,6 +684,8 @@ def writer_row(store: Store, filt: MetricsFilter) -> WriterRow:
         kickbacks_per_ticket=kickbacks_per_ticket(store, filt),
         escalation_rate=escalation_rate(store, filt),
         cost_per_accepted_ticket=cost_per_accepted_ticket(store, filt),
+        attempt_minutes_per_accepted_ticket=attempt_minutes_per_accepted_ticket(store, filt),
+        user_reviews_per_accepted_ticket=user_reviews_per_accepted_ticket(store, filt),
         time_to_accept=time_to_accept(store, filt),
         router_hit_rate=router_hit_rate(store, filt),
         ai_kickbacks_per_ticket=ai_kickbacks_per_ticket(store, filt),
@@ -788,6 +831,7 @@ __all__ = [
     "TrendPoint",
     "WriterRow",
     "ai_kickbacks_per_ticket",
+    "attempt_minutes_per_accepted_ticket",
     "cost_per_accepted_ticket",
     "escalation_rate",
     "failure_steps_by_variant",
@@ -803,5 +847,6 @@ __all__ = [
     "time_to_accept",
     "trend",
     "writer_reviewer_vs_strong_writer",
+    "user_reviews_per_accepted_ticket",
     "writer_row",
 ]

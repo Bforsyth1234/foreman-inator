@@ -292,11 +292,21 @@ class RunEnv:
     cancel: threading.Event = field(default_factory=threading.Event)
 
 
-def make_proxy(config: Config, store: Store, spend: Any) -> Any:
-    """The experiment process's own model proxy (a free loopback port)."""
-    from foreman_inator.proxy.server import ModelProxy
+def make_proxy(config: Config, store: Store, spend: Any, local_slots: Any = None) -> Any:
+    """The experiment process's own model proxy (a free loopback port). #34: its local
+    calls are capped at ``max_local_inference`` through the cross-process slot files the
+    worker also uses, so a replay and the worker never run two local inferences past the
+    cap; a run inside the worker's process may pass the worker proxy's ``slots``."""
+    from foreman_inator.proxy.server import ModelProxy, shared_local_slots
 
-    return ModelProxy(config.proxy_models(), store=store, spend_hook=spend.hook).start()
+    if local_slots is None:
+        local_slots = shared_local_slots(int(config.max_local_inference))
+    return ModelProxy(
+        config.proxy_models(),
+        store=store,
+        spend_hook=spend.hook,
+        local_slots=local_slots,
+    ).start()
 
 
 def build_deps(
@@ -329,6 +339,7 @@ def build_deps(
         endpoint_for=config.model,
         spend=spend,
         recordings_dir=rec,
+        config=config,
     )
 
 
@@ -442,8 +453,10 @@ def run_command(
     proxy_factory: Callable[[Config, Store, Any], Any] | None = None,
     driver_factory: Callable[[], Any] | None = None,
     config: Config | None = None,
+    local_slots: Any = None,
 ) -> int:
-    """``fman experiment run``: its own proxy, its own mirrors, the run lock, clean stops."""
+    """``fman experiment run``: its own proxy, its own mirrors, the run lock, clean stops.
+    ``local_slots``: the worker proxy's ``slots`` when run inside the worker (#34)."""
     from foreman_inator import config as config_mod
     from foreman_inator.spend import Spend
 
@@ -456,11 +469,19 @@ def run_command(
         raise ExperimentError("no database yet: run the worker first")
     with run_lock(), Store(paths.db_path()) as store:
         spend = Spend(store, cfg)
-        proxy = (proxy_factory or make_proxy)(cfg, store, spend)
+        if proxy_factory is not None:
+            proxy = proxy_factory(cfg, store, spend)
+        elif local_slots is not None:
+            proxy = make_proxy(cfg, store, spend, local_slots=local_slots)
+        else:
+            proxy = make_proxy(cfg, store, spend)
         if driver_factory is None:
             from foreman_inator.runner.opencode import OpenCodeDriver
 
-            driver_factory = OpenCodeDriver
+            # #34: time queued for a local slot never counts against a replay's writer.
+            def driver_factory() -> Any:
+                return OpenCodeDriver(extra_time=getattr(proxy, "queue_wait", None))
+
         env = RunEnv(store, cfg, build_deps(store, cfg, proxy=proxy, spend=spend,
                                             driver=driver_factory()))  # fmt: skip
         old = install_cancel_handlers(env.cancel) if _main_thread() else {}

@@ -16,6 +16,7 @@ current text. `fman --version` prints the version.
 | [`fman repo remove`](#fman-repo-remove) | Take repos out of the list the worker polls. |
 | [`fman repo list`](#fman-repo-list) | The repos in `config.toml`, marking any the installation no longer covers. |
 | [`fman repo set-verify`](#fman-repo-set-verify) | Save the command that verifies a repo. |
+| [`fman repo set-profile`](#fman-repo-set-profile) | Set a repo's profile: how hard the writer tries and how much review a change gets. |
 | [`fman experiment run`](#fman-experiment-run) | Replay the champion against a challenger on past tickets. |
 | [`fman experiment status`](#fman-experiment-status) | Champions, running and ended experiments with their results. |
 | [`fman experiment promote`](#fman-experiment-promote) | Make a challenger champion if it won on replay and holds live. |
@@ -142,6 +143,24 @@ pass.
 | Option | Meaning |
 | --- | --- |
 | `--clear` | Forget the saved command. |
+
+## `fman repo set-profile`
+
+```bash
+fman repo set-profile <owner/name> <preset>
+fman repo set-profile <owner/name> [<preset>] [--writer W] [--review R]
+```
+
+Set a repo's profile. `<preset>` is `prototype`, `personal`, `default` or
+`production`; without one, the repo's current profile is the start. The
+options then change one mode. An unknown name is refused with the valid ones,
+and nothing is saved. The worker uses the new profile from its next decision.
+See [Repo profiles](configuration.md#repo-profiles).
+
+| Option | Meaning |
+| --- | --- |
+| `--writer` | `thrifty`, `normal` or `fast`. |
+| `--review` | `off`, `light`, `normal` or `strict`. |
 
 ## `fman experiment run`
 

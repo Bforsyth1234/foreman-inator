@@ -155,13 +155,28 @@ def repo_count_warning(cfg: Config) -> str | None:
     )
 
 
+def build_proxy_and_driver(cfg: Config, store: Store, spend: Spend) -> tuple[Any, Any]:
+    """The worker's started model proxy and its OpenCode driver. The embedding model
+    (#23) is served next to the writers but is never a rung. #34: one process-wide cap
+    (``max_local_inference``) on local-model calls, shared across processes (lock files
+    under the foreman home); the driver adds the attempt's time
+    queued for a slot to its writer timeout (``extra_time=proxy.queue_wait``)."""
+    from foreman_inator.proxy.server import ModelProxy, shared_local_slots
+    from foreman_inator.runner.opencode import OpenCodeDriver
+
+    slots = shared_local_slots(cfg.max_local_inference)  # shared with `fman experiment run`
+    proxy = ModelProxy(
+        cfg.proxy_models(), store=store, spend_hook=spend.hook, local_slots=slots
+    ).start()
+    return proxy, OpenCodeDriver(extra_time=proxy.queue_wait)
+
+
 def run_worker(*, once: bool = False) -> int:
     """``fman run``: build the real collaborators and work until stopped. Exit code."""
     from foreman_inator import config as config_mod
     from foreman_inator import paths
-    from foreman_inator.proxy.server import ModelProxy
-    from foreman_inator.runner.opencode import OpenCodeDriver
     from foreman_inator.runner.worktree import GitIdentity
+    from foreman_inator.worker import ollama_watch_for
 
     _setup_logging()
     cfg = config_mod.load()
@@ -187,9 +202,7 @@ def run_worker(*, once: bool = False) -> int:
         attempt_max_input_tokens_cloud=cfg.attempt_max_input_tokens_cloud,
         attempt_max_input_tokens_local=cfg.attempt_max_input_tokens_local,
     )
-    # The embedding model (#23) is served next to the writers but is never a rung.
-    proxy = ModelProxy(cfg.proxy_models(), store=store, spend_hook=spend.hook).start()
-    driver = OpenCodeDriver()
+    proxy, driver = build_proxy_and_driver(cfg, store, spend)
     if not once:
         warm_up_opencode(driver, cfg, proxy)
     worker = Worker(
@@ -205,6 +218,7 @@ def run_worker(*, once: bool = False) -> int:
         spend=spend,
         recordings_dir=paths.recordings_dir(),
         traces_dir=paths.traces_dir(),
+        ollama_watch=ollama_watch_for(cfg),  # #52
     )
     old = install_signal_handlers(worker)
     try:
@@ -226,6 +240,7 @@ def run_worker(*, once: bool = False) -> int:
 
 __all__ = [
     "build_github",
+    "build_proxy_and_driver",
     "install_signal_handlers",
     "repo_count_warning",
     "run_worker",

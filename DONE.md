@@ -527,3 +527,68 @@ GitHub issues #50, #51, #55, #56, #57, #58 (no todo ids) were built in the same 
 Not yet read by `fman status` or the metrics page (#60 does that).
 
 Runner at close: config keys and docs for all five new settings; `Spend` gets the per-attempt limits in `worker_run`; `post_summary` gets the budget; export keeps `end_reason`/`end_detail`; `fman status` shows an attempt's spend against the budget; `PruneSteps` mixed into `Worker`, `maybe_prune()` in `poll_and_handle` once `recover()` has run; `fman prune [--dry-run] [--days N]`; `test_install.py` now expects the refill (offline in the edited worktree, network only in the base scratch) with an `install_refill_cache = false` variant for the old flag; the hand-over comment of a dormant flag says its file locks are released.
+
+## Wave 14 — local cap, memory, repo profiles, rules files, cold loads (2026-11-25, branch `wave-14`)
+
+GitHub issue #52 (no todo id) was built in the same wave: before the clarity check or the router calls a local model, `OllamaWatch` (`/api/ps`) is asked; a cold model gets `cold_load_timeout_seconds` (default 120) more, and a timeout while it loads is retried once (`tickets/clarify.py`, `routing/rules.py`, `tests/test_cold_load.py`).
+
+#51 — Repo profiles: per-repo `writer` and `review` settings [~] live
+Wave: _ (proposed: its own wave after 6b) · Agent: _ · Added: 2026-11-23 · Source: user
+Ask: "a setting per repo that prioritizes speed over cost saving and correctness over cost … personal project can take a lot of time and have bugs but cost little", and "sometimes i build prototypes and i want speed to be most important minor bugs dont matter".
+Why: the retry and kickback limits are module constants (`routing/escalation.py:75-79`), the router's pick is used as is, and AI review is the same for every repo. `repo_settings` holds only the verify command.
+DECISIONS (assistant, 2026-11-23; the user approved the two settings, `review = off` and the four presets, and can overturn the rest):
+1. Two settings per repo, not three sliders: cost is what the other two are bought with. `writer` = `thrifty` | `normal` | `fast`. `review` = `off` | `light` | `normal` | `strict`. No setting means `normal` + `normal`, which must behave exactly as the code does today.
+2. `writer`: `thrifty` allows 2 retries on a tier before moving up (3 check attempts) and makes a cloud writer attempt wait for approval. `fast` starts one tier above the router's pick (capped at the top tier) and moves up on the first failed check. User-kickback rules are the same in all three.
+3. `review`: `off` takes the existing `review:skip` path (checks pass → PR marked ready). `light` runs review checks 1–3 (tests, coverage, revert) and gives its verdict from hard findings alone: no run-app, no model call. `strict` ignores `review:skip` and moves the writer up on the first AI kickback.
+4. Presets: `prototype` = fast + off · `personal` = thrifty + light · `default` = normal + normal · `production` = fast + strict.
+5. Stored in `repo_settings` (`writer_mode`, `review_mode`), set by `fman repo set-profile <repo> <preset>` or `--writer` / `--review`, shown by `fman status` and in the PR description. Same home as `fman repo set-verify`; #49 (`cloud = false`) and #45 (install command) should use it too.
+6. A `tier:N` label is never shifted. The shift is applied after the router's guess; `route_reason` records both ("profile fast: tier 1 → 2"), and every attempt records `writer_mode` and `review_mode`. #23 must learn from the router's own pick, not the shifted start, and #20's metrics can split by mode.
+7. Exploration rate per mode (thrifty 25%, normal 10%, fast 0%) is defined here and read by #23 (`routing/explore.py`, wave 8); nothing explores until #23 is built.
+8. No per-repo budget in this item. The global daily and monthly caps apply to every profile. `thrifty`'s approval reuses the refusal and `approve` path in `spend.py` with its own reason.
+9. Invariants: every mode keeps a finite attempt bound (7e); `light` and `off` run no model reviewer, so 7f is not in play; `off` marks the PR ready with no review, as `review:skip` already does.
+SPEC change needed: "Routing and escalation" gains "Repo profiles" and `attempts` gains `writer_mode, review_mode`. Both are already in SPEC.md (2026-11-23); the Claude doc, the source of truth, still needs them.
+Files:
+⚬ OWNED: `src/foreman_inator/routing/profile.py`, `tests/test_profile.py`, one migration with the next free number when this is built (002 and 003 are claimed by #41 and #43)
+⚬ EDITED (additive, earlier waves): `src/foreman_inator/routing/escalation.py` (limits passed in; today's constants stay as the defaults), `src/foreman_inator/review/reviewer.py` (a `depth` argument on `review_change`), `src/foreman_inator/db/store.py` (`RepoSettings` fields, `set_profile`, the two attempt columns), `src/foreman_inator/spend.py` (the approval reason)
+⚬ Do NOT touch: `cli.py`, `worker.py`, `pr/publisher.py` (rule 9: the runner wires them at close).
+Scheduling: `store.py` and the migrations belong to wave 6b slot B, and the wiring needs #21's loop, so this runs after 6b. Because `normal` is the default and equals today's behaviour, #21 needs no change to be built first.
+Approach: `profile.py` is pure: `Profile(writer, review)`, `PRESETS`, `limits_for(profile) -> Limits` (check attempts, user and AI kickback limits, start shift, explore rate, cloud approval), `shift_start(tier, ladder, limits)`, `review_plan(profile)` (off | hard checks only | full; whether the skip label counts). `make_policy(ladder, limits=...)`, `next_step` and `attempt_bound` take `Limits`. Runner at close: `fman repo set-profile`, the profile line in `fman status` and the PR description, and three call sites in `worker.py` (route, policy, review). Fallback if `light` can't reuse the reviewer cleanly: `light` calls the check functions in `review/checks.py` directly and builds the verdict in `profile.py`'s caller.
+Verify:
+⚬ `default` gives the same decision as today on every existing escalation test, and `attempt_bound(4)` is unchanged.
+⚬ `fast`: tier 1 pick starts on tier 2, tier 3 stays 3, a `tier:N` label is not shifted, the first failed check escalates.
+⚬ `thrifty`: three failed checks before moving up; a cloud writer attempt is refused until approved.
+⚬ For every `writer` × `review` pair, any history ends with the user within `attempt_bound` (invariant 7e).
+⚬ `off`: no review row, no model call, PR ready. `light`: the fake reviewer model is called 0 times and a hard finding still gives `request_changes`. `strict`: `review:skip` is ignored and one AI kickback escalates.
+⚬ `set_profile` round-trips through the store; an unknown preset is rejected with the valid names; an attempt row records both modes.
+⚬ pytest + ruff gate (rule 8).
+⚬ Non-vacuous: make `limits_for(fast)` return the default limits, the `fast` tests fail; let `light` call the model, the zero-calls test fails.
+Live (user): set a toy repo to `prototype` and label 2 issues: both PRs arrive ready with no bot review. Set it to `production`, label one issue with `review:skip`: the review still runs.
+Deviations:
+Built (B4): `routing/profile.py` (presets, `limits_for`, `shift_start`, `review_plan`), `Limits` through `make_policy`/`next_step`/`attempt_bound`, `review_change(depth="light")`, `Spend.writer_gate`, migration 008 (`repo_settings.writer_mode/review_mode`, `attempts.writer_mode/review_mode`), the `start:<ticket>` cursor, `Profile` lines in `fman status`. Tests: `tests/test_profile.py`; wiring and both Live expectations at worker level in `tests/test_wave14_wiring.py`.
+
+#57 — Global cap on concurrent local-model inference [x] · Added: 2026-11-23 · Source: user
+Why: `max_parallel_per_repo` (default 1, "one local GPU") is counted per repo, and nothing limits local work across repos. Three watched repos can send three tickets to Ollama at once, each loading `qwen3.8:27b` or `inkling-2-mini`: models get evicted and reloaded, the machine swaps, and attempts slow down or time out. Those runs are then recorded as model failures in the metrics and the kNN router's data.
+Idea: a `max_local_inference` config setting (default 1). The proxy holds one shared semaphore for requests to `local` tier endpoints; cloud tiers are not limited. Time spent waiting for a slot is recorded on the `llm.call` span and not counted against the attempt's timeout. Estimate: about 2 hours with tests.
+Built (B2): `proxy/server.LocalSlots` (process-wide, first come first served) held by local completion calls only; `llm.queue_wait_s` on the span, left out of `latency_ms`; `proxy.queue_wait(attempt_id)` and `proxy.local_slots()`; `OpenCodeDriver(extra_time=)` extends the writer deadline. Config `max_local_inference` (default 1). Tests: `tests/test_local_cap.py`.
+
+#59 — Record memory state on each attempt [x] · Added: 2026-11-23 · Source: user
+Why: a slow or failed local attempt can't be told apart from a starved machine. Without this, resource contention looks like model quality in the metrics and replay sets.
+Idea: at attempt start (and optionally at end), store the loaded models from #58 plus system memory used and memory pressure (`psutil`, or `vm_stat` / `memory_pressure` on macOS) on the attempt's trace. Decide whether it belongs on a span attribute (no schema change) or in an attempt column. Estimate: about 2 hours.
+Built (B3): `resources/memory.py` (`vm_stat` / `memory_pressure` behind an injectable runner); span attributes `resource.mem_used_bytes`, `resource.mem_pressure`, `resource.ollama_loaded` (and `resource.end.*`) at attempt start and end; no schema change. Tests: `tests/test_resources_memory.py`.
+
+#61 — Global rules file for every repo [x] · Added: 2026-11-23 · Source: user
+Why: users want rules that apply to every repo the worker touches (commit style, "never add dependencies", language preferences). There is nowhere to put them: OpenCode's own `~/.config/opencode/AGENTS.md` is never read because `XDG_CONFIG_HOME` points at foreman-inator's dirs, on purpose (`runner/opencode.py`).
+Idea: `~/.foreman-inator/AGENTS.md` (mode 600, invariant d) plus an optional per-repo `rules_file` in config. Shown in the prompt before the repo's own file, under its own heading; the prompt says the repo's file wins on a conflict. Shares `CONVENTIONS_BUDGET` with the repo file (global clipped first) or gets its own budget: decide and record. Replays record which global text was used so a later edit doesn't change old results. Estimate: about 1 hour with tests.
+Built (B6): `~/.foreman-inator/AGENTS.md` (`paths.rules_path()`, mode 600) and per-repo `[rules_file]` in config, shown before the repo files with "repository file wins"; one shared `CONVENTIONS_BUDGET`, global clipped first, a warning per clip; `conventions.sha256` on the attempt span. Tests: `tests/test_conventions.py`.
+
+#63 — Read both AGENTS.md and CLAUDE.md, not the first one found [x] · Added: 2026-11-23 · Source: assistant (gap review)
+Why: `CONVENTIONS_FILES` is "first one found wins". A repo with both files loses every `CLAUDE.md` rule without a warning. Nested files (`pkg/AGENTS.md`) are also ignored.
+Idea: read both root files, skip one that is identical to or a symlink of the other, and label each in the prompt. Nested files: include those on the path of the ticket's `owned_files` when there are any, within the budget. Log a warning when the budget clips the text. Estimate: about 45 minutes.
+Built (B6): `tickets/conventions.gather` reads root `AGENTS.md` and `CLAUDE.md` (identical or symlinked duplicates skipped), nested files on the `owned_files` paths, each labelled; repo files only from inside the worktree. `read_conventions` kept for the replay runner.
+
+#46 — Metrics: attempt minutes and review count next to dollars [x] · Added: 2026-11-23 · Source: assistant (gap review; user asked "why wouldnt local llms be priced at 0")
+Why: local models cost $0 per token (correct), so "cost per accepted ticket" shows a local model that took 3 attempts and 2 reviews as free.
+Idea: metrics page only. `attempts.seconds` is already recorded; add total attempt minutes and the user's review count per accepted ticket, per model.
+Built (B5): per accepted ticket per model, attempt minutes (sum of `attempts.seconds`) and the user review count (user kickbacks + 1) in `metrics/queries.writer_row` and the writer table on the metrics page. Tests: `tests/test_metrics_attempt_minutes.py`.
+
+Runner at close: config keys `cold_load_timeout_seconds`, `max_local_inference`, `[rules_file]` and their docs; one `OllamaWatch` passed by `fman run` to `clarify.assess` and `routing.route`; one `LocalSlots` for the worker proxy (and the experiment proxy when run inside the worker), driver `extra_time=proxy.queue_wait`; `policy_for` passes the profile's `Limits` and `history` its start tier; the cloud writer check uses `writer_gate`; the review-off hand-over reason and comment; shadows skip light reviews; `fman repo set-profile`; the PR `Repo profile:` line; `conventions.gather` with the repo's `rules_file` in `_run_attempt`. `tests/test_cold_load.py`'s retry-cap test now gives its proxy two local slots (the abandoned first call holds one until its slow reply ends). Proof each wiring is called: `tests/test_wave14_wiring.py`.

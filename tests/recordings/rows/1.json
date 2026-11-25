@@ -15,6 +15,7 @@
    "id": 1,
    "model": "inkling-2-mini",
    "outcome": "failed_checks",
+   "review_mode": "normal",
    "seconds": 60.0,
    "started_at": "2026-01-05T09:07:00+00:00",
    "tests_passed": false,
@@ -25,7 +26,8 @@
    "trigger": "first",
    "variant_id": "inkling-2-mini/writer-v1@0a1b2c3d",
    "verify_output_path": null,
-   "worktree": null
+   "worktree": null,
+   "writer_mode": "normal"
   },
   {
    "base_commit": "b0a5e01",
@@ -42,6 +44,7 @@
    "id": 2,
    "model": "inkling-2-mini",
    "outcome": "kicked_back",
+   "review_mode": "normal",
    "seconds": 60.0,
    "started_at": "2026-01-05T09:09:00+00:00",
    "tests_passed": true,
@@ -52,7 +55,8 @@
    "trigger": "first",
    "variant_id": "inkling-2-mini/writer-v1@0a1b2c3d",
    "verify_output_path": null,
-   "worktree": null
+   "worktree": null,
+   "writer_mode": "normal"
   },
   {
    "base_commit": "b0a5e01",
@@ -69,6 +73,7 @@
    "id": 3,
    "model": "inkling-2-mini",
    "outcome": "kicked_back",
+   "review_mode": "normal",
    "seconds": 60.0,
    "started_at": "2026-01-05T09:13:00+00:00",
    "tests_passed": true,
@@ -79,7 +84,8 @@
    "trigger": "ai_kickback",
    "variant_id": "inkling-2-mini/writer-v1@0a1b2c3d",
    "verify_output_path": null,
-   "worktree": null
+   "worktree": null,
+   "writer_mode": "normal"
   },
   {
    "base_commit": "b0a5e01",
@@ -96,6 +102,7 @@
    "id": 4,
    "model": "qwen3.8-27b",
    "outcome": "accepted",
+   "review_mode": "normal",
    "seconds": 60.0,
    "started_at": "2026-01-05T09:17:00+00:00",
    "tests_passed": true,
@@ -106,7 +113,8 @@
    "trigger": "escalation",
    "variant_id": "qwen3.8-27b/writer-v1@0a1b2c3d",
    "verify_output_path": null,
-   "worktree": null
+   "worktree": null,
+   "writer_mode": "normal"
   }
  ],
  "explore": false,

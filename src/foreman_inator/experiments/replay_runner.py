@@ -105,7 +105,8 @@ from foreman_inator.review import reviewer as rv
 from foreman_inator.runner import sandbox
 from foreman_inator.runner import verify as verify_mod
 from foreman_inator.runner.worktree import RepoMirror, Worktree, WorktreeError
-from foreman_inator.tickets.prompt import build_writer_prompt, read_conventions
+from foreman_inator.tickets import conventions as conventions_mod
+from foreman_inator.tickets.prompt import build_writer_prompt
 from foreman_inator.worker_setup import setup_failure
 
 from . import replay_sets as rs
@@ -208,6 +209,19 @@ class ReplayDeps:
     spend: Any = None
     recordings_dir: Path | None = None  # read for head commits when building sets
     clock: Callable[[], float] = time.monotonic
+    config: Any = None  # the repos' ``rules_file`` (``rules_file_for``); None = no config
+
+
+def _forget_queue_wait(proxy: Any, run_id: int) -> None:
+    """#34: the run is over; drop its queue-wait total so the proxy's map stays small."""
+    forget = getattr(proxy, "forget_queue_wait", None)
+    if forget is not None:
+        forget(run_id)
+
+
+def _rules_file(config: Any, repo: str) -> Any:
+    getter = getattr(config, "rules_file_for", None)
+    return getter(repo) if getter is not None else None
 
 
 # --------------------------------------------------------------------------- results
@@ -824,8 +838,10 @@ def _drive(
                     return "stopped", STOP_SANDBOX
                 _save(store, result)
                 log.info(
-                    "replay %d: case %d %s %s",
+                    "replay %d: case %d %s %s%s",
                     experiment_id, case.id, side, result.score or result.status,
+                    f" (conventions sha256 {ctx.conventions_sha256})"
+                    if ctx.conventions_sha256 else "",
                 )  # fmt: skip
         return "finished", None
     finally:
@@ -846,6 +862,7 @@ class _SideCtx:
     budget: _Budget
     mirrors: dict[str, RepoMirror]
     policies: list[sandbox.Policy] = field(default_factory=list)
+    conventions_sha256: str | None = None  # writer side: hash of the rules in its prompt
 
     @property
     def name(self) -> str:
@@ -996,37 +1013,46 @@ def _writer_side(ctx: _SideCtx) -> CaseResult:
         if cmd is None:
             return ctx.result("error", t0, detail="no verify command for the repo")
         now = deps.store.now()
-        conv = read_conventions(wt.path)
+        # The production prompt's rules (#38, #40): global rules, the repo's rules_file,
+        # AGENTS.md + CLAUDE.md and nested files, as ``Worker._run_attempt`` gathers them.
+        conv = conventions_mod.gather(
+            wt.path, wc.owned_files, rules_file=_rules_file(deps.config, wc.repo)
+        )
+        ctx.conventions_sha256 = conv.sha256  # determinism: which rules it saw (logged)
         prompt = build_writer_prompt(
             _replay_ticket(wc, now),
             _replay_attempt(wc, variant.endpoint, wt, now),
             (),
             verify_command=cmd.display,
-            conventions=conv[1] if conv else None,
-            conventions_name=conv[0] if conv else "AGENTS.md",
+            conventions=conv,
             template=variant.template,
             clarification=wc.clarification,
         )
+        run_id = _synthetic_id()
         with (
             ctx.tap.watch(ctx.budget) as meter,
             deps.proxy.context(
                 bucket="experiments",
                 label=f"replay:{ctx.name}",
                 prompt_version=f"{variant.template.name}@{variant.template.sha256[:12]}",
+                writer_run=run_id,  # #34: queues for the local slot like a live writer
             ) as pctx,
         ):
             meter.add_token(pctx.token)  # type: ignore[attr-defined]
             policy = ctx.policy(wt.path, "writer", writer=True)
-            run = deps.driver.run(
-                attempt_id=_synthetic_id(),
-                worktree=wt,
-                prompt=prompt.text,
-                endpoint=variant.endpoint,
-                proxy_base_url=pctx.base_url,
-                timeout=settings.writer_timeout_s,
-                cancel=ctx.cancel,
-                sandbox=policy,
-            )
+            try:
+                run = deps.driver.run(
+                    attempt_id=run_id,
+                    worktree=wt,
+                    prompt=prompt.text,
+                    endpoint=variant.endpoint,
+                    proxy_base_url=pctx.base_url,
+                    timeout=settings.writer_timeout_s,
+                    cancel=ctx.cancel,
+                    sandbox=policy,
+                )
+            finally:
+                _forget_queue_wait(deps.proxy, run_id)
         if meter.refused:
             raise _Stop(meter.refused)
         if ctx.cancel.is_set() or getattr(run, "cancelled", False):

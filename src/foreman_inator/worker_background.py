@@ -280,6 +280,8 @@ class BackgroundSteps:
             r = reviews[-1]
             if r.id not in self._finalized or r.created_at < started:
                 continue
+            if r.reviewer_model == rv.LIGHT_REVIEWER_MODEL:  # #51 light: no model to shadow
+                continue
             done = any(
                 s.variant_id == ch.variant_id
                 for s in self.store.list_reviews(attempt_id=r.attempt_id, shadow=True)
