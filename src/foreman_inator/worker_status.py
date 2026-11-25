@@ -34,7 +34,7 @@ _TITLES = {
 TITLE_WIDTH = 40
 
 
-def _attempt_text(attempts: Sequence[Attempt]) -> str:
+def _attempt_text(attempts: Sequence[Attempt], budget_usd: float | None = None) -> str:
     if not attempts:
         return "not started"
     a = attempts[-1]
@@ -45,6 +45,8 @@ def _attempt_text(attempts: Sequence[Attempt]) -> str:
     else:
         state = a.outcome.replace("_", " ")
     cost = f", ${a.cost_usd:.2f}" if a.cost_usd else ""
+    if cost and budget_usd is not None:  # #58: the attempt's spend against its budget
+        cost += f" of ${budget_usd:.2f}"
     return f"attempt {len(attempts)} ({a.trigger}, {a.model}, tier {a.tier}{cost}): {state}"
 
 
@@ -53,17 +55,20 @@ def _line(
     attempts: Sequence[Attempt],
     waits: dict[int, tuple[int, ...]] | None = None,
     store: Store | None = None,
+    budget_usd: float | None = None,
 ) -> str:
     title = " ".join(t.title.split())
     if len(title) > TITLE_WIDTH:
         title = title[: TITLE_WIDTH - 1] + "…"
     parts = [
         f"  #{t.id:<4} {t.repo}#{t.issue_number:<5} {title:<{TITLE_WIDTH}}",
-        _attempt_text(attempts),
+        _attempt_text(attempts, budget_usd),
     ]
     if t.pr_number is not None:
         parts.append(f"PR #{t.pr_number}")
     line = "  ".join(parts)
+    if t.column in ("done", "dropped"):
+        return line  # #50: a closed ticket's flag is history, not something for the user
     if t.flag_reason and t.flag_reason.startswith(FLAG_SPEND_CAP):
         line += (
             f"\n         WAITING: spend approval ({t.flag_reason}); run `fman approve-spend {t.id}`"
@@ -74,9 +79,22 @@ def _line(
     if blockers:
         held = ", ".join(f"#{b}" for b in blockers)
         line += f"\n         WAITING: on files held by ticket(s) {held}"
+        line += _release_hint(blockers, store)
     for why in _waits(t, attempts, store):
         line += f"\n         WAITING: {why}"
     return line
+
+
+def _release_hint(blockers: Sequence[int], store: Store | None) -> str:
+    """#55: for a blocker that is flagged for the user, say what releases its files."""
+    if store is None:
+        return ""
+    hints = []
+    for b in blockers:
+        bt = store.get_ticket(b)
+        if bt.flag_reason:
+            hints.append(f"#{b} is flagged: close or re-label issue {bt.repo}#{bt.issue_number}")
+    return f" ({'; '.join(hints)})" if hints else ""
 
 
 def _waits(t: Ticket, attempts: Sequence[Attempt], store: Store | None) -> list[str]:
@@ -108,6 +126,7 @@ def render_status(store: Store, *, closed_limit: int = 5, config: Config | None 
         for repo in sorted({t.repo for t in tickets})
         for w in locks.waiting(repo)
     }
+    budget = config.attempt_budget_usd if config is not None else None
     by_col: dict[str, list[Ticket]] = {c: [] for c in COLUMNS}
     for t in tickets:
         by_col[t.column].append(t)
@@ -121,7 +140,7 @@ def render_status(store: Store, *, closed_limit: int = 5, config: Config | None 
         if len(shown) < len(items):
             header += f", latest {len(shown)}"
         out.append(header)
-        out.extend(_line(t, store.list_attempts(t.id), waits, store) for t in shown)
+        out.extend(_line(t, store.list_attempts(t.id), waits, store, budget) for t in shown)
         if not items:
             out.append("  (none)")
         out.append("")

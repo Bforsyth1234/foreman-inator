@@ -100,6 +100,9 @@ EXTRA_COLUMNS: dict[str, list[str]] = {
         # migration 002 (#41)
         "ci_passed",
         "ci_status",
+        # migration 007 (#58)
+        "end_reason",
+        "end_detail",
     ],
     "kickbacks": ["failure_step_index"],
     "reviews": ["created_at", "shadow"],

@@ -31,7 +31,8 @@ different threads or asyncio tasks: every method takes one lock, and `get_record
 finds the open recorder for an attempt from anywhere in the process.
 
 Retention (`prune`): recordings of merged tickets are kept; the rest are deleted once older
-than 90 days.
+than 90 days. `foreman_inator.prune.run` calls it (the worker once a day, `fman prune` by
+hand) and also keeps tickets that are still open.
 """
 
 from __future__ import annotations
@@ -333,6 +334,11 @@ def _is_merged(merged: Container[int] | Callable[[int], bool]) -> Callable[[int]
     return lambda ticket_id: ticket_id in merged
 
 
+#: Files under `traces/<ticket_id>/` that follow the recordings' retention rule: span files
+#: and the full check output saved next to them (verify, install and CI logs).
+TRACE_SUFFIXES = (".jsonl", ".log")
+
+
 def prune(
     recordings_dir: str | Path,
     *,
@@ -340,21 +346,24 @@ def prune(
     traces_dir: str | Path | None = None,
     max_age_days: float = RETENTION_DAYS,
     now: float | None = None,
+    dry_run: bool = False,
 ) -> list[Path]:
     """Delete recordings (and their `.files/`) of tickets that are not merged once older
     than `max_age_days` by mtime; merged tickets' recordings are always kept.
 
-    `merged` is a set of merged ticket ids or a `ticket_id -> bool` callable (the caller
-    asks the store). With `traces_dir`, local span files (`<traces_dir>/<ticket_id>/*.jsonl`)
-    follow the same rule. Returns the deleted paths. Directories not named by an integer
-    ticket id are left alone.
+    `merged` is a set of kept ticket ids or a `ticket_id -> bool` callable (the caller
+    asks the store; `foreman_inator.prune` also keeps open tickets). With `traces_dir`,
+    local span files and saved check logs (`<traces_dir>/<ticket_id>/*.jsonl`, `*.log`)
+    follow the same rule. Returns the deleted paths; with `dry_run`, the paths that would
+    be deleted, and nothing is touched. Directories not named by an integer ticket id are
+    left alone.
     """
     is_merged = _is_merged(merged)
     cutoff = (now if now is not None else datetime.now(UTC).timestamp()) - max_age_days * 86400
     deleted: list[Path] = []
     roots = [(Path(recordings_dir), (".jsonl.gz", ".jsonl"))]
     if traces_dir is not None:
-        roots.append((Path(traces_dir), (".jsonl",)))
+        roots.append((Path(traces_dir), TRACE_SUFFIXES))
     for root, suffixes in roots:
         if not root.is_dir():
             continue
@@ -368,13 +377,16 @@ def prune(
                     continue
                 if f.stat().st_mtime >= cutoff:
                     continue
-                f.unlink()
+                if not dry_run:
+                    f.unlink()
                 deleted.append(f)
                 stem = f.name.removesuffix(".gz").removesuffix(".jsonl")
                 side = tdir / f"{stem}.files"
                 if side.is_dir():
-                    shutil.rmtree(side)
+                    if not dry_run:
+                        shutil.rmtree(side)
                     deleted.append(side)
-            with contextlib.suppress(OSError):
-                os.rmdir(tdir)  # only if now empty
+            if not dry_run:
+                with contextlib.suppress(OSError):
+                    os.rmdir(tdir)  # only if now empty
     return deleted

@@ -39,6 +39,24 @@ Rules as implemented:
 * **Resume.** A paused ticket can resume when it has an open approval, or when the live
   caps have headroom again (a new local day or month, or a raised cap):
   ``resume_reason``.
+* **Per-attempt budget** (#58). One writer attempt (live calls with an ``attempt_id`` and
+  no ``review_id``) may spend at most ``attempt_budget_usd`` on cloud models, and may
+  send at most ``attempt_max_input_tokens_cloud`` / ``_local`` input tokens (by the
+  endpoint's kind; local calls are checked too, though they cost nothing). The running
+  totals are the attempt row's ``cost_usd`` and ``tokens_in``, which the proxy adds
+  before it settles a call here. A call is refused (cap ``attempt``, before it is sent)
+  when ``cost_usd + reserved + estimate > attempt_budget_usd`` (the same boundary as the
+  caps) or when ``tokens_in`` has already reached the token limit. The refusal is not a
+  pause and asks nobody (``needs_approval`` is False): ``budget_stop(attempt_id)`` tells
+  the worker, which ends the attempt with ``end_reason = 'budget'``, and escalation hands
+  the ticket to the user (flag ``attempt_budget: ...``) with no retry on any tier.
+  Worst-case overshoot, for one attempt (its writer calls run one at a time): the USD
+  check uses the proxy's high estimate, so the attempt's cost passes the budget by at
+  most one call's (actual - estimate), which is zero unless that call returned more than
+  its estimated output tokens; the token check sees only calls already made, so input
+  tokens pass the limit by at most one call's input. ``None`` turns a limit off, and is
+  the constructor's default (so a bare ``Spend`` keeps the old behaviour); the worker
+  passes the config's values, whose defaults are the ``DEFAULT_ATTEMPT_*`` constants.
 """
 
 from __future__ import annotations
@@ -51,19 +69,28 @@ from datetime import UTC, date, datetime, timedelta, tzinfo
 from typing import Literal
 from zoneinfo import ZoneInfo
 
+from foreman_inator import config as config_defaults
 from foreman_inator.config import Config, ModelEndpoint, SpendCaps
 from foreman_inator.db.store import NotFoundError, SpendApproval, SpendEntry, Store, Ticket
 
 log = logging.getLogger(__name__)
 
 Bucket = Literal["live", "experiments"]
-CapName = Literal["daily", "monthly", "experiments_monthly", "approval"]
+CapName = Literal["daily", "monthly", "experiments_monthly", "approval", "attempt"]
 BUCKETS: tuple[Bucket, ...] = ("live", "experiments")
 
 #: Flag reason for a ticket paused at the cap (``store.flag_ticket(id, f"{FLAG_SPEND_CAP}: ...")``).
 FLAG_SPEND_CAP = "spend_cap"
 #: An unsettled reservation is dropped after this long (proxy upstream timeout is 600 s).
 DEFAULT_RESERVATION_TTL = timedelta(minutes=15)
+#: Flag reason prefix for a ticket handed over after an attempt reached its budget (#58).
+FLAG_ATTEMPT_BUDGET = "attempt_budget"
+#: Per-attempt limits (#58), defined in ``config`` (whose keys default to them) and
+#: re-exported here. The live run that prompted #58 spent $4.78 and 3.34M input tokens
+#: in one tier 3 attempt.
+DEFAULT_ATTEMPT_BUDGET_USD = config_defaults.DEFAULT_ATTEMPT_BUDGET_USD
+DEFAULT_ATTEMPT_MAX_INPUT_TOKENS_CLOUD = config_defaults.DEFAULT_ATTEMPT_MAX_INPUT_TOKENS_CLOUD
+DEFAULT_ATTEMPT_MAX_INPUT_TOKENS_LOCAL = config_defaults.DEFAULT_ATTEMPT_MAX_INPUT_TOKENS_LOCAL
 _EPS = 1e-9  # float slack so 4.0 + 1.0 <= 5.0 holds after summing ledger REALs
 
 
@@ -90,15 +117,29 @@ class Refusal:
     attempt_id: int | None = None
     review_id: int | None = None
     model: str | None = None
+    # cap "attempt" only (#58): the attempt's input tokens and the limit that refused it
+    # (None when the dollar budget refused it).
+    tokens_in: int | None = None
+    token_limit: int | None = None
 
     @property
     def needs_approval(self) -> bool:
         """True for live spend tied to a ticket: the worker pauses it and asks the user.
-        Experiment refusals never ask (replays just stop)."""
-        return self.bucket == "live" and self.ticket_id is not None
+        Experiment refusals never ask (replays just stop); nor does an attempt budget
+        stop (the attempt ends and escalation hands the ticket over)."""
+        return self.bucket == "live" and self.ticket_id is not None and self.cap != "attempt"
+
+    @property
+    def detail(self) -> str:
+        """For cap ``attempt``: what the attempt used against which limit."""
+        if self.token_limit is not None:
+            return f"sent {self.tokens_in or 0:,} input tokens of {self.token_limit:,}"
+        return f"spent ${self.spent_usd:.2f} of ${self.cap_usd:.2f}"
 
     @property
     def flag_reason(self) -> str:
+        if self.cap == "attempt":
+            return f"{FLAG_ATTEMPT_BUDGET}: {self.detail}"
         return f"{FLAG_SPEND_CAP}: {self.cap} cap ${self.cap_usd:.2f} reached"
 
 
@@ -189,6 +230,9 @@ class Spend:
         tz: tzinfo | str | None = None,
         approval_usd: float | None = None,
         reservation_ttl: timedelta = DEFAULT_RESERVATION_TTL,
+        attempt_budget_usd: float | None = None,
+        attempt_max_input_tokens_cloud: int | None = None,
+        attempt_max_input_tokens_local: int | None = None,
     ) -> None:
         self.store = store
         self.caps = config.spend_caps if isinstance(config, Config) else config
@@ -203,6 +247,12 @@ class Spend:
         self._attempt_ticket: dict[int, int | None] = {}
         self._refusals_by_attempt: dict[int, Refusal] = {}
         self._refusals_by_ticket: dict[int, Refusal] = {}
+        self.attempt_budget_usd = None if attempt_budget_usd is None else float(attempt_budget_usd)
+        self.attempt_max_input_tokens = {
+            "cloud": attempt_max_input_tokens_cloud,
+            "local": attempt_max_input_tokens_local,
+        }
+        self._budget_stops: dict[int, Refusal] = {}
 
     # ------------------------------------------------------------------ windows
 
@@ -321,7 +371,9 @@ class Spend:
         """``ModelProxy(spend_hook=spend.hook)``. ``estimate``: allow (and reserve) or refuse
         before anything is sent. ``actual``: settle the reservation and record the cost."""
         if endpoint.kind != "cloud":
-            return True if phase == "estimate" else None
+            if phase == "estimate":
+                return self._local_estimate(endpoint, context)
+            return None
         bucket = getattr(context, "bucket", "live")
         if phase == "estimate":
             return self._estimate(endpoint, float(cost_usd), context, bucket)
@@ -364,7 +416,11 @@ class Spend:
         with self._lock:
             now = self.now()
             who = self._who(ctx)
-            refusal = self._cap_check(estimate, bucket, now, self._reserved(bucket, now))
+            reserved = self._reserved(bucket, now)
+            stop = self._attempt_check(ep, estimate, ctx, bucket, who, now)
+            if stop is not None:
+                return self._stop(stop, who, ep)
+            refusal = self._cap_check(estimate, bucket, now, reserved)
             granted = False
             if refusal is not None and bucket == "live" and who.attempt_id is not None:
                 refusal, granted = self._try_grant(refusal, who, estimate)
@@ -380,6 +436,65 @@ class Spend:
             res = _Reservation(estimate, now, who.attempt_id if granted else None)
             self._state.reservations.setdefault(key, deque()).append(res)
             return True
+
+    def _local_estimate(self, ep: ModelEndpoint, ctx) -> bool:
+        """A local call: only the attempt's input-token limit can refuse it (#58)."""
+        if self.attempt_max_input_tokens.get(ep.kind) is None:
+            return True
+        bucket = getattr(ctx, "bucket", "live")
+        with self._lock:
+            now = self.now()
+            who = self._who(ctx)
+            stop = self._attempt_check(ep, 0.0, ctx, bucket, who, now)
+            return True if stop is None else self._stop(stop, who, ep)
+
+    def _attempt_check(
+        self, ep: ModelEndpoint, estimate: float, ctx, bucket: str, who: _Who, now: datetime
+    ) -> Refusal | None:
+        """The per-attempt budget (#58) for a writer call, or None when it fits."""
+        if bucket != "live" or who.attempt_id is None or getattr(ctx, "review_id", None):
+            return None
+        token_limit = self.attempt_max_input_tokens.get(ep.kind)
+        budget = self.attempt_budget_usd if ep.kind == "cloud" else None
+        if token_limit is None and budget is None:
+            return None
+        try:
+            att = self.store.get_attempt(who.attempt_id)
+        except NotFoundError:
+            return None
+        reserved = self._attempt_reserved(who.attempt_id)
+        base = Refusal(
+            bucket="live",
+            cap="attempt",
+            cap_usd=budget if budget is not None else 0.0,
+            spent_usd=float(att.cost_usd or 0.0),
+            reserved_usd=reserved,
+            estimate_usd=estimate,
+            resets_at=None,
+            at=now,
+            tokens_in=int(att.tokens_in or 0),
+        )
+        if token_limit is not None and int(att.tokens_in or 0) >= token_limit:
+            return replace(base, token_limit=int(token_limit))
+        if budget is not None and not _fits(base.spent_usd + reserved, estimate, budget):
+            return base
+        return None
+
+    def _attempt_reserved(self, attempt_id: int) -> float:
+        """Unsettled live writer-call reservations of one attempt (keys from ``_key``)."""
+        return sum(
+            r.amount
+            for key, q in self._state.reservations.items()
+            if key[0] == "live" and key[2] == attempt_id and key[3] is None
+            for r in q
+        )
+
+    def _stop(self, stop: Refusal, who: _Who, ep: ModelEndpoint) -> bool:
+        stop = _with_who(stop, who, ep.name)
+        assert who.attempt_id is not None
+        self._budget_stops[who.attempt_id] = stop
+        log.info("spend: refused %s call: attempt %s %s", ep.name, who.attempt_id, stop.detail)
+        return False
 
     def _try_grant(
         self, refusal: Refusal, who: _Who, estimate: float
@@ -441,6 +556,12 @@ class Spend:
         """The last cap refusal of a call in this attempt (in memory; lost on restart)."""
         with self._lock:
             return self._refusals_by_attempt.get(attempt_id)
+
+    def budget_stop(self, attempt_id: int) -> Refusal | None:
+        """#58: the refusal that stopped this attempt at its own budget (cap ``attempt``),
+        or None. In memory; an attempt cut by a restart is superseded anyway."""
+        with self._lock:
+            return self._budget_stops.get(attempt_id)
 
     def refusal_for_ticket(self, ticket_id: int) -> Refusal | None:
         with self._lock:
@@ -583,7 +704,11 @@ def _with_who(refusal: Refusal, who: _Who, model: str | None) -> Refusal:
 
 __all__ = [
     "BUCKETS",
+    "DEFAULT_ATTEMPT_BUDGET_USD",
+    "DEFAULT_ATTEMPT_MAX_INPUT_TOKENS_CLOUD",
+    "DEFAULT_ATTEMPT_MAX_INPUT_TOKENS_LOCAL",
     "DEFAULT_RESERVATION_TTL",
+    "FLAG_ATTEMPT_BUDGET",
     "FLAG_SPEND_CAP",
     "Refusal",
     "Spend",

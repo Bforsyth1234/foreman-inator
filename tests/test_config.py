@@ -272,6 +272,47 @@ api_key_ref = "{cloud_ref}"
 {extra}"""
 
 
+# --------------------------------------------------------------------------- wave 13 keys
+
+
+def test_wave13_keys_default_and_round_trip(foreman_home: Path) -> None:
+    from foreman_inator import spend
+
+    cfg = config.load()
+    assert cfg.attempt_budget_usd == spend.DEFAULT_ATTEMPT_BUDGET_USD == 1.50
+    assert cfg.attempt_max_input_tokens_cloud == spend.DEFAULT_ATTEMPT_MAX_INPUT_TOKENS_CLOUD
+    assert cfg.attempt_max_input_tokens_local == spend.DEFAULT_ATTEMPT_MAX_INPUT_TOKENS_LOCAL
+    assert cfg.retention_days == 90 and cfg.install_refill_cache is True
+    _write(
+        foreman_home,
+        "attempt_budget_usd = 3\nattempt_max_input_tokens_cloud = 10\n"
+        "attempt_max_input_tokens_local = 20\nretention_days = 30\n"
+        "install_refill_cache = false\n",
+    )
+    cfg = config.load()
+    assert (cfg.attempt_budget_usd, cfg.retention_days) == (3.0, 30.0)
+    assert (cfg.attempt_max_input_tokens_cloud, cfg.attempt_max_input_tokens_local) == (10, 20)
+    assert cfg.install_refill_cache is False
+    config.save(cfg)
+    assert config.load() == cfg
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "retention_days = 0.5",
+        "attempt_budget_usd = 0",
+        "attempt_max_input_tokens_cloud = 0",
+        "attempt_max_input_tokens_local = 1.5",
+        "install_refill_cache = 1",
+    ],
+)
+def test_wave13_keys_are_validated(foreman_home: Path, line: str) -> None:
+    _write(foreman_home, line + "\n")
+    with pytest.raises(ConfigError):
+        config.load()
+
+
 # --------------------------------------------------------------------------- writer timeout
 
 

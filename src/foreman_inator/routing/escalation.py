@@ -36,6 +36,9 @@ an ``explore`` attempt failed       move straight to the routed tier, with no   
 (checks or any kickback)            same-tier retry (``explore_failed``)
 "move up" from the last rung        hand to the user; ``mark_ready`` when the   —
                                     last change passed its checks
+checks failed with ``end_reason``   hand to the user (``attempt_budget``), no   —
+``budget`` (#58)                    retry on this or any tier: another attempt
+                                    would spend the same again
 ==================================  ==========================================  =========
 
 A *segment* is the part of a stint after its last kickback, so a kickback-triggered
@@ -91,6 +94,8 @@ FLAG_KICKBACK_WRONG = "kickback_wrong"
 FLAG_AI_KICKBACK_CAP = "ai_kickback_cap"
 FLAG_EXPLORE_FAILED = "explore_failed"
 FLAG_NO_MODEL = "no_model"
+#: #58: the last attempt reached its per-attempt budget (``spend.FLAG_ATTEMPT_BUDGET``).
+FLAG_ATTEMPT_BUDGET = "attempt_budget"
 
 
 def attempt_bound(rungs: int) -> int:
@@ -206,6 +211,13 @@ def next_step(history: History | Sequence[Attempt], ladder: Sequence[Rung]) -> S
                 f"{FLAG_INTERRUPTED}: {cut} attempts were cut short by a crash or shutdown"
             )
         return Retry(last.trigger, here.tier, "re-run after an interrupted attempt", here.model)
+
+    if last.outcome == "failed_checks" and getattr(last, "end_reason", None) == "budget":
+        what = getattr(last, "end_detail", None) or "reached its per-attempt budget"
+        return HandToUser(
+            f"{FLAG_ATTEMPT_BUDGET}: {what} on {_name(here)}; stopped at the per-attempt "
+            "budget, not retried on any tier; over to you"
+        )
 
     stint = _stint([a for a in attempts if a.outcome != "superseded"], idx, rungs)
     kicks = _kicks_by_attempt(h)
@@ -381,6 +393,7 @@ def _up(
 
 __all__ = [
     "FLAG_AI_KICKBACK_CAP",
+    "FLAG_ATTEMPT_BUDGET",
     "FLAG_CHECKS_FAILED",
     "FLAG_EXPLORE_FAILED",
     "FLAG_INTERRUPTED",

@@ -39,6 +39,11 @@ as `"keychain:foreman-inator/<name>"`.
 | `failure_labels` | `true` | After each kickback, label the failure step with a local model, in the background. |
 | `failure_label_timeout_seconds` | `30` | Time limit for one labeling call. Above 0, at most 600. |
 | `allow_cloud_labeler` | `false` | Allow a cloud model as the failure labeler (by default it is the first local model). |
+| `install_refill_cache` | `true` | When an install after a model edit (offline) misses the empty package cache and the dependency files are unchanged from the base commit, fill the cache once from a scratch checkout of the base commit (with network) and retry offline. `false`: flag the ticket instead. |
+| `attempt_budget_usd` | `1.50` | Cloud spend one attempt may use. Over it, the attempt ends and the ticket is handed to you (`attempt_budget`), with no retry on any tier. Above 0. |
+| `attempt_max_input_tokens_cloud` | `1500000` | Input tokens one attempt may send to cloud models, with the same effect. At least 1. |
+| `attempt_max_input_tokens_local` | `4000000` | Input tokens one attempt may send to local models, with the same effect. At least 1. |
+| `retention_days` | `90` | Days `fman prune` and the worker's daily prune keep an unmerged ticket's recordings and traces and ended attempts' scratch. At least 1. |
 
 ## `[spend_caps]`
 

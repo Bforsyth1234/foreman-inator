@@ -35,7 +35,7 @@ from typing import Any
 from foreman_inator import tracing
 from foreman_inator.db.store import Attempt, Review, Ticket
 from foreman_inator.github.app_auth import GitHubNotFound
-from foreman_inator.locks import predict_files
+from foreman_inator.locks import DORMANT_FLAGS, flag_kind, predict_files
 from foreman_inator.pr.summary import post_summary
 from foreman_inator.routing import Override
 from foreman_inator.routing import escalation as esc
@@ -321,7 +321,12 @@ class ActionHandlers:
         t = ctx.ticket
 
         def post() -> None:
-            res = post_summary(self.api, self.store, t.id)
+            res = post_summary(
+                self.api,
+                self.store,
+                t.id,
+                attempt_budget_usd=getattr(self.config, "attempt_budget_usd", None),
+            )
             if res.posted:
                 log.info("ticket %d: summary comment posted", t.id)
 
@@ -413,6 +418,10 @@ _FLAG_TEXT = {
         "restarts), so foreman-inator stopped working on it."
     ),
     FLAG_PUBLISH_FAILED: "foreman-inator could not open or update the pull request.",
+    esc.FLAG_ATTEMPT_BUDGET: (
+        "An attempt reached its per-attempt spend or token budget (`attempt_budget_usd`), "
+        "so foreman-inator stopped and handed this issue to you instead of retrying."
+    ),
     FLAG_REVIEWER_HANDOVER: (
         "The AI reviewer could not reach a verdict, so the change goes to you without one."
     ),
@@ -481,6 +490,11 @@ def flag_comment(ticket: Ticket, reason: str, *, pr_number: int | None = None) -
             "To start over, remove the `agent` label and add it again. Nothing else will "
             "run on this issue until then.",
         ]
+        if ticket.pr_number is None and flag_kind(reason) in DORMANT_FLAGS:
+            lines.append(  # #55: a dormant ticket's file locks are released
+                "While it waits, its file locks are released so other issues can change the "
+                "same files; it takes them again when it starts over."
+            )
     return "\n".join(lines)
 
 

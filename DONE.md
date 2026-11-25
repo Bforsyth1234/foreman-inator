@@ -515,3 +515,15 @@ Live evidence: the reviewer's call to `claude-opus-5-5` through Anthropic's Open
 - ✅ Tests: 29 added, none changed or removed. The reviewer path through the real proxy with a fake upstream that refuses `temperature` now gets a verdict with exactly one resend, and the second review makes one request. Non-vacuity: with the resend disabled 11 tests fail; resending on any 400 fails the 7 pass-through cases; removing the scrub fails the key-echo test. Suite: 1,295 passed, 1 skipped (three runs).
 Deviations: our callers keep `temperature: 0` (repeatable verdicts and labels on local models) and rely on the fallback. If a provider echoes our key in an error body, the client's copy has it replaced with `[redacted]`. Known limits: a refusal worded in a way the matcher does not recognise still passes through (the note then shows the provider's text); learned pairs are in memory, so each worker restart pays one extra round trip per pair.
 Live (user): run a ticket through AI review with the Claude reviewer and confirm a real verdict.
+
+## Wave 13 — budgets, prune, cache refill, dormant locks (2026-11-25, branch `wave-13`)
+
+GitHub issues #50, #51, #55, #56, #57, #58 (no todo ids) were built in the same wave: #50 no FLAGGED line on closed tickets; #55 dormant flagged tickets release their file locks; #51 setup and the kNN router name a missing embedding model and its `ollama pull`; #57 an offline install that misses an empty cache refills it from the base commit (`install_refill_cache`); #58 per-attempt spend and input-token budget (`attempt_budget_usd`, `attempt_max_input_tokens_cloud/_local`, migration 007 `attempts.end_reason/end_detail`), handed to the user with no retry; #56 `fman prune` and a daily prune in the worker (`retention_days`).
+
+#58 — Poll Ollama for loaded models [x] · GitHub #35
+- ✅ New `resources/ollama.py`: `loaded_models(host, transport=)` reads `GET /api/ps` into `LoadedModel(name, size, size_vram, expires_at)`, or `Unreachable(reason)` when Ollama cannot be reached or answers badly, so "nothing loaded" and "can't tell" differ. `OllamaWatch(host, ttl)` caches the answer; `is_loaded(model)`. Host via `setup.deps.ollama_host`.
+- ✅ Rule 12: shape checked against https://docs.ollama.com/api/ps on 2026-11-25; parsing is behind `_parse`.
+- ✅ Tests: `tests/test_resources_ollama.py` (fake transport).
+Not yet read by `fman status` or the metrics page (#60 does that).
+
+Runner at close: config keys and docs for all five new settings; `Spend` gets the per-attempt limits in `worker_run`; `post_summary` gets the budget; export keeps `end_reason`/`end_detail`; `fman status` shows an attempt's spend against the budget; `PruneSteps` mixed into `Worker`, `maybe_prune()` in `poll_and_handle` once `recover()` has run; `fman prune [--dry-run] [--days N]`; `test_install.py` now expects the refill (offline in the edited worktree, network only in the base scratch) with an `install_refill_cache = false` variant for the old flag; the hand-over comment of a dormant flag says its file locks are released.

@@ -479,15 +479,44 @@ def test_verify_and_writer_have_no_network_and_cannot_write_the_shared_cache(tmp
 @macos
 @needs_uv
 @pytest.mark.timeout(300)
-def test_after_a_model_edit_the_install_is_offline(tmp_path, index, fake_setup):
+def test_after_a_model_edit_the_install_is_offline(tmp_path, index, fake_setup, monkeypatch):
     """Attempt 2 builds on attempt 1's branch (a model edit): no network for its install.
-    With a cold cache (a repo never installed) it fails even though the index is up."""
+    With a cold cache (a repo never installed) the offline install misses the cache, so
+    the cache is filled from a scratch checkout of the base commit (#57, network only
+    there) and the install in the edited worktree is retried, still offline."""
+    runs: list[tuple[Path, str]] = []
+    real = install.run
+
+    def spy(command, worktree, **kw):
+        runs.append((Path(worktree).resolve(), kw["network"]))
+        return real(command, worktree, **kw)
+
+    monkeypatch.setattr(install, "run", spy)
     att = _Repo(tmp_path, "python_uv_dep", index, repo="o/cold")
     (att.wt.path / "model.txt").write_text("written by a model\n")
     att._git("add", "-A", cwd=att.wt.path)
     att._git("commit", "-qm", "attempt 1", cwd=att.wt.path)
     wt2 = att.attempt(start_point=f"refs/heads/{att.wt.branch}")
     w = FakeWorker(tmp_path)
+    res = w.install_dependencies(_Ticket("o/cold"), 2, wt2)
+    assert res is not None and res.network == "none"
+    edited = wt2.path.resolve()
+    assert [n for p, n in runs if p == edited] == ["none", "none"]  # every run offline
+    networked = [p for p, n in runs if n != "none"]
+    assert networked and edited not in networked  # network only in the base scratch
+
+
+@macos
+@needs_uv
+@pytest.mark.timeout(300)
+def test_after_a_model_edit_without_refill_a_cold_cache_is_flagged(tmp_path, index, fake_setup):
+    """install_refill_cache = false: the old outcome, flagged without reaching the index."""
+    att = _Repo(tmp_path, "python_uv_dep", index, repo="o/cold")
+    (att.wt.path / "model.txt").write_text("written by a model\n")
+    att._git("add", "-A", cwd=att.wt.path)
+    att._git("commit", "-qm", "attempt 1", cwd=att.wt.path)
+    wt2 = att.attempt(start_point=f"refs/heads/{att.wt.branch}")
+    w = FakeWorker(tmp_path, install_refill_cache=False)
     hits = index.hits
     with pytest.raises(_SetupFailed) as err:
         w.install_dependencies(_Ticket("o/cold"), 2, wt2)

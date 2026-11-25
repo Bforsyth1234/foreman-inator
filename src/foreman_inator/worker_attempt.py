@@ -23,9 +23,12 @@ Attempt (``attempt_job``), in order:
    worker's own commit, the diff, ``_launch_verify`` (sandboxed) inside ``verify_span``;
    a rebase attempt whose conflicted files still hold markers fails its checks without
    running verify;
-8. a spend refusal during the run → the attempt is set aside (uncounted) and the ticket
-   pauses; otherwise the attempt's diff widens its file locks (#19), and if another
-   ticket holds one of those files the attempt waits before publishing;
+8. a writer call refused at the attempt's own budget (#58, ``Spend.budget_stop``) on an
+   attempt that failed → the attempt records ``end_reason = 'budget'`` and goes on as
+   failed checks, so escalation hands the ticket over; a spend-cap refusal during the
+   run → the attempt is set aside (uncounted) and the ticket pauses; otherwise the
+   attempt's diff widens its file locks (#19), and if another ticket holds one of those
+   files the attempt waits before publishing;
 9. ``ChecksFailed`` → escalation on the next pass (a rebase attempt: another rebase or
    the flag), or publish → CI gate → AI review.
 
@@ -41,6 +44,7 @@ from __future__ import annotations
 import logging
 import threading
 from collections.abc import Sequence
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -299,7 +303,16 @@ class AttemptSteps:
         cancel: threading.Event,
     ) -> bool:
         """False when the attempt was set aside or paused (spend, lock yield)."""
-        refusal = self.spend_refusal(att.id)  # type: ignore[attr-defined]
+        stop = _budget_stop(self.spend, att.id) if not passed else None
+        if stop is not None:
+            # #58: the attempt reached its own budget. Not a pause (nobody is asked) and
+            # not a plain check failure: it keeps ``failed_checks`` (the outcome set has
+            # no "budget") and records why; escalation then hands the ticket over.
+            row = self.store.get_attempt(att.id)  # the final totals, not the refused call's
+            detail = replace(stop, spent_usd=row.cost_usd, tokens_in=row.tokens_in).detail
+            self.store.set_attempt_end_reason(att.id, "budget", detail)
+            log.info("ticket %d: attempt %d stopped at its budget (%s)", ticket.id, att.id, detail)
+        refusal = None if stop is not None else self.spend_refusal(att.id)  # type: ignore[attr-defined]
         if refusal is not None:
             self.set_aside(ticket, att, "a cloud call was refused at the spend cap")  # type: ignore[attr-defined]
             self.pause_for_spend(ticket, refusal)  # type: ignore[attr-defined]
@@ -550,6 +563,12 @@ def leftover_markers(root: Path, files: Sequence[str]) -> list[str]:
         if any(ln.startswith(("<<<<<<<", ">>>>>>>")) for ln in text.splitlines()):
             left.append(name)
     return left
+
+
+def _budget_stop(spend: Any, attempt_id: int) -> Any:
+    """``Spend.budget_stop`` (#58); None for a spend stand-in without it."""
+    fn = getattr(spend, "budget_stop", None)
+    return fn(attempt_id) if fn is not None else None
 
 
 def _write(path: Path, text: str) -> None:

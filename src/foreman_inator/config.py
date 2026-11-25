@@ -24,6 +24,9 @@ Layout (every key optional; missing keys take the defaults below)::
     knn_threshold = 50   # accepted tickets before the kNN start rule replaces the rules
     explore_rate = 0.10  # share of tickets started one tier lower (#23)
     failure_labels = true  # label every kickback's failure step (#27), local model
+    attempt_budget_usd = 1.50   # one attempt's cloud spend; over it the ticket is handed over (#58)
+    retention_days = 90  # `fman prune` and the worker's daily prune keep this long (#56)
+    install_refill_cache = true  # refill an empty install cache from the base commit (#57)
 
     [experiments]        # replays (#25) and the shadow reviewer (#26), wave 9 (#29)
     run_budget_usd = 2.0
@@ -77,6 +80,12 @@ MAX_PARALLEL_PER_REPO = 16
 SANDBOX_MODES = ("on", "off")
 SANDBOX_NETWORKS = ("none", "allow")
 SANDBOX_INSTALLS = ("on", "off")
+#: #58 per-attempt limits (``spend.Spend`` re-exports them as ``DEFAULT_ATTEMPT_*``).
+DEFAULT_ATTEMPT_BUDGET_USD = 1.50
+DEFAULT_ATTEMPT_MAX_INPUT_TOKENS_CLOUD = 1_500_000
+DEFAULT_ATTEMPT_MAX_INPUT_TOKENS_LOCAL = 4_000_000
+#: #56: days an unmerged ticket's recordings, traces and stale scratch are kept.
+DEFAULT_RETENTION_DAYS = 90.0
 
 Kind = Literal["local", "cloud"]
 
@@ -275,6 +284,19 @@ class Config:
     sandbox_install: tuple[tuple[str, str], ...] = ()
     #: #45: bound on one dependency install (the step fails, and the ticket is flagged).
     install_timeout_seconds: float = 900.0
+    #: #57: when an offline install (after a model edit) misses the package cache and the
+    #: lockfiles are unchanged from the base commit, fill the cache once from a scratch
+    #: checkout of the base commit (with network) and retry offline. False flags instead.
+    install_refill_cache: bool = True
+    #: #58: one attempt may spend at most this on cloud models, and send at most the
+    #: token limits below (by the endpoint's kind). Over either, the attempt ends with
+    #: ``end_reason = 'budget'`` and the ticket is handed to the user (no retry).
+    attempt_budget_usd: float = DEFAULT_ATTEMPT_BUDGET_USD
+    attempt_max_input_tokens_cloud: int = DEFAULT_ATTEMPT_MAX_INPUT_TOKENS_CLOUD
+    attempt_max_input_tokens_local: int = DEFAULT_ATTEMPT_MAX_INPUT_TOKENS_LOCAL
+    #: #56: `fman prune` and the worker's daily prune remove an unmerged ticket's
+    #: recordings and traces, and ended attempts' scratch, older than this many days.
+    retention_days: float = DEFAULT_RETENTION_DAYS
     #: Bound on one writer session (OpenCode). A large repo on local models can need more
     #: than the old fixed 20 minutes just to read its way in (live run 2026-11-24).
     writer_timeout_seconds: float = 1200.0
@@ -397,6 +419,13 @@ def _validate(cfg: Config) -> None:
             )
     if not 0 < cfg.install_timeout_seconds <= 24 * 3600:
         raise ConfigError("install_timeout_seconds must be > 0 and <= 86400")
+    if not cfg.attempt_budget_usd > 0:
+        raise ConfigError("attempt_budget_usd must be > 0")
+    for key in ("attempt_max_input_tokens_cloud", "attempt_max_input_tokens_local"):
+        if getattr(cfg, key) < 1:
+            raise ConfigError(f"{key} must be at least 1")
+    if not cfg.retention_days >= 1:
+        raise ConfigError("retention_days must be at least 1")
     if not 0 < cfg.writer_timeout_seconds <= 24 * 3600:
         raise ConfigError("writer_timeout_seconds must be > 0 and <= 86400")
     _validate_learning(cfg)
@@ -578,6 +607,16 @@ def from_dict(data: Mapping[str, Any]) -> Config:
         kw["sandbox"] = _typed(data["sandbox"], str, "sandbox")
     if "clarify" in data:
         kw["clarify"] = _typed(data["clarify"], bool, "clarify")
+    if "install_refill_cache" in data:
+        kw["install_refill_cache"] = _typed(
+            data["install_refill_cache"], bool, "install_refill_cache"
+        )
+    for key in ("attempt_budget_usd", "retention_days"):
+        if key in data:
+            kw[key] = float(_typed(data[key], (int, float), key))
+    for key in ("attempt_max_input_tokens_cloud", "attempt_max_input_tokens_local"):
+        if key in data:
+            kw[key] = _typed(data[key], int, key)
     for table in ("sandbox_network", "sandbox_install"):
         if table in data:
             raw = _typed(data[table], dict, table)
@@ -660,6 +699,11 @@ def to_dict(cfg: Config) -> dict[str, Any]:
     if cfg.sandbox_install:
         out["sandbox_install"] = dict(cfg.sandbox_install)
     out["install_timeout_seconds"] = cfg.install_timeout_seconds
+    out["install_refill_cache"] = cfg.install_refill_cache
+    out["attempt_budget_usd"] = cfg.attempt_budget_usd
+    out["attempt_max_input_tokens_cloud"] = cfg.attempt_max_input_tokens_cloud
+    out["attempt_max_input_tokens_local"] = cfg.attempt_max_input_tokens_local
+    out["retention_days"] = cfg.retention_days
     out["writer_timeout_seconds"] = cfg.writer_timeout_seconds
     for key in _LEARNING_TYPES:
         if getattr(cfg, key) is not None:

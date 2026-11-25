@@ -475,7 +475,8 @@ def rebase_uncounted(attempts: Sequence[AttemptLike]) -> frozenset[int]:
     """Attempts escalation must not see because of rebases (todo #43 decision 3): every
     rebase attempt that failed its checks or was interrupted, and the attempt a rebase
     replaced on the PR (the latest non-rebase attempt before each rebase attempt). A
-    rebase attempt that passed carries the writer's change on and counts as usual."""
+    rebase attempt that passed carries the writer's change on and counts as usual; so
+    does one stopped at its per-attempt budget (#58), so escalation hands it over."""
     out: set[int] = set()
     last_writer: int | None = None
     for a in attempts:
@@ -484,6 +485,8 @@ def rebase_uncounted(attempts: Sequence[AttemptLike]) -> frozenset[int]:
             continue
         if last_writer is not None:
             out.add(last_writer)
+        if getattr(a, "end_reason", None) == "budget":
+            continue
         if a.outcome in ("failed_checks", "superseded"):
             out.add(a.id)
     return frozenset(out)

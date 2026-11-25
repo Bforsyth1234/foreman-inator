@@ -68,6 +68,18 @@ plant a modified package in its own repo's cache, which later attempts and revie
 repo would install (and, for example, make its tests look green). It cannot reach another
 repo or the user's own tools. Deleting ``~/.foreman-inator/cache/<owner>/<name>`` resets it.
 
+Refilling an empty cache (#57)
+------------------------------
+An offline install (after a model edit) fails when the repo's cache lacks a package: a
+ticket that predates the install step, or a cache the user deleted (uv: "the requested
+data wasn't found in the cache"; npm, with ``npm_config_offline``: ``ENOTCACHED``). Then
+the worker checks the dependency files (``dependency_files_changed``): unchanged from the
+base commit, it fills the cache from a scratch worktree detached at the base commit
+(``refill_cache``: the same networked policy as a first attempt, and only after
+``is_base`` confirms the scratch holds exactly the base's files) and retries the offline
+install in the real worktree once. Changed (the model edited a lockfile), it does not:
+new dependencies need the user. Model-edited code never gets the network either way.
+
 Marker: a worktree that was installed gets ``<git dir>/fman-installed`` (the private git
 dir; never in the tree, never writable from the sandbox), so the reviewer's checks
 (``verify.run`` with ``Policy.install`` set) install each scratch worktree once and the
@@ -374,6 +386,92 @@ def cache_env(cache: Path) -> dict[str, str]:
     return {var: str(cache / sub) for var, sub in sandbox_mod.CACHE_VARS.items()}
 
 
+# --------------------------------------------------------------------------- refill (#57)
+
+#: Root files whose change means the model asked for different dependencies.
+LOCKFILES: tuple[str, ...] = (
+    "uv.lock", "poetry.lock", "package-lock.json", "npm-shrinkwrap.json", "pnpm-lock.yaml",
+    "yarn.lock", "Package.resolved",
+)  # fmt: skip
+
+#: An offline install that failed because the cache lacks a package: uv's offline error
+#: (seen live, 2026-11-24: "Network connectivity is disabled, but the requested data
+#: wasn't found in the cache") and npm's offline cache-miss code ``ENOTCACHED``.
+_CACHE_MISS = re.compile(r"wasn't found in the cache|\bENOTCACHED\b")
+
+
+def is_cache_miss(text: str) -> bool:
+    """True when an install's output shows an offline cache miss."""
+    return bool(_CACHE_MISS.search(text or ""))
+
+
+def failure_text(exc: InstallFailed) -> str:
+    """The whole log of a failed install when readable, else its tail."""
+    if exc.log_path is not None:
+        try:
+            return Path(exc.log_path).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            pass
+    return exc.detail
+
+
+def dependency_files(command: InstallCommand) -> tuple[str, ...]:
+    """The files that pin ``command``'s dependencies (``package.json`` too when npm runs
+    without a lockfile)."""
+    if "--no-package-lock" in command.display:
+        return (*LOCKFILES, "package.json")
+    return LOCKFILES
+
+
+def dependency_files_changed(
+    worktree: Path | str, base_sha: str | None, files: Sequence[str] = LOCKFILES
+) -> list[str] | None:
+    """The ``files`` that differ from ``base_sha`` in ``worktree`` (tracked or new), ``[]``
+    when none do, None when it cannot tell (no base, git failed): treat as changed."""
+    if not base_sha:
+        return None
+    env = {**os.environ, "GIT_CONFIG_NOSYSTEM": "1"}
+    try:
+        diff = subprocess.run(
+            ["git", "diff", "--name-only", base_sha, "--", *files],
+            cwd=worktree, capture_output=True, text=True, timeout=120, env=env,
+        )  # fmt: skip
+        new = subprocess.run(
+            ["git", "ls-files", "--others", "--exclude-standard", "--", *files],
+            cwd=worktree, capture_output=True, text=True, timeout=120, env=env,
+        )  # fmt: skip
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if diff.returncode != 0 or new.returncode != 0:
+        return None
+    return sorted({*diff.stdout.split(), *new.stdout.split()})
+
+
+def refill_cache(
+    command: InstallCommand,
+    scratch: Path | str,
+    base_sha: str,
+    *,
+    policy: Policy,
+    cache: Path,
+    log_path: Path | str,
+    timeout: float = DEFAULT_TIMEOUT_S,
+    cancel: threading.Event | None = None,
+    ports: Sequence[int] | None = None,
+) -> InstallResult:
+    """Fill ``cache`` by installing ``command`` in ``scratch``, a worktree detached at
+    ``base_sha``, with a first attempt's network (``network_for(base=True)``). Refuses
+    (``InstallFailed``) unless ``scratch`` holds exactly ``base_sha``'s files."""
+    sc = Path(scratch)
+    if not is_base(sc, base_sha):
+        raise InstallFailed(
+            f"cache refill refused: {sc} is not exactly the base commit {base_sha[:12]}", ""
+        )
+    network = network_for(policy, base=True)
+    return run(command, sc, policy=policy, network=network, cache=cache, log_path=log_path,
+               timeout=timeout, cancel=cancel, ports=ports)  # fmt: skip
+
+
 # --------------------------------------------------------------------------- running
 
 
@@ -447,14 +545,20 @@ __all__ = [
     "InstallFailed",
     "InstallPlan",
     "InstallResult",
+    "LOCKFILES",
     "cache_root",
+    "dependency_files",
+    "dependency_files_changed",
     "detect",
     "ensure",
     "install_policy",
     "installed",
+    "failure_text",
     "is_base",
+    "is_cache_miss",
     "marker_path",
     "network_for",
+    "refill_cache",
     "run",
     "snapshot",
 ]

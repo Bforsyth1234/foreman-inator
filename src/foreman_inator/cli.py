@@ -2,7 +2,8 @@
 
 Commands: ``setup`` (#8), ``config set-key`` (#2), ``run`` and ``status`` and
 ``repo set-verify`` (#14), ``metrics`` and ``approve-spend`` (#21), ``experiment run |
-status | promote`` and ``replay`` (#29), ``repo add | remove | list`` (#56). Later waves
+status | promote`` and ``replay`` (#29), ``repo add | remove | list`` (#56), ``prune``
+(#56). Later waves
 add ``@app.command()`` functions here.
 
 The callback below keeps `app` a multi-command group, so adding commands
@@ -475,6 +476,47 @@ def export_command(
         f"{n['values_replaced']} values replaced). Read MANIFEST.json before sharing: "
         "sizes, timings, counts and file extensions are still visible."
     )
+
+
+@app.command("prune")
+def prune_command(
+    dry_run: Annotated[
+        bool, typer.Option("--dry-run", help="List what would be deleted; delete nothing.")
+    ] = False,
+    days: Annotated[
+        float | None,
+        typer.Option(
+            "--days", help="Retention in days (default: retention_days, 90).", show_default=False
+        ),
+    ] = None,
+) -> None:
+    """Delete unmerged tickets' recordings and traces, and ended attempts' scratch, older
+    than the retention (#56). The worker runs the same prune once a day."""
+    from foreman_inator import config as config_mod
+    from foreman_inator import paths, prune
+    from foreman_inator.db.store import Store
+
+    if days is not None and days < 1:
+        raise typer.BadParameter("--days must be at least 1")
+    db = paths.db_path()
+    if not db.exists():
+        typer.echo("No tickets yet (the worker has not created its database).")
+        return
+    cfg = config_mod.load()
+    with Store(db, read_only=True) as store:
+        report = prune.run(
+            store,
+            paths.home(),
+            days=days if days is not None else cfg.retention_days,
+            dry_run=dry_run,
+            repos=cfg.repos,
+            recordings_dir=paths.recordings_dir(),
+            traces_dir=paths.traces_dir(),
+        )
+    for line in report.lines():
+        typer.echo(line)
+    if report.errors:
+        raise typer.Exit(1)
 
 
 def _register_setup() -> None:

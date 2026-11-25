@@ -21,6 +21,7 @@ current text. `fman --version` prints the version.
 | [`fman experiment promote`](#fman-experiment-promote) | Make a challenger champion if it won on replay and holds live. |
 | [`fman replay`](#fman-replay) | Check that today's logic still decides a recorded ticket as it did. |
 | [`fman export`](#fman-export) | Export one ticket's trace, recordings and rows for a bug report, redacted. |
+| [`fman prune`](#fman-prune) | Delete old recordings, traces and scratch of unmerged tickets. |
 
 ## `fman setup`
 
@@ -215,3 +216,19 @@ are kept. `--redact` is required: there is no raw mode.
 | `--db <path>` | Database (default: yours; opened read-only). |
 
 Read the export before you attach it anywhere.
+
+## `fman prune`
+
+```bash
+fman prune [--dry-run] [--days <n>]
+```
+
+Delete unmerged tickets' recordings and traces, and ended attempts' scratch
+(sandbox, OpenCode and replay work folders), older than the retention, plus the
+package caches of repos no longer in `config.toml`. Merged tickets' recordings
+are kept. The worker runs the same prune once a day.
+
+| Option | Meaning |
+| --- | --- |
+| `--dry-run` | List what would be deleted; delete nothing. |
+| `--days <n>` | Retention in days. At least 1. Default: `retention_days` (90). |
