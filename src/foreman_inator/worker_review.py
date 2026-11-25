@@ -31,6 +31,14 @@ after a restart (``Worker.recover`` empties the finalized set), which is what ma
 crash between the review row and the comment, or between the comment and marking ready,
 come out right with no second comment.
 
+Repo profiles (#51): the repo's ``review`` mode (``routing.profile.review_plan``) decides
+steps 2-4. ``off`` hands over at step 2 with no review row and no model call, as
+``review:skip`` does (``skip_reason``). ``light`` skips steps 3's pick and runs
+``review_change(depth="light")``: checks 1-3 and a verdict from hard findings alone, no
+model, so no variant is registered and no champion outcome is kept for shadows.
+``strict`` ignores the ``review:skip`` label (its one-kickback escalation is
+``profile.limits_for``'s, applied by the policy). ``normal`` is today's stage.
+
 Hand-over (``hand_over``), always in this order: the PR body's hand-over section, the
 issue comment saying why (once, by marker), marking the PR ready when the change passed
 its checks, and last the ticket's flag. The flag is the "done" mark: a crash before it
@@ -55,6 +63,7 @@ from foreman_inator.github.client import IssueEvent
 from foreman_inator.github.poller import REVIEW_SKIP_LABEL
 from foreman_inator.pr.publisher import Handover, PublishError, pr_head_branch
 from foreman_inator.review import reviewer as rv
+from foreman_inator.routing import profile as prof
 from foreman_inator.runner import sandbox
 from foreman_inator.runner.worktree import WorktreeError
 from foreman_inator.tickets import lifecycle
@@ -121,8 +130,9 @@ class ReviewSteps:
         if not self.ci_gate(t, att):
             log.debug("ticket %d: waiting at the CI gate", t.id)
             return
-        if self.review_skipped(t):
-            self.hand_over(t, _SKIP_REASON, ready=True, attempt=att)
+        reason = self.skip_reason(t)
+        if reason is not None:
+            self.hand_over(t, reason, ready=True, attempt=att)
             return
         self.review_stage(t, att, cancel)
 
@@ -138,20 +148,34 @@ class ReviewSteps:
         if not self.ci_gate(t, att):
             log.info("ticket %d: waiting on GitHub CI before the AI review", t.id)
             return
+        plan = prof.review_plan(self.repo_profile(t))  # type: ignore[attr-defined]
+        if plan.kind == "off":  # #51: e.g. the profile changed after the checks passed
+            self.hand_over(t, review_off_reason(self.repo_profile(t)), ready=True, attempt=att)  # type: ignore[attr-defined]
+            return
         why = self.sandbox_ready(self._mirror(t.repo).repo_dir)  # type: ignore[attr-defined]
         if why is not None:
             self.hand_over(t, f"{FLAG_SANDBOX}: {why}", ready=False, attempt=att)
             return
         writer = self._endpoint_named(att)
-        try:
-            reviewer, prompt_name = self.champion_reviewer(writer)
-        except rv.ReviewError as exc:
-            self.hand_over(t, f"{FLAG_NO_REVIEWER}: {exc}", ready=True, attempt=att)
-            return
+        light = plan.kind == "light"
+        if light:  # #51: no model reads the diff, so no reviewer is picked (7f not in play)
+            reviewer, prompt_name = writer, rv.REVIEWER_PROMPT_NAME
+        else:
+            try:
+                reviewer, prompt_name = self.champion_reviewer(writer)
+            except rv.ReviewError as exc:
+                self.hand_over(t, f"{FLAG_NO_REVIEWER}: {exc}", ready=True, attempt=att)
+                return
         mirror = self._mirror(t.repo)  # type: ignore[attr-defined]
         head = self._head_sha(mirror, t, att)
         settings = self.store.get_repo_settings(t.repo)
-        log.info("ticket %d: AI review of attempt %d by %s", t.id, att.id, reviewer.name)
+        log.info(
+            "ticket %d: %s review of attempt %d by %s",
+            t.id,
+            plan.kind,
+            att.id,
+            rv.LIGHT_REVIEWER_MODEL if light else reviewer.name,
+        )
         with self._trace(t):  # type: ignore[attr-defined]
             outcome = self._launch_review(
                 issue=rv.IssueText(t.issue_number, t.title, t.request),
@@ -167,6 +191,7 @@ class ReviewSteps:
                 recordings_dir=self.recordings_dir,
                 timeout=self.review_timeout or rv.DEFAULT_TIMEOUT_S,
                 cancel=cancel,
+                depth=plan.depth,
             )
         if (cancel is not None and cancel.is_set()) or self.stopping:  # type: ignore[attr-defined]
             log.info("ticket %d: AI review cut short; it runs again", t.id)
@@ -180,18 +205,20 @@ class ReviewSteps:
                 # A base conflict (#43) or a kickback moved it while the review ran.
                 log.info("ticket %d: left testing during the AI review; verdict dropped", t.id)
                 return
-            variants.register(  # #24: every reviews.variant_id has a variants row
-                self.store,
-                "reviewer",
-                outcome.reviewer_model,
-                PromptRef(name=outcome.prompt_name, sha256=outcome.prompt_hash, text=""),
-            )
+            if not light:  # a light review has no variant (no model, no prompt was used)
+                variants.register(  # #24: every reviews.variant_id has a variants row
+                    self.store,
+                    "reviewer",
+                    outcome.reviewer_model,
+                    PromptRef(name=outcome.prompt_name, sha256=outcome.prompt_hash, text=""),
+                )
             outcome = rv.record_outcome(self.store, att.id, outcome)
             if outcome.verdict == "request_changes":
                 self.store.set_attempt_outcome(att.id, "kicked_back")
             self._commit(t.id, AIReviewed(t.id, outcome.verdict))  # type: ignore[arg-type, attr-defined]
         assert outcome.review is not None
-        self.remember_champion(att.id, outcome)  # type: ignore[attr-defined]  # shadow (#26)
+        if not light:
+            self.remember_champion(att.id, outcome)  # type: ignore[attr-defined]  # shadow (#26)
         if outcome.kickback is not None:
             self.queue_label(t.repo, outcome.kickback.id)  # type: ignore[attr-defined]  # #27
         log.info(
@@ -333,10 +360,27 @@ class ReviewSteps:
             return False
         return ci_decided(cur) or not getattr(self.poller, "ci", False)  # type: ignore[attr-defined]
 
+    def skip_reason(self, ticket: Ticket) -> str | None:
+        """#51: why the AI review is skipped for ``ticket`` (the hand-over's flag reason),
+        or None to review. ``review = off`` always skips (no GitHub read); ``strict``
+        ignores the ``review:skip`` label; otherwise an allowed user's label skips."""
+        p = self.repo_profile(ticket)  # type: ignore[attr-defined]
+        plan = prof.review_plan(p)
+        if plan.kind == "off":
+            return review_off_reason(p)
+        if plan.skip_label_counts and self.skip_label_applied(ticket):
+            return _SKIP_REASON
+        return None
+
     def review_skipped(self, ticket: Ticket) -> bool:
+        """Is the review skipped for ``ticket`` (``skip_reason``)? The repo profile's
+        ``review`` mode decides first (#51), then the ``review:skip`` label."""
+        return self.skip_reason(ticket) is not None
+
+    def skip_label_applied(self, ticket: Ticket) -> bool:
         """Is the ``review:skip`` label on the issue, applied by an allowed user (7b)?
         Read from GitHub when it matters, so a label added after the ticket was created
-        counts too. (#51's ``review = off|strict`` profiles decide here as well.)"""
+        counts too."""
         issue = self.api.get_issue(ticket.repo, ticket.issue_number)
         if REVIEW_SKIP_LABEL not in {lb.lower() for lb in issue.labels}:
             return False
@@ -399,6 +443,12 @@ def _applied(events: Iterable[IssueEvent], label: str) -> IssueEvent | None:
 
 _SKIP_REASON = f"{FLAG_REVIEW_SKIPPED}: the review:skip label was applied by an allowed user"
 
+
+def review_off_reason(p: prof.Profile) -> str:
+    """#51: the hand-over reason when the repo profile turns the review off."""
+    return f"{FLAG_REVIEW_SKIPPED}: review is off in this repo's profile, {prof.describe(p)}"
+
+
 _YES_NO = {True: "passed", False: "failed", None: "unknown"}
 
 
@@ -424,4 +474,4 @@ def comment_from_row(review: Review) -> str:
     )
 
 
-__all__ = ["ReviewSteps", "ci_decided", "comment_from_row"]
+__all__ = ["ReviewSteps", "ci_decided", "comment_from_row", "review_off_reason"]

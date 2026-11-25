@@ -103,6 +103,9 @@ EXTRA_COLUMNS: dict[str, list[str]] = {
         # migration 007 (#58)
         "end_reason",
         "end_detail",
+        # migration 008 (#51)
+        "writer_mode",
+        "review_mode",
     ],
     "kickbacks": ["failure_step_index"],
     "reviews": ["created_at", "shadow"],
@@ -112,6 +115,9 @@ EXTRA_COLUMNS: dict[str, list[str]] = {
         "updated_at",
         # migration 006 (#45)
         "install_command",
+        # migration 008 (#51)
+        "writer_mode",
+        "review_mode",
     ],
     "champion_history": ["id", "role", "variant_id", "set_at", "note"],
     "poll_cursors": ["repo", "name", "value", "updated_at"],

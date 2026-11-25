@@ -8,7 +8,8 @@ GitHub CI (#41) says so, and with the config the sandbox line (#40) comes last, 
 when the sandbox is off. Wave 9: the champion lines (#24, including "PROMPT CHANGED ...
 (not promoted)") and the running experiments count. ``set_verify_command`` saves a repo's verify
 command and lifts the "no verify command" flag from that repo's open tickets, so the
-running worker picks them up on its next pass.
+running worker picks them up on its next pass. #51: one ``Profile <repo>: ...`` line per
+repo whose profile is not ``default``, and ``set_profile`` for ``fman repo set-profile``.
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ from foreman_inator.config import Config
 from foreman_inator.db.store import COLUMNS, Attempt, Store, Ticket
 from foreman_inator.experiments import variants
 from foreman_inator.locks import Locks
+from foreman_inator.routing import profile as prof
 from foreman_inator.runner import sandbox
 from foreman_inator.spend import FLAG_SPEND_CAP, Spend
 from foreman_inator.tickets.lifecycle import clarify_cursor
@@ -163,6 +165,7 @@ def render_status(store: Store, *, closed_limit: int = 5, config: Config | None 
     )
     out.append(f"{len(tickets)} ticket(s), {flagged} flagged for you, {waiting} waiting.")
     out.extend(_champion_lines(store))
+    out.extend(profile_lines(store, sorted({t.repo for t in tickets})))
     if config is not None:
         out.append(repos_line(config))
         out.append(Spend(store, config).summary().status_line())
@@ -198,6 +201,44 @@ def _champion_lines(store: Store) -> list[str]:
     return lines
 
 
+def profile_lines(store: Store, repos: Sequence[str]) -> list[str]:
+    """#51: ``Profile me/toy: prototype (writer fast, review off)`` for each repo (of
+    ``repos``, plus every repo with a stored profile) whose profile is not ``default``."""
+    try:
+        stored = [
+            r["repo"]
+            for r in store.query(
+                "SELECT repo FROM repo_settings"
+                " WHERE writer_mode IS NOT NULL OR review_mode IS NOT NULL"
+            )
+        ]
+    except Exception:  # a database from before migration 008
+        return []
+    lines = []
+    for repo in sorted(set(repos) | set(stored)):
+        p = prof.profile_of(store.get_repo_settings(repo))
+        if p != prof.DEFAULT:
+            lines.append(f"Profile {repo}: {prof.describe(p)}")
+    return lines
+
+
+def set_profile(
+    store: Store,
+    repo: str,
+    preset: str | None = None,
+    *,
+    writer: str | None = None,
+    review: str | None = None,
+) -> prof.Profile:
+    """``fman repo set-profile <repo> [<preset>] [--writer W] [--review R]``: save the
+    repo's profile and return it. ``ProfileError`` (an unknown preset or mode) names the
+    valid ones; nothing is saved then. Takes effect on the worker's next decision."""
+    current = prof.profile_of(store.get_repo_settings(repo))
+    p = prof.resolve(preset, writer=writer, review=review, current=current)
+    store.set_profile(repo, p.writer, p.review)
+    return p
+
+
 def set_verify_command(store: Store, repo: str, command: str | None) -> list[int]:
     """Save ``repo``'s verify command (None clears it) and unflag the open tickets that
     were waiting for one. Returns their ids."""
@@ -212,4 +253,4 @@ def set_verify_command(store: Store, repo: str, command: str | None) -> list[int
     return cleared
 
 
-__all__ = ["render_status", "repos_line", "set_verify_command"]
+__all__ = ["profile_lines", "render_status", "repos_line", "set_profile", "set_verify_command"]

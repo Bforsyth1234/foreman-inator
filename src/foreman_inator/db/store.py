@@ -47,6 +47,11 @@ ExperimentStatus = Literal["running", "promoted", "rejected"]
 SpendBucket = Literal["live", "experiments"]
 #: attempts.end_reason (#58, migration 007): why an attempt ended, beyond its outcome.
 EndReason = Literal["budget", "timeout"]
+#: Repo profile modes (#51, migration 008); NULL in a row means "normal".
+WriterMode = Literal["thrifty", "normal", "fast"]
+ReviewMode = Literal["off", "light", "normal", "strict"]
+WRITER_MODES: tuple[str, ...] = ("thrifty", "normal", "fast")
+REVIEW_MODES: tuple[str, ...] = ("off", "light", "normal", "strict")
 CiStatus = Literal["passed", "failed", "base_red", "no_ci", "timed_out", "no_permission"]
 
 COLUMNS: tuple[str, ...] = ("todo", "in_progress", "testing", "done", "dropped")
@@ -153,6 +158,9 @@ class Attempt:
     # migration 007 (#58): "budget" when the attempt hit its per-attempt limit.
     end_reason: EndReason | None = None
     end_detail: str | None = None
+    # migration 008 (#51): the repo profile the attempt ran under (None: before 008).
+    writer_mode: WriterMode | None = None
+    review_mode: ReviewMode | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -227,6 +235,9 @@ class RepoSettings:
     verify_prompted_at: datetime | None
     updated_at: datetime
     install_command: str | None = None  # migration 006 (#45)
+    # migration 008 (#51): the repo profile; None means "normal".
+    writer_mode: WriterMode | None = None
+    review_mode: ReviewMode | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -715,22 +726,42 @@ class Store:
         worktree: str | None = None,
         branch: str | None = None,
         base_commit: str | None = None,
+        writer_mode: WriterMode | None = None,
+        review_mode: ReviewMode | None = None,
     ) -> Attempt:
-        attempt_id = self._insert(
-            "attempts",
-            {
-                "ticket_id": ticket_id,
-                "model": model,
-                "tier": tier,
-                "trigger": trigger,
-                "variant_id": variant_id,
-                "worktree": worktree,
-                "branch": branch,
-                "base_commit": base_commit,
-                "started_at": self.now(),
-            },
-        )
+        """A new attempt row. ``writer_mode`` / ``review_mode`` (#51) default to the
+        ticket's repo profile at this moment (``normal`` when the repo has none), so every
+        attempt records the modes it ran under."""
+        values: dict[str, Any] = {
+            "ticket_id": ticket_id,
+            "model": model,
+            "tier": tier,
+            "trigger": trigger,
+            "variant_id": variant_id,
+            "worktree": worktree,
+            "branch": branch,
+            "base_commit": base_commit,
+            "started_at": self.now(),
+        }
+        with self.transaction():
+            if self._has_column("attempts", "writer_mode"):  # a store migrated past 008
+                if writer_mode is None or review_mode is None:
+                    row = self._one(
+                        "SELECT r.writer_mode, r.review_mode FROM tickets t"
+                        " LEFT JOIN repo_settings r ON r.repo = t.repo WHERE t.id = ?",
+                        (ticket_id,),
+                    )
+                    writer_mode = writer_mode or (row and row["writer_mode"]) or "normal"
+                    review_mode = review_mode or (row and row["review_mode"]) or "normal"
+                values["writer_mode"] = writer_mode
+                values["review_mode"] = review_mode
+            attempt_id = self._insert("attempts", values)
         return self.get_attempt(attempt_id)
+
+    def _has_column(self, table: str, column: str) -> bool:
+        with self._lock:
+            rows = self._conn.execute(f"PRAGMA table_info({table})").fetchall()
+        return any(r["name"] == column for r in rows)
 
     def get_attempt(self, attempt_id: int) -> Attempt:
         row = self._one("SELECT * FROM attempts WHERE id = ?", (attempt_id,))
@@ -1131,6 +1162,28 @@ class Store:
                 " ON CONFLICT (repo) DO UPDATE SET install_command = excluded.install_command,"
                 " updated_at = excluded.updated_at",
                 (repo, install_command, now),
+            )
+        settings = self.get_repo_settings(repo)
+        assert settings is not None
+        return settings
+
+    def set_profile(
+        self, repo: str, writer_mode: WriterMode | None, review_mode: ReviewMode | None
+    ) -> RepoSettings:
+        """Save ``repo``'s profile (#51). None stores NULL (``normal``). Presets and
+        ``--writer`` / ``--review`` are resolved by ``routing.profile.resolve``."""
+        if writer_mode is not None and writer_mode not in WRITER_MODES:
+            raise ValueError(f"unknown writer mode {writer_mode!r}; valid: {WRITER_MODES}")
+        if review_mode is not None and review_mode not in REVIEW_MODES:
+            raise ValueError(f"unknown review mode {review_mode!r}; valid: {REVIEW_MODES}")
+        now = _ts(self.now())
+        with self.transaction() as conn:
+            conn.execute(
+                "INSERT INTO repo_settings (repo, writer_mode, review_mode, updated_at)"
+                " VALUES (?, ?, ?, ?) ON CONFLICT (repo) DO UPDATE SET"
+                " writer_mode = excluded.writer_mode, review_mode = excluded.review_mode,"
+                " updated_at = excluded.updated_at",
+                (repo, writer_mode, review_mode, now),
             )
         settings = self.get_repo_settings(repo)
         assert settings is not None
