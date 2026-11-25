@@ -79,6 +79,18 @@ and the recorder row's ``raw_content`` (``{"type": "error", "text": ...}``, ``te
 empty). The error body goes to the client unchanged, except that our own API key, should
 the provider echo it, is replaced with ``[redacted]``.
 
+Local inference cap (#34, todo 57): completion calls to ``kind == "local"`` endpoints hold
+one slot of ``LocalSlots`` (``max_local_inference``, default 1) from the moment they are
+sent until the reply (or stream) ends; cloud endpoints and embeddings (short, a
+small model, never a tier) are never limited. One
+``LocalSlots`` may be shared by several proxies (the worker's and an experiment run's), so
+the cap is global to the process. A request waits for its slot after the fail-closed
+checks and preflight; a client that disconnects while queued is dropped without reaching
+the upstream. The wait is the span's ``llm.queue_wait_s`` and is left out of its
+``latency_ms``. ``queue_wait(attempt_id)`` is the attempt's total wait so far, the time
+still being waited included; the OpenCode driver adds it to the writer timeout, so time in
+the queue never counts against an attempt. ``local_slots()`` is ``(in use, cap)``.
+
 Running: `start()` runs uvicorn on a background thread, bound to 127.0.0.1 (port 0 picks a
 free port; `url` says which); `stop()` shuts it down. `proxy.app` is a plain ASGI app, so
 tests can drive it with ``httpx.ASGITransport`` and no socket. Upstreams are reached with
@@ -98,6 +110,7 @@ import secrets
 import socket
 import threading
 import time
+from collections import deque
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field, replace
@@ -124,6 +137,71 @@ Phase = Literal["estimate", "actual"]
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_MAX_OUT = 4096
 UPSTREAM_PATHS = {"chat/completions", "completions", "embeddings"}
+DEFAULT_MAX_LOCAL_INFERENCE = 1  # config `max_local_inference`: one local GPU
+DISCONNECT_POLL_S = 0.25  # while queued for a local slot, how often to check the client
+
+
+class LocalSlots:
+    """A process-wide cap on concurrent local-model calls (#34). First come, first served.
+
+    Not bound to one event loop (``asyncio.Semaphore`` is): the proxy serves on its own
+    thread's loop, and one instance may be shared by several proxies, each on its own loop.
+    A released slot is handed straight to the oldest waiter."""
+
+    def __init__(self, cap: int = DEFAULT_MAX_LOCAL_INFERENCE):
+        if int(cap) < 1:
+            raise ValueError("max_local_inference must be at least 1")
+        self.cap = int(cap)
+        self._lock = threading.Lock()
+        self._in_use = 0
+        self._waiters: deque[tuple[asyncio.AbstractEventLoop, asyncio.Future[None]]] = deque()
+
+    @property
+    def in_use(self) -> int:
+        with self._lock:
+            return self._in_use
+
+    @property
+    def waiting(self) -> int:
+        with self._lock:
+            return len(self._waiters)
+
+    async def acquire(self) -> None:
+        loop = asyncio.get_running_loop()
+        with self._lock:
+            if self._in_use < self.cap and not self._waiters:
+                self._in_use += 1
+                return
+            fut: asyncio.Future[None] = loop.create_future()
+            waiter = (loop, fut)
+            self._waiters.append(waiter)
+        try:
+            await fut
+        except BaseException:
+            with self._lock:
+                try:
+                    self._waiters.remove(waiter)
+                    granted = False
+                except ValueError:  # release() already handed us the slot
+                    granted = True
+            if granted:
+                self.release()
+            raise
+
+    def release(self) -> None:
+        with self._lock:
+            while self._waiters:
+                loop, fut = self._waiters.popleft()
+                if loop.is_closed():
+                    continue  # its loop is gone; nobody is waiting there
+                loop.call_soon_threadsafe(_grant, fut)
+                return  # the slot moves to that waiter; in_use is unchanged
+            self._in_use -= 1
+
+
+def _grant(fut: asyncio.Future[None]) -> None:
+    if not fut.done():
+        fut.set_result(None)
 
 
 def _is_loopback(host: str) -> bool:
@@ -426,6 +504,8 @@ class ModelProxy:
         host: str = DEFAULT_HOST,
         port: int = 0,
         upstream_timeout: float = 600.0,
+        max_local_inference: int = DEFAULT_MAX_LOCAL_INFERENCE,
+        local_slots: LocalSlots | None = None,
     ):
         models = config.models if isinstance(config, Config) else tuple(config)
         self.models: dict[str, ModelEndpoint] = {m.name: m for m in models}
@@ -444,11 +524,80 @@ class ModelProxy:
         # (base_url, upstream model id) -> parameters that endpoint refused; process life.
         self._refused: dict[tuple[str, str], set[str]] = {}
         self._refused_lock = threading.Lock()
+        # #34: pass one `local_slots` to every proxy in the process to share the cap.
+        self._slots = local_slots if local_slots is not None else LocalSlots(max_local_inference)
+        self._waits: dict[int, float] = {}  # attempt id -> finished queue waits (s)
+        self._waiting: dict[int, list[float]] = {}  # attempt id -> monotonic starts
+        self._wait_lock = threading.Lock()
         self._client: httpx.AsyncClient | None = None
         self._server: uvicorn.Server | None = None
         self._thread: threading.Thread | None = None
         self._sock: socket.socket | None = None
         self.app = self._build_app()
+
+    # ------------------------------------------------------------------ local slots (#34)
+
+    @property
+    def slots(self) -> LocalSlots:
+        return self._slots
+
+    def local_slots(self) -> tuple[int, int]:
+        """``(in use, cap)`` for local-model calls, process-wide if the slots are shared."""
+        return self._slots.in_use, self._slots.cap
+
+    def queue_wait(self, attempt_id: int) -> float:
+        """Seconds this attempt's writer calls have spent queued for a local slot, the
+        current wait included. Thread-safe; the OpenCode driver's ``extra_time``."""
+        now = time.monotonic()
+        with self._wait_lock:
+            done = self._waits.get(int(attempt_id), 0.0)
+            live = sum(now - t for t in self._waiting.get(int(attempt_id), ()))
+        return done + live
+
+    def forget_queue_wait(self, attempt_id: int) -> None:
+        with self._wait_lock:
+            self._waits.pop(int(attempt_id), None)
+
+    async def _wait_for_slot(self, request: Request, ctx: CallContext) -> tuple[bool, float]:
+        """Queue for a local slot. ``(got it, seconds waited)``; False when the client
+        disconnected first (then no slot is held)."""
+        key = ctx.attempt_id if ctx.counts_toward_attempt else None
+        t0 = time.monotonic()
+        if key is not None:
+            with self._wait_lock:
+                self._waiting.setdefault(key, []).append(t0)
+        acq = asyncio.ensure_future(self._slots.acquire())
+        try:
+            while True:
+                done, _ = await asyncio.wait({acq}, timeout=DISCONNECT_POLL_S)
+                if done:
+                    acq.result()
+                    return True, time.monotonic() - t0
+                if await request.is_disconnected():
+                    await self._abandon(acq)
+                    return False, time.monotonic() - t0
+        except BaseException:
+            await self._abandon(acq)
+            raise
+        finally:
+            if key is not None:
+                waited = time.monotonic() - t0
+                with self._wait_lock:
+                    starts = self._waiting.get(key, [])
+                    with suppress(ValueError):
+                        starts.remove(t0)
+                    if not starts:
+                        self._waiting.pop(key, None)
+                    self._waits[key] = self._waits.get(key, 0.0) + waited
+
+    async def _abandon(self, acq: asyncio.Future[None]) -> None:
+        if not acq.done():
+            acq.cancel()
+        try:
+            await acq
+        except asyncio.CancelledError:
+            return  # never granted (or acquire() gave it back itself)
+        self._slots.release()  # granted before the cancel landed
 
     # ------------------------------------------------------------------ URLs and contexts
 
@@ -646,6 +795,34 @@ class ModelProxy:
             headers["authorization"] = f"Bearer {key}"
         url = ep.base_url.rstrip("/") + "/" + rest
         call = _Call(self, ctx, ep, rest, body, t0_ns)
+        if ep.kind == "local" and rest != "embeddings":
+            got, waited = await self._wait_for_slot(request, ctx)
+            call.queue_wait_s = waited
+            if not got:
+                call.finish(status=499, error="incomplete: client left while queued (local)")
+                return error_response(
+                    499, "client_disconnected", "client left while queued", "api_error"
+                )
+            call.release = self._slots.release
+        try:
+            response = await self._forward(call, ep, url, headers, body, stream, key)
+        except BaseException:
+            call.release_slot()
+            raise
+        if not isinstance(response, _TeeStream):
+            call.release_slot()  # finish() did already; a no-op then
+        return response
+
+    async def _forward(
+        self,
+        call: _Call,
+        ep: ModelEndpoint,
+        url: str,
+        headers: dict[str, str],
+        body: dict[str, Any],
+        stream: bool,
+        key: str | None,
+    ) -> Response | _TeeStream:
         client = self._upstream()
         dropped = [p for p in sorted(self.refused_params(ep)) if p in body]
         resends = 0
@@ -865,6 +1042,17 @@ class _Call:
         self.dropped: tuple[str, ...] = ()  # parameters left out of the upstream request
         self.resends = 0  # extra upstream tries after a refused parameter
         self.error_text: str | None = None  # the provider's error message, scrubbed
+        self.queue_wait_s: float | None = None  # #34: time queued for a local slot
+        self.release: Callable[[], None] | None = None  # gives the local slot back
+
+    def release_slot(self) -> None:
+        """Give the local slot back (once). Safe to call when none is held."""
+        release, self.release = self.release, None
+        if release is not None:
+            try:
+                release()
+            except Exception:  # pragma: no cover - defensive
+                log.exception("proxy: releasing a local slot failed")
 
     def _prompt_view(self) -> Any:
         if self.rest == "embeddings":
@@ -875,6 +1063,7 @@ class _Call:
 
     def finish(self, *, status: int, error: str | None = None, complete: bool = True) -> None:
         """Record everything. Never raises (bookkeeping must not break a response)."""
+        self.release_slot()  # the upstream is done with; let the next local call go
         if self._finished:
             return
         self._finished = True
@@ -885,7 +1074,7 @@ class _Call:
 
     def _finish(self, status: int, error: str | None, complete: bool) -> None:
         end_ns = time.time_ns()
-        latency_ms = (end_ns - self.t0_ns) / 1e6
+        latency_ms = (end_ns - self.t0_ns) / 1e6 - (self.queue_wait_s or 0.0) * 1000
         tee = self.tee
         text = "".join(tee.text)
         usage = tee.usage or {}
@@ -923,6 +1112,9 @@ class _Call:
                     "llm.dropped_params": ",".join(self.dropped) or None,
                     "llm.resends": self.resends or None,
                     "llm.error.message": self.error_text or None,
+                    "llm.queue_wait_s": (
+                        round(self.queue_wait_s, 3) if self.queue_wait_s is not None else None
+                    ),
                 },
             )
 
@@ -1061,6 +1253,8 @@ class _TeeStream:
 __all__ = [
     "CallContext",
     "CallUsage",
+    "DEFAULT_MAX_LOCAL_INFERENCE",
+    "LocalSlots",
     "ModelProxy",
     "SpendHook",
     "error_response",
