@@ -30,6 +30,13 @@ Verdict policy (assistant decision, 2026-11-23):
   review as ``handed_to_user`` with the reason in the note. Scratch worktrees and the temp
   folder are always removed.
 
+Depth (#51, repo profiles). ``depth="full"`` (the default) is everything above.
+``depth="light"`` (``review = light``) runs checks 1-3 only and decides from the hard
+findings alone: a finding -> ``request_changes`` as above, none -> ``approve``. Check 4 and
+check 5 are recorded as skipped spans; no model is called, so the reviewer endpoint is
+not used, the family check (7f) is not in play, and the row's ``reviewer_model`` is
+``LIGHT_REVIEWER_MODEL`` with no variant. Timeouts and errors hand over as above.
+
 Invariant 7f: check 5's input is exactly ``ReviewInput`` (issue title and body, the diff
 bounded with a visible truncation marker, the changed-file list, the checks 1-4
 summaries). ``review_change`` is keyword-only with no ``**kwargs`` and takes no writer
@@ -59,7 +66,7 @@ from importlib import resources
 from pathlib import Path
 from string import Template
 from threading import Event
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 import httpx
 from fde_kit.prompts import PromptRef, load_prompt
@@ -88,6 +95,11 @@ DIFF_BUDGET = 60_000
 CHANGED_FILES_MAX = 200
 NOTE_BUDGET = 1_500
 COMMENT_MARKER = "<!-- foreman-inator:ai-review -->"
+#: #51: ``review_change``'s depth (``routing.profile.ReviewPlan.depth``).
+ReviewDepth = Literal["full", "light"]
+REVIEW_DEPTHS: tuple[str, ...] = ("full", "light")
+#: The ``reviews.reviewer_model`` of a light review: no model read the diff.
+LIGHT_REVIEWER_MODEL = "hard-checks"
 
 _SECTION = re.compile(r"^<!-- section: ([a-z_]+) -->$", re.MULTILINE)
 _provisional = itertools.count(1)
@@ -441,7 +453,12 @@ def render_comment(
         COMMENT_MARKER,
         f"### AI review: {_VERDICT_TITLE.get(verdict, verdict)}",
         "",
-        f"Reviewer `{_safe(reviewer_model)}` (`{_safe(variant_id)}`). foreman-inator records this "
+        (
+            f"Reviewer `{_safe(reviewer_model)}` (`{_safe(variant_id)}`)."
+            if variant_id
+            else f"Reviewer `{_safe(reviewer_model)}` (light review: hard checks only, no model)."
+        )
+        + " foreman-inator records this "
         "verdict itself; the bot cannot approve or request changes on its own pull request.",
         "",
         "| Check | Result |",
@@ -491,8 +508,12 @@ def review_change(
     cancel: Event | None = None,
     clock: Callable[[], float] = time.monotonic,
     precomputed: Precomputed | None = None,
+    depth: ReviewDepth = "full",
 ) -> ReviewOutcome:
     """Review ``change`` against ``issue``. See the module docstring for the policy.
+
+    ``depth`` (#51): ``"full"``, or ``"light"`` for checks 1-3 and a verdict from hard
+    findings alone, with no model call (``reviewer`` is then not used).
 
     ``precomputed`` (#29, the shadow reviewer): results of checks 1-4 already run on this
     exact change (``(tests, coverage, revert, run_app)`` of another review's outcome).
@@ -509,15 +530,22 @@ def review_change(
     model call is costed to (``"experiments"`` for replays and shadow reviews). Raises
     ``FamilyConflict``, and the store's error if the row cannot be written (one non-shadow
     review per attempt)."""
-    check_independent(reviewer, writer)
+    if depth not in REVIEW_DEPTHS:
+        raise ValueError(f"unknown review depth {depth!r}; valid: {', '.join(REVIEW_DEPTHS)}")
+    light = depth == "light"
+    if not light:
+        check_independent(reviewer, writer)
     template = load_reviewer_template(prompt_name)
-    variant_id = f"{reviewer.name}/{template.name}@{template.sha256[:8]}"
+    reviewer_name = LIGHT_REVIEWER_MODEL if light else reviewer.name
+    variant_id = "" if light else f"{reviewer.name}/{template.name}@{template.sha256[:8]}"
     provisional = -next(_provisional)  # span key until the row exists (ids are positive)
     role = "review-shadow" if shadow else "review"
     run = _Run(
         issue=issue,
         change=change,
         reviewer=reviewer,
+        reviewer_name=reviewer_name,
+        light=light,
         template=template,
         variant_id=variant_id,
         proxy=proxy,
@@ -542,7 +570,7 @@ def review_change(
             attempt_id,
             role=role,
             base_commit=change.base_sha,
-            model=reviewer.name,
+            model=reviewer_name,
             variant_id=variant_id,
             head_commit=change.head_sha,
         )
@@ -550,9 +578,10 @@ def review_change(
     outcome: ReviewOutcome | None = None
     try:
         with tracing.review_span(
-            provisional, attempt_id=attempt_id, reviewer_model=reviewer.name, variant_id=variant_id
+            provisional, attempt_id=attempt_id, reviewer_model=reviewer_name, variant_id=variant_id
         ) as rspan:
             rspan.set_attribute("review.shadow", shadow)
+            rspan.set_attribute("review.depth", depth)
             rspan.set_attribute("review.prompt", f"{template.name}@{template.sha256[:12]}")
             try:
                 outcome = run.execute(shadow=shadow)
@@ -582,7 +611,7 @@ def record_outcome(store: Store, attempt_id: int, outcome: ReviewOutcome) -> Rev
         attempt_id,
         reviewer_model=outcome.reviewer_model,
         verdict=outcome.verdict,  # type: ignore[arg-type]
-        variant_id=outcome.variant_id,
+        variant_id=outcome.variant_id or None,
         tests_passed=outcome.tests_passed,
         changed_line_coverage=outcome.changed_line_coverage,
         tests_nonvacuous=outcome.tests_nonvacuous,
@@ -782,6 +811,9 @@ class _Run:
             )
             self.report(s, names[2], self.revert)
 
+        if self.light:  # #51: checks 1-3 only; the verdict from hard findings alone
+            return self._verdict(shadow, diff, changed)
+
         # 4. run the change
         with self.check_span(names[3]) as s:
             self.left(names[3])
@@ -818,9 +850,16 @@ class _Run:
     def _verdict(self, shadow: bool, diff: str, changed: Sequence[str]) -> ReviewOutcome:
         names = tracing.REVIEW_CHECKS
         self.findings = C.hard_findings(self.tests, self.coverage, self.revert, self.run_app)
+        if self.light and self.run_app is None and self.precomputed is None:
+            self.skip(names[3], "light review: checks 1-3 only")
         if self.findings:
             self.skip(names[4], "a hard check failed: " + self.findings[0].check)
             return self.finish_findings(shadow)
+        if self.light:
+            self.skip(names[4], "light review: no model call")
+            return self.finish(
+                "approve", None, "Light review: tests, coverage and revert checks passed.", shadow
+            )
 
         # 5. read the diff against the issue
         with self.check_span(names[4]) as s:
@@ -906,7 +945,7 @@ class _Run:
             verdict=verdict,
             tag=tag,
             note=note,
-            reviewer_model=self.reviewer.name,
+            reviewer_model=self.reviewer_name,
             variant_id=self.variant_id,
             check_lines=rows,
             shadow=shadow,
@@ -925,7 +964,7 @@ class _Run:
             tokens_out=self.tokens_out,
             cost_usd=self.cost,
             model_calls=self.calls,
-            reviewer_model=self.reviewer.name,
+            reviewer_model=self.reviewer_name,
             variant_id=self.variant_id,
             prompt_name=self.template.name,
             prompt_hash=self.template.sha256,

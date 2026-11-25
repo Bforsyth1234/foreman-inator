@@ -36,6 +36,15 @@ Rules as implemented:
   over-cap attempt, or that attempt going past ``approval_usd``, is refused again and
   the worker asks again. Approving twice before one is used is one approval. So every
   dollar past the cap follows a user command, and nothing retries silently.
+* **Thrifty approval** (#51). A repo whose profile has ``writer = thrifty`` makes every
+  cloud writer attempt wait for the user, caps or not: ``writer_gate(ticket_id,
+  approval_required=True)`` returns a Refusal with cap ``thrifty`` (flag reason
+  ``spend_cap: thrifty ...``), and the worker pauses and asks exactly as at a cap. The
+  same ``fman approve-spend`` grants one attempt: when the caps have headroom the gate
+  consumes the approval itself (so the next cloud attempt asks again); when a cap is also
+  reached it leaves the approval for the cap path above, which consumes it on the
+  attempt's first over-cap call, so one approval still covers one attempt. A
+  ``thrifty`` pause resumes only on an approval, never because the caps cleared.
 * **Resume.** A paused ticket can resume when it has an open approval, or when the live
   caps have headroom again (a new local day or month, or a raised cap):
   ``resume_reason``.
@@ -76,7 +85,7 @@ from foreman_inator.db.store import NotFoundError, SpendApproval, SpendEntry, St
 log = logging.getLogger(__name__)
 
 Bucket = Literal["live", "experiments"]
-CapName = Literal["daily", "monthly", "experiments_monthly", "approval", "attempt"]
+CapName = Literal["daily", "monthly", "experiments_monthly", "approval", "attempt", "thrifty"]
 BUCKETS: tuple[Bucket, ...] = ("live", "experiments")
 
 #: Flag reason for a ticket paused at the cap (``store.flag_ticket(id, f"{FLAG_SPEND_CAP}: ...")``).
@@ -85,6 +94,9 @@ FLAG_SPEND_CAP = "spend_cap"
 DEFAULT_RESERVATION_TTL = timedelta(minutes=15)
 #: Flag reason prefix for a ticket handed over after an attempt reached its budget (#58).
 FLAG_ATTEMPT_BUDGET = "attempt_budget"
+#: #51: the flag reason of a ticket paused by the ``thrifty`` writer mode (a spend_cap
+#: pause, so the status and resume paths treat it like one).
+FLAG_THRIFTY = f"{FLAG_SPEND_CAP}: thrifty profile"
 #: Per-attempt limits (#58), defined in ``config`` (whose keys default to them) and
 #: re-exported here. The live run that prompted #58 spent $4.78 and 3.34M input tokens
 #: in one tier 3 attempt.
@@ -140,6 +152,8 @@ class Refusal:
     def flag_reason(self) -> str:
         if self.cap == "attempt":
             return f"{FLAG_ATTEMPT_BUDGET}: {self.detail}"
+        if self.cap == "thrifty":
+            return f"{FLAG_THRIFTY}: a cloud writer attempt waits for approval"
         return f"{FLAG_SPEND_CAP}: {self.cap} cap ${self.cap_usd:.2f} reached"
 
 
@@ -593,6 +607,22 @@ class Spend:
             return None
         return _with_who(refusal, _Who(ticket_id, None, None), None)
 
+    def writer_gate(self, ticket_id: int, *, approval_required: bool = False) -> Refusal | None:
+        """Before a cloud writer attempt: ``blocked(ticket_id)``, plus, for a ``thrifty``
+        repo (``approval_required``), the profile's own approval (see the module
+        docstring). None: start the attempt. Without ``approval_required`` this is
+        exactly ``blocked``."""
+        if not approval_required:
+            return self.blocked(ticket_id)
+        capped = self.blocked(None)
+        approval = self.store.open_spend_approval(ticket_id)
+        if approval is None:
+            now = self.now()
+            return Refusal("live", "thrifty", 0.0, 0.0, 0.0, 0.0, None, now, ticket_id=ticket_id)
+        if capped is None and self.store.consume_spend_approval(approval.id):
+            log.info("spend: approval %s used for a thrifty cloud attempt", approval.id)
+        return None
+
     def approve(self, ticket_id: int) -> SpendApproval:
         """`fman approve-spend <ticket>`: one more attempt past the cap, up to
         ``approval_usd``. Idempotent while an approval is still unused."""
@@ -612,12 +642,19 @@ class Spend:
             return None
         if self.store.open_spend_approval(ticket.id) is not None:
             return "approved"
+        if (ticket.flag_reason or "").startswith(FLAG_THRIFTY):
+            return None  # #51: only the user's approval lifts a thrifty pause
         return "cap_clear" if self.blocked(None) is None else None
 
     def approval_comment(self, ticket: Ticket, refusal: Refusal) -> str:
         """The issue comment asking for approval. Amounts and commands only."""
         marker = f"<!-- foreman-inator:flag ticket={ticket.id} -->"
-        if refusal.cap == "approval":
+        if refusal.cap == "thrifty":
+            why = (
+                "this repo's profile is thrifty, so every cloud writer attempt waits for "
+                "your approval"
+            )
+        elif refusal.cap == "approval":
             why = (
                 f"the attempt used the ${refusal.cap_usd:.2f} of cloud spend your last "
                 "approval allowed"
@@ -710,6 +747,7 @@ __all__ = [
     "DEFAULT_RESERVATION_TTL",
     "FLAG_ATTEMPT_BUDGET",
     "FLAG_SPEND_CAP",
+    "FLAG_THRIFTY",
     "Refusal",
     "Spend",
     "SpendError",
