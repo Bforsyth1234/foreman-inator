@@ -162,6 +162,7 @@ time.sleep(float(sys.argv[3]))
 
 def hold_in_other_process(lock: Path, tmp_path: Path, seconds: float) -> subprocess.Popen:
     ready = tmp_path / "held.flag"
+    ready.unlink(missing_ok=True)  # a flag left by an earlier holder must not count
     lock.parent.mkdir(parents=True, exist_ok=True)
     proc = subprocess.Popen([sys.executable, "-c", HOLD, str(lock), str(ready), str(seconds)])
     end = time.monotonic() + 10
