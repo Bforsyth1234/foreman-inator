@@ -65,7 +65,7 @@ in the item, and put the shape you rely on behind one small adapter so a
 change touches one file.
 ============================================================ -->
 
-Next ID: #77
+Next ID: #78
 Legend: `[ ]` todo · `[~]` in progress · `[~] live` built, waiting on its live check · `[x]` done (move to DONE.md)
 
 ## Wave plan
@@ -467,3 +467,36 @@ Why: `fman status` (`worker_status.render_status`) shows the queue only in a ter
 Idea: `/activity`: read-only, same data as `render_status` (tickets by state, locks, spend approvals, needs-info, CI waits, flags) plus, for each running attempt, the repo and issue link, model and tier, current step (writing, verify, review, CI), elapsed time against `writer_timeout_seconds`, tokens and cost so far, and a link to its trace (`/traces`). Show loaded local models and memory once #58 / #59 exist. Refresh with a `<meta http-equiv="refresh">` every few seconds so the page needs no JavaScript. Optional later: pause or cancel buttons through the shared POST layer.
 Verify: with fake running attempts in a test store, the page lists each with its model, step and elapsed time, and matches `render_status`'s ticket states; a finished attempt leaves the running list; issue titles are escaped. Non-vacuous: drop the escape and the `<script>`-in-title test fails.
 Estimate: about half a day with tests (read-only). Related: #58, #59, #60.
+
+### Unscheduled (bulk sweep, 2026-11-25)
+
+Asked by the user: "can we add a feature to take every issue in github and use agent waves to complete them", then chose "Build `fman sweep` with dynamic waves and a cap on open PRs".
+
+#77 — `fman sweep`: start every open issue, dynamic waves, cap on open PRs [ ] · Added: 2026-11-25 · Source: user
+Why: today work starts only when you label an issue by hand, one at a time. The worker already runs tickets in parallel with file locks (`locks.py`: predicted files, all-or-nothing acquire, wait instead of fail), so "waves" mostly exist; what is missing is a bulk start and a way to keep the PR pile reviewable.
+DECISIONS (user, 2026-11-25):
+1. Dynamic waves: a ticket starts as soon as its files are free (existing lock gate + `max_parallel_per_repo`). No strict wave barrier waiting on merges, since the worker never merges (invariant 7a).
+2. A cap on open PRs per repo, so a sweep of 40 issues does not land 40 PRs on the user at once.
+DECISIONS (assistant, 2026-11-25):
+3. The label is applied with the user's own GitHub credentials (`gh` CLI token), not the App's. The poller counts a label only when an `allowed_users` user applied it (`github/poller.py:340`, invariant 7b), so a bot-applied label would start nothing, and that rule stays.
+4. Preview first, then one confirmation (`--yes` skips it). Nothing is labeled on a dry run (`--dry-run`).
+Files:
+⚬ OWNED: src/foreman_inator/sweep.py (new), tests/test_sweep.py (new), tests/test_open_pr_cap.py (new)
+⚬ EDITED: src/foreman_inator/config.py (`max_open_prs_per_repo`, default 5, 0 = no cap, validated like `max_parallel_per_repo`), src/foreman_inator/worker_queue.py (the gate), docs/setup.md (usage)
+⚬ Runner registers: `sweep` command in cli.py. No new dependencies.
+Approach:
+⚬ Select: open issues (not PRs) in `owner/repo` that have no `agent` label, no open ticket, and no `fman/` PR already. Filters: `--label`, `--exclude-label`, `--limit N`, `--author`. Skip issues whose author is not on `allowed_users` unless `--include-any-author` (shown in the preview).
+⚬ Preview: per issue, its predicted files (`locks.predict_files`), the tier the router would pick, and the wave it falls into: greedy grouping so no file appears in two issues of one wave (same rule as todo.md rule 3); issues that predict no files go in a separate "unknown files" group, since they may collide later (see `locks.py`, "No prediction"). Totals: issue count, waves, estimated cloud spend against the remaining `spend_caps` (cloud-tier issues × average cost from metrics, or "unknown" with no history).
+⚬ Apply: label each issue `agent` via `gh issue edit --add-label`, paced to stay under rate limits, printing progress; stop on the first auth error. Re-running is safe (already-labeled issues are skipped).
+⚬ Open-PR cap: in `job_for`, the `publish` step (opening a draft PR) waits while the repo has `max_open_prs_per_repo` open `fman/` PRs that are not merged or closed. Attempts may still run and finish; only opening new PRs waits. Waiting is not a failure: no attempt counted, nothing flagged (same as the lock gate). `fman status` shows "waiting: open-PR cap (5/5)".
+⚬ Fallback: if `gh` is missing or not logged in, print the exact `gh auth login` step and stop; never fall back to the App token.
+Verify:
+⚬ With a fake GitHub of 10 issues (2 labeled, 1 PR, 1 from a non-allowed author): the preview lists 6, waves have no shared file, `--dry-run` labels nothing.
+⚬ Apply labels through a fake `gh`; a re-run labels nothing new.
+⚬ With the cap at 2 and 2 open `fman/` PRs, a passed attempt's publish waits and a third PR is not opened; after one PR merges it publishes. Cap 0 means no limit.
+⚬ The poller still ignores a label applied by the bot (existing test stays green).
+⚬ Non-vacuous: remove the cap check from `job_for` and the "third PR is not opened" test fails; drop the shared-file check from wave grouping and the "no shared file" test fails.
+⚬ pytest + ruff gate (rule 8).
+Live (user): run `fman sweep owner/test-repo --dry-run` on the private test repo, check the preview, then run it for real with `--limit 3` and watch the PR count stay under the cap.
+Estimate: about 2 to 3 hours of agent work with tests. Related: #19 (file locks), #21 (queue), #76 (activity page would show sweep progress).
+Deviations:
