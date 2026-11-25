@@ -9,7 +9,11 @@ Attempt (``attempt_job``), in order:
 1. escalation decides from the stored rows (``Worker.policy_for``): a step, a hand-over,
    or nothing;
 2. the writer is ``step.model`` (``config.model``), so tier 3's GLM → Claude step runs
-   Claude; a cloud writer at the spend cap pauses the ticket before anything runs;
+   Claude; a running writer traffic split (#34, ``experiments.split.pick``) may give a
+   ticket's first attempt to the challenger's model and prompt (never a retry,
+   escalation, explore or ``tier:N`` ticket; the attempt's ``variant_id`` is then the
+   challenger's), and sends a retry after one back to the champion's model; a cloud
+   writer at the spend cap pauses the ticket before anything runs;
 3. under the repo's mirror lock: fetch, and the attempt's worktree on
    ``fman/issue-<n>/a<k>``, starting from the previous attempt's work when there is one;
 4. find the verify command (the repo's saved override first); none → hand over once;
@@ -53,6 +57,7 @@ from fde_kit.prompts import PromptRef
 from foreman_inator import prompts, tracing
 from foreman_inator.config import ConfigError, ModelEndpoint
 from foreman_inator.db.store import Attempt, Ticket
+from foreman_inator.experiments import split as split_mod
 from foreman_inator.experiments import variants
 from foreman_inator.pr.publisher import pr_head_branch
 from foreman_inator.resources import memory
@@ -198,6 +203,12 @@ class AttemptSteps:
             )
             return
         endpoint = self._writer_endpoint(step)
+        # #34: a running traffic split may give this first attempt to the challenger
+        # (its model and prompt), or send a retry after one back to the champion.
+        split_pick = self._split_pick(ticket, step, endpoint)
+        template = None
+        if split_pick is not None:
+            endpoint, template = split_pick.endpoint, split_pick.template
         if endpoint.is_cloud:
             # #51: a thrifty repo's cloud writer attempt also waits for an approval.
             refusal = self.spend.writer_gate(
@@ -262,7 +273,27 @@ class AttemptSteps:
             endpoint.name,
             step.reason,
         )
-        self._run_and_finish(ticket, att, wt, endpoint, cmd, cancel)
+        if split_pick is not None:
+            log.info("ticket %d: attempt %d: %s", ticket.id, att.id, split_pick.reason)
+        self._run_and_finish(ticket, att, wt, endpoint, cmd, cancel, template=template)
+
+    def _split_pick(self, ticket: Ticket, step: esc.Retry, endpoint: Any) -> Any:
+        """#34 (``experiments.split.pick``): None when no split applies. Never raises: a
+        broken split leaves the attempt as escalation chose it."""
+        ex = getattr(self.config, "experiments", None)
+        try:
+            return split_mod.pick(
+                self.store,
+                self.config,
+                ticket,
+                step,
+                endpoint,
+                self.history(ticket).attempts,  # type: ignore[attr-defined]
+                min_cases=int(getattr(ex, "min_cases", 10)),
+            )
+        except Exception:
+            log.exception("ticket %d: traffic split check failed; no split", ticket.id)
+            return None
 
     def _run_and_finish(
         self,
@@ -274,13 +305,15 @@ class AttemptSteps:
         cancel: threading.Event,
         *,
         conflicted: Sequence[str] = (),
+        template: PromptRef | None = None,
     ) -> bool | None:
         """Run a started attempt (``_run_attempt``), then what follows it: a spend pause,
         file locks, ``ChecksFailed``, or the publish. Returns whether the checks passed
-        (None: cancelled, set aside or refused)."""
+        (None: cancelled, set aside or refused). ``template``: the writer prompt (#34's
+        split challenger); None is the champion's."""
         try:
             att, passed, vr, diff = self._run_attempt(
-                ticket, att, wt, endpoint, cmd, cancel, conflicted=conflicted
+                ticket, att, wt, endpoint, cmd, cancel, conflicted=conflicted, template=template
             )
         except _Cancelled:
             log.info("ticket %d: attempt %d cancelled; marked superseded", ticket.id, att.id)
@@ -383,8 +416,10 @@ class AttemptSteps:
         cancel: threading.Event,
         *,
         conflicted: Sequence[str] = (),
+        template: PromptRef | None = None,
     ) -> tuple[Attempt, bool, Any, Any]:
-        template = self.writer_template()
+        if template is None:
+            template = self.writer_template()
         # #38, #40: global rules, the repo's rules_file, AGENTS.md + CLAUDE.md, nested files.
         conv = conventions_mod.gather(
             wt.path, ticket.owned_files, rules_file=_rules_file(self.config, ticket.repo)
