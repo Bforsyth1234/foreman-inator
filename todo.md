@@ -65,7 +65,7 @@ in the item, and put the shape you rely on behind one small adapter so a
 change touches one file.
 ============================================================ -->
 
-Next ID: #79
+Next ID: #80
 Legend: `[ ]` todo · `[~]` in progress · `[~] live` built, waiting on its live check · `[x]` done (move to DONE.md)
 
 ## Wave plan
