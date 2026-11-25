@@ -217,6 +217,32 @@ Set `FOREMAN_INATOR_HOME` to use another folder.
 | `worktrees/` | A bare mirror per repo and one worktree per attempt |
 | `logs/` | `worker.out.log`, `worker.err.log`, `experiments.out.log`, `experiments.err.log` |
 | `sandbox/`, `opencode/`, `replays/` | Per-attempt scratch space, per-attempt OpenCode config, experiment mirrors |
+| `cache/` | Package caches per repo (`cache/<owner>/<name>/`), shared by that repo's installs |
+
+#### What gets deleted, and when
+
+Once a day (when the worker starts, then every 24
+hours) the worker prunes this folder. Run the same thing by hand with
+`fman prune`; `fman prune --dry-run` lists what would go and deletes nothing,
+and `--days N` changes the retention for that run.
+
+- `recordings/<ticket>/` and `traces/<ticket>/` (spans and saved check, install
+  and CI logs): deleted once older than the retention period, `retention_days`
+  in the config, 90 by default. A merged ticket's files are never deleted, nor
+  those of a ticket that is still open or has an attempt running.
+- `sandbox/` and `opencode/attempts/`: leftovers of a launch that did not clean
+  up after itself (a crash or a kill). One goes 24 hours after its last change
+  once its attempt has ended or its experiment has finished; never while the
+  attempt or experiment is running, and never for an attempt of a merged
+  ticket. An entry not named after an attempt waits the full retention period.
+- `replays/work/`: an experiment's verify logs, once the experiment is no
+  longer running and the folder is older than the retention period.
+- `cache/<owner>/<name>/`: only for a repo no longer in `repos`, and not while
+  one of its attempts runs. Re-adding the repo fills the cache again on the
+  next install.
+
+Nothing else is pruned: the database, `worktrees/` (removed when a ticket ends)
+and `logs/` are kept.
 
 ## 3. Store the cloud keys
 

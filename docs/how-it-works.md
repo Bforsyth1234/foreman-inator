@@ -252,9 +252,15 @@ flowchart LR
   receive them; with nothing listening, nothing is lost locally.
 - **Recordings:** every attempt and review is recorded in
   `~/.foreman-inator/recordings/<ticket>/`: the prompt, every model response
-  and every tool result. SPEC says recordings of unmerged tickets are deleted
-  after 90 days; the delete function exists, but nothing calls it yet, so
-  recordings are kept until you delete them.
+  and every tool result.
+- **Retention:** once a day the worker deletes recordings and traces of
+  tickets that are not merged once they are older than `retention_days` (90
+  by default). A merged ticket's recordings are kept for good, and an open
+  ticket's or a running attempt's are never touched. The same pass sweeps
+  scratch space a crashed launch left in `sandbox/` and `opencode/attempts/`,
+  old experiment logs in `replays/work/`, and package caches of repos removed
+  from the config. `fman prune --dry-run` lists what would go; see
+  [setup.md](setup.md#what-gets-deleted-and-when) for the exact rules.
 
 ## Experiments
 
