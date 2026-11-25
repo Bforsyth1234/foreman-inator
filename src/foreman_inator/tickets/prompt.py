@@ -43,13 +43,15 @@ version is one hash and one variant (``<model>/<prompt-name>@<hash[:8]>``, #24).
 
 from __future__ import annotations
 
+import logging
 import re
-from collections.abc import Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from importlib import resources
 from pathlib import Path
 from string import Template
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from fde_kit.prompts import PromptRef, load_prompt
 
@@ -57,7 +59,10 @@ from foreman_inator.db.store import KICKBACK_BY, TAGS, Attempt, Kickback, Review
 from foreman_inator.tickets.lifecycle import clarify_qa_cursor, split_kickback_note
 
 if TYPE_CHECKING:  # conventions imports this module's bounding helpers
+    from foreman_inator.github.client import Comment
     from foreman_inator.tickets.conventions import Conventions
+
+log = logging.getLogger(__name__)
 
 WRITER_PROMPT_NAME = "writer-v1"
 
@@ -71,6 +76,8 @@ NOTE_BUDGET = 2_000  # per note
 NOTES_TOTAL_BUDGET = 6_000  # all notes; the newest are kept
 CLARIFICATION_BUDGET = 5_100  # the Q&A text (#44; ``clarify.QA_BUDGET`` plus room)
 LINE_COMMENTS_BUDGET = 6_000  # a review's line comments (#42), the first ones kept
+ISSUE_COMMENT_BUDGET = 2_000  # per issue comment (#25 / todo #48)
+ISSUE_COMMENTS_BUDGET = 6_000  # all issue comments; the newest are kept
 OWNED_FILES_MAX = 40  # list entries
 OWNED_FILE_BUDGET = 200  # per path
 HISTORY_MAX = 10  # attempts listed; the newest are kept
@@ -81,6 +88,8 @@ Situation = Literal["first", "retry", "kickback", "escalation", "rebase"]
 
 _SECTION = re.compile(r"^<!-- section: ([a-z_]+) -->$", re.MULTILINE)
 _MARKER = re.compile(r"-{3,}\s*(?:BEGIN|END)\b", re.IGNORECASE)
+_HTML_COMMENT = re.compile(r"<!--.*?(?:-->|$)", re.DOTALL)
+_QA_MARKER = "<!-- foreman-inator:needs-info"  # ``clarify.QUESTION_MARKER``'s prefix (#44)
 
 
 # --------------------------------------------------------------------------- inputs
@@ -220,6 +229,7 @@ def build_writer_prompt(
     template: PromptRef | None = None,
     conflicted_files: Sequence[str] = (),
     clarification: str | None = None,
+    issue_comments: str | None = None,
 ) -> WriterPrompt:
     """Render the writer's session prompt for ``attempt`` of ``ticket``.
 
@@ -232,6 +242,9 @@ def build_writer_prompt(
     ``conflicted_files`` is ``Replay.conflicted`` for a ``rebase`` attempt (#43).
     ``clarification`` is the Q&A text of the worker's clarifying questions (#44,
     ``clarify.answered``), shown right after the issue on every attempt.
+    ``issue_comments`` is ``issue_comments_text``'s result (#25, todo #48): the allowed
+    users' comments, already clipped to ``ISSUE_COMMENTS_BUDGET``; it goes after the
+    issue body inside the issue fence, defused.
     """
     if attempt.ticket_id != ticket.id:
         raise ValueError(f"attempt {attempt.id} belongs to ticket {attempt.ticket_id}")
@@ -252,7 +265,7 @@ def build_writer_prompt(
         s["issue"].substitute(
             issue_number=ticket.issue_number,
             issue_title=defuse(clip_head(" ".join(ticket.title.split()), TITLE_BUDGET)),
-            issue_body=defuse(clip_head(ticket.request, ISSUE_BODY_BUDGET)) or "(no body)",
+            issue_body=_issue_body(ticket.request, issue_comments),
         )
     )
     if clarification and clarification.strip():
@@ -343,6 +356,96 @@ def build_writer_prompt(
         prompt_name=ref.name,
         prompt_hash=ref.sha256,
         situation=situation,
+    )
+
+
+def _issue_body(request: str, comments: str | None) -> str:
+    body = defuse(clip_head(request, ISSUE_BODY_BUDGET)) or "(no body)"
+    if comments and comments.strip():
+        body += "\n\n" + defuse(clip_head(comments, ISSUE_COMMENTS_BUDGET + 200))
+    return body
+
+
+def _stamp(dt: datetime) -> str:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC).strftime("%Y-%m-%d %H:%M UTC")
+
+
+def _same_login(a: str | None, b: str | None) -> bool:
+    return a is not None and b is not None and a.lower() == b.lower()
+
+
+def issue_comments_text(
+    comments: Iterable[Comment],
+    *,
+    is_allowed: Callable[[str], bool],
+    bot_login: str | None,
+    clarification: str | None = None,
+) -> str | None:
+    """The issue's comments for the writer (#25, todo #48), or None when none count.
+
+    Only comments by allowed users count (invariant 7b); the bot's own comments never
+    do, nor any comment carrying the #44 question marker. An answer already shown in
+    the clarification block (``clarification``, the stored Q&A text, names each answer
+    ``[author, stamp]``) is left out here. Hidden HTML comments are stripped, each
+    comment is clipped to ``ISSUE_COMMENT_BUDGET`` and the newest are kept within
+    ``ISSUE_COMMENTS_BUDGET``, with a marker for what was dropped. The result is
+    defused; ``build_writer_prompt`` defuses it again inside the issue fence."""
+    qa = clarification or ""
+    kept: list[tuple[datetime, int, str]] = []
+    for c in comments:
+        author = c.author
+        if author is None or _same_login(author, bot_login) or not is_allowed(author):
+            continue
+        raw = c.body or ""
+        if _QA_MARKER in raw:
+            continue
+        header = f"[{author}, {_stamp(c.created_at)}]"
+        if qa and header in qa:
+            continue
+        text = _HTML_COMMENT.sub("", raw).strip()
+        if not text:
+            continue
+        kept.append((c.created_at, c.id, f"{header}\n{clip_head(text, ISSUE_COMMENT_BUDGET)}"))
+    if not kept:
+        return None
+    kept.sort(key=lambda k: (k[0], k[1]))
+    shown: list[str] = []
+    used = 0
+    for _, _, item in reversed(kept):
+        if shown and used + len(item) > ISSUE_COMMENTS_BUDGET:
+            break
+        shown.append(item)
+        used += len(item) + 2
+    shown.reverse()
+    head = "Comments on the issue from allowed users, oldest first:"
+    if len(shown) < len(kept):
+        head += f"\n[... {len(kept) - len(shown)} earlier comments not shown ...]"
+    return defuse("\n\n".join([head, *shown]))
+
+
+def fetch_issue_comments(
+    api: Any,
+    ticket: Ticket,
+    *,
+    is_allowed: Callable[[str], bool],
+    clarification: str | None = None,
+) -> str | None:
+    """List the ticket's issue comments and render them (``issue_comments_text``). A
+    GitHub failure is logged and the attempt goes on without comments."""
+    try:
+        comments = api.list_issue_comments(ticket.repo, ticket.issue_number)
+        bot = api.bot_login()
+    except Exception as exc:  # noqa: BLE001 - comments are optional context
+        log.warning(
+            "ticket %d: could not list issue comments (%s); the attempt goes on without them",
+            ticket.id,
+            exc,
+        )
+        return None
+    return issue_comments_text(
+        comments, is_allowed=is_allowed, bot_login=bot, clarification=clarification
     )
 
 
@@ -483,12 +586,13 @@ def writer_prompt_for(
     conflicted_files: Sequence[str] = (),
     rules_file: str | Path | None = None,
     global_rules: str | Path | None = None,
+    issue_comments: str | None = None,
 ) -> WriterPrompt:
     """Caller-side convenience for the worker (#14): read everything, then build.
     ``conflicted_files``: ``Replay.conflicted`` for a ``rebase`` attempt (#43). The
     clarification Q&A (#44) is read from the store's ``clarify-qa:<ticket>`` cursor.
     ``rules_file`` is the repo's configured rules file (#38); ``global_rules`` overrides
-    ``paths.rules_path()`` (tests)."""
+    ``paths.rules_path()`` (tests). ``issue_comments``: ``fetch_issue_comments`` (#25)."""
     from foreman_inator.tickets.conventions import gather
 
     conv = gather(worktree, ticket.owned_files, global_path=global_rules, rules_file=rules_file)
@@ -500,4 +604,5 @@ def writer_prompt_for(
         conventions=conv,
         conflicted_files=conflicted_files,
         clarification=store.get_cursor(ticket.repo, clarify_qa_cursor(ticket.id)),
+        issue_comments=issue_comments,
     )

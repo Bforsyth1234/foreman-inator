@@ -67,6 +67,7 @@ from foreman_inator.tickets.lifecycle import AttemptStarted, ChecksFailed, clari
 from foreman_inator.tickets.prompt import (
     WRITER_PROMPT_NAME,
     build_writer_prompt,
+    fetch_issue_comments,
     load_history,
 )
 from foreman_inator.worker_policy import (
@@ -388,6 +389,7 @@ class AttemptSteps:
         conv = conventions_mod.gather(
             wt.path, ticket.owned_files, rules_file=_rules_file(self.config, ticket.repo)
         )
+        qa = self.store.get_cursor(ticket.repo, clarify_qa_cursor(ticket.id))
         prompt = build_writer_prompt(  # ``writer_prompt_for`` with the champion's template
             ticket,
             att,
@@ -396,7 +398,10 @@ class AttemptSteps:
             conventions=conv,
             template=template,
             conflicted_files=conflicted,
-            clarification=self.store.get_cursor(ticket.repo, clarify_qa_cursor(ticket.id)),
+            clarification=qa,
+            issue_comments=fetch_issue_comments(  # #25: allowed users' comments, not the Q&A
+                self.api, ticket, is_allowed=self.config.is_allowed_user, clarification=qa
+            ),
         )
         variant = variants.register(self.store, "writer", endpoint.name, template).id
         att = self.store.update_attempt(att.id, variant_id=variant)
