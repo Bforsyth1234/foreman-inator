@@ -10,13 +10,16 @@ else) and:
   logged once (the stamp is remembered, so the same broken file is not re-read each poll);
 * a missing file: the old config stays (``config.load`` would give the defaults, which
   is never what a running worker should silently switch to);
+* an empty file, or one listing no repos / allowed_users while the running config has
+  some: refused like an invalid one (most likely a half-written or wiped file);
 * valid: it replaces ``self.config``, except the fields in ``RESTART_FIELDS`` (things
   built once at start: the model ladder and proxy, the sandbox line, the App identity,
   the relay), which keep their running values and are logged as needing a restart. If
   holding them back makes the mix invalid, nothing is swapped. Every changed key is
   logged (``changes``), and the pieces the worker copied out of the config at start are
   updated when they still held the old config's value: ``spend.caps`` (and the per-attempt
-  limits), ``poller.config`` / ``poller.repos`` / ``self.repos``, ``self.parallel``.
+  limits, and ``spend.approval_usd`` when it was the daily-cap default),
+  ``poller.config`` / ``poller.repos`` / ``self.repos``, ``self.parallel``.
 
 Everything else reads ``self.config`` when it needs it (``writer_timeout_seconds``,
 ``allowed_users``, ``max_open_prs_per_repo``, ...), so a new value applies from the next
@@ -32,7 +35,7 @@ from pathlib import Path
 from typing import Any
 
 from foreman_inator import config as config_mod
-from foreman_inator.config import Config, ConfigError
+from foreman_inator.config import Config, ConfigError, SpendCaps
 
 log = logging.getLogger("foreman_inator.worker")
 
@@ -108,6 +111,30 @@ def hold_restart_fields(old: Config, new: Config) -> tuple[Config, list[str]]:
     return replace(new, **{f: getattr(old, f) for f in held}), held
 
 
+def _refuse_reason(path: Path, old: Config, new: Config) -> str | None:
+    """Why a freshly read file looks like a half-written or wiped config rather than an
+    edit (defence in depth: ``config.save`` writes atomically, but an editor may not)."""
+    try:
+        if not path.read_bytes().strip():
+            return f"{path} is empty"
+    except OSError as exc:
+        return f"{path} could not be read: {exc}"
+    if old.repos and not new.repos:
+        return "it lists no repos (the running config has some); restart the worker to apply it"
+    if old.allowed_users and not new.allowed_users:
+        return (
+            "it lists no allowed_users (the running config has some); "
+            "restart the worker to apply it"
+        )
+    return None
+
+
+def _default_approval_usd(cfg: Config) -> float:
+    """``Spend``'s default ``approval_usd`` for ``cfg`` (the daily cap, or the default cap)."""
+    daily = cfg.spend_caps.daily_usd
+    return float(daily if daily > 0 else SpendCaps.daily_usd)
+
+
 class ConfigReloadSteps:
     # Provided by Worker (each read with getattr: tests may build a partial worker).
     config: Any
@@ -139,6 +166,12 @@ class ConfigReloadSteps:
         try:
             new = load(path)
             old = self.config
+            refused = _refuse_reason(path, old, new)
+            if refused:
+                log.warning(
+                    "config.toml changed but was not applied (old config kept): %s", refused
+                )
+                return None
             applied, held = hold_restart_fields(old, new)
         except (ConfigError, OSError) as exc:
             log.warning("config.toml changed but was not applied (old config kept): %s", exc)
@@ -163,6 +196,8 @@ class ConfigReloadSteps:
         if spend is not None:
             if getattr(spend, "caps", None) == old.spend_caps:
                 spend.caps = new.spend_caps
+            if getattr(spend, "approval_usd", None) == _default_approval_usd(old):
+                spend.approval_usd = _default_approval_usd(new)
             if getattr(spend, "attempt_budget_usd", None) == old.attempt_budget_usd:
                 spend.attempt_budget_usd = new.attempt_budget_usd
             limits = getattr(spend, "attempt_max_input_tokens", None)

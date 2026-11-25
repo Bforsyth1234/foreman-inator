@@ -125,3 +125,48 @@ def test_changes_lists_every_differing_key() -> None:
     b = replace(a, allowed_users=("x",), status_comment=False)
     assert changes(a, b) == ["allowed_users: [] -> [x]", "status_comment: true -> false"]
     assert changes(a, a) == []
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["", "\n", 'repos = []\nallowed_users = ["brooks"]\n', 'repos = ["acme/widgets"]\n'],
+    ids=["empty", "blank", "no-repos", "no-allowed-users"],
+)
+def test_a_wiped_or_half_written_file_keeps_the_old_config(
+    setup: tuple[Path, FakeWorker], caplog: pytest.LogCaptureFixture, text: str
+) -> None:
+    path, w = setup
+    before, caps = w.config, w.spend.caps
+    path.write_text(text)
+    bump(path)
+    with caplog.at_level(logging.WARNING, logger="foreman_inator.worker"):
+        assert w.maybe_reload_config() is None
+    assert w.config is before
+    assert w.spend.caps is caps
+    assert w.repos == ("acme/widgets",)
+    assert "not applied" in caplog.text
+
+
+def test_a_changed_daily_cap_moves_the_default_approval_amount(
+    setup: tuple[Path, FakeWorker],
+) -> None:
+    path, w = setup
+    assert w.spend.approval_usd == 5.0
+    config_mod.save(replace(w.config, spend_caps=SpendCaps(daily_usd=2.0, monthly_usd=9.0)), path)
+    bump(path)
+    assert w.maybe_reload_config()
+    assert w.spend.approval_usd == 2.0
+
+
+def test_an_explicit_approval_amount_is_left_alone(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    cfg = Config(repos=("acme/widgets",), allowed_users=("brooks",))
+    config_mod.save(cfg, path)
+    cfg = config_mod.load(path)
+    store = SimpleNamespace(now=lambda: None)
+    w = FakeWorker(cfg, Spend(store, cfg, approval_usd=7.0))  # type: ignore[arg-type]
+    w.watch_config(path)
+    config_mod.save(replace(cfg, spend_caps=SpendCaps(daily_usd=2.0, monthly_usd=9.0)), path)
+    bump(path)
+    assert w.maybe_reload_config()
+    assert w.spend.approval_usd == 7.0

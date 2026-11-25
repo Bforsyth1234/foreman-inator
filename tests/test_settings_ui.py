@@ -23,6 +23,8 @@ from foreman_inator.routing import profile as prof
 
 BASE = "http://127.0.0.1:8642"
 TOKEN = "settings-token"
+#: What the fake App installation can see (GitHub's spelling).
+SEEN = ["acme/widgets", "acme/gadgets", "Acme/Gizmos"]
 
 
 @pytest.fixture
@@ -43,7 +45,9 @@ def db() -> Path:
 
 @pytest.fixture
 def client(cfg_path: Path, db: Path) -> TestClient:
-    routes = ui.routes(db, config_path=cfg_path, guard=forms.FormGuard(TOKEN))
+    routes = ui.routes(
+        db, config_path=cfg_path, guard=forms.FormGuard(TOKEN), access=lambda cfg: SEEN
+    )
     return TestClient(LoopbackHostOnly(Starlette(routes=routes)), base_url=BASE)
 
 
@@ -79,6 +83,54 @@ def load_message(path: Path, raw: dict[str, Any], tmp: Path) -> str:
 
 
 # =========================================================================== config form
+
+
+def _client_with(cfg_path: Path, db: Path, access: Any) -> TestClient:
+    kw = {} if access is None else {"access": access}
+    routes = ui.routes(db, config_path=cfg_path, guard=forms.FormGuard(TOKEN), **kw)
+    return TestClient(LoopbackHostOnly(Starlette(routes=routes)), base_url=BASE)
+
+
+def test_adding_a_repo_the_installation_cannot_see_is_refused(
+    client: TestClient, cfg_path: Path
+) -> None:
+    before = cfg_path.read_bytes()
+    f = page_form(client)
+    f["repos"] = "acme/widgets\nacme/secret"
+    r = post(client, "/settings", f)
+    assert r.status_code == 400
+    assert "cannot see acme/secret" in r.text
+    assert cfg_path.read_bytes() == before
+
+
+def test_an_added_repo_takes_githubs_spelling(client: TestClient, cfg_path: Path) -> None:
+    f = page_form(client)
+    f["repos"] = "acme/widgets\nacme/gizmos"
+    r = post(client, "/settings", f)
+    assert r.status_code == 200, r.text
+    assert config_mod.load(cfg_path).repos == ("acme/widgets", "Acme/Gizmos")
+
+
+@pytest.mark.parametrize("access", [None, "boom"], ids=["no-credentials", "github-error"])
+def test_without_an_installation_check_adding_is_refused_but_removing_works(
+    cfg_path: Path, db: Path, access: Any
+) -> None:
+    def broken(cfg: Config) -> list[str]:
+        raise OSError("network down")
+
+    c = _client_with(cfg_path, db, broken if access == "boom" else None)
+    before = cfg_path.read_bytes()
+    f = page_form(c)
+    f["repos"] = "acme/widgets\nacme/gadgets"
+    r = post(c, "/settings", f)
+    assert r.status_code == 400
+    assert "fman repo add" in r.text
+    assert cfg_path.read_bytes() == before
+    f = page_form(c)
+    f["repos"] = ""
+    r = post(c, "/settings", f)
+    assert r.status_code == 200, r.text
+    assert config_mod.load(cfg_path).repos == ()
 
 
 def test_get_shows_current_values_and_the_reload_note(client: TestClient) -> None:

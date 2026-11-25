@@ -900,9 +900,11 @@ def full_app(
         ),
         *settings_ui.routes(store_path, nav=nav),  # #73: edit config.toml (FormGuard)
         *tiers_ui.routes(store_path, nav=nav),  # #74: models per tier (FormGuard)
-        *activity_ui.routes(  # #76: what runs now; #79: its Retry button (FormGuard)
+        # #76: what runs now; #79: its Retry button (FormGuard). config.toml is read per
+        # request (like /settings and /tiers), so Retry decides with the current models/caps.
+        *activity_ui.routes(
             store_path,
-            load_config=(lambda: cfg) if config is not None else None,
+            load_config=None,
             nav=nav,
             resources_path=res_path,
             traces_dir=traces_dir,

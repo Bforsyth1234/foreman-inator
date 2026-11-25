@@ -10,8 +10,11 @@
 * ``POST /settings``: reads config.toml as TOML, sets the submitted keys, and builds the
   new config with ``config.from_dict`` (exactly the validation ``config.load`` runs); a
   refusal shows ``config.load``'s own message (``"<path>: <error>"``) and the file is not
-  touched. A valid form is written with ``config.save`` (as ``fman repo add`` does: the
-  whole file is rewritten from the typed config, mode 600), and the page lists what
+  touched. Repos the form adds go through ``fman repo add``'s ``setup.add_repos`` with the
+  installation's repo list; when that list cannot be fetched from the page, adding is
+  refused (pointing at ``fman repo add``); removing needs no check. A valid form is
+  written with ``config.save`` (as ``fman repo add`` does: the whole file is rewritten
+  from the typed config, atomically, mode 600), and the page lists what
   changed (``worker_config_reload.changes``). A form loaded before the file last changed
   is refused (its hidden ``config_hash``), so a hand edit is never overwritten blind;
 * ``POST /settings/repo``: one watched repo's settings, through the CLI's own functions:
@@ -35,7 +38,8 @@ import math
 import re
 import sqlite3
 import tomllib
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -190,9 +194,44 @@ def build(path: Path, raw: dict[str, Any]) -> Config:
         raise ConfigError(f"{path}: {exc}") from exc
 
 
-def save_form(path: Path, form: dict[str, str]) -> tuple[Config, list[str]]:
+#: Shown when a repo is added here but the App's installation could not be asked.
+NO_ACCESS_TEXT = (
+    "Repos can only be added here when the page can check that the App's installation"
+    " can see them, and it could not ({why}). Nothing was saved. Run"
+    " `fman repo add OWNER/NAME` instead (removing repos here still works)."
+)
+
+AccessCheck = Callable[[Config], "list[str] | None"]
+
+
+def check_added_repos(old: Config, new: Config, access: AccessCheck | None) -> Config:
+    """``new`` with the repos it adds to ``old`` run through ``fman repo add``'s own
+    ``setup.add_repos`` (the installation check, GitHub's spelling). Removing repos needs
+    no check. Raises ``ConfigError`` (nothing saved) when the installation cannot see an
+    added repo, or cannot be asked from the page (no App credentials, GitHub error)."""
+    from foreman_inator import setup as setup_mod
+
+    had = {r.lower() for r in old.repos}
+    added = [r for r in new.repos if r.lower() not in had]
+    if not added:
+        return new
+    accessible, err = setup_mod._access_or_error(old, access)
+    if accessible is None:
+        raise ConfigError(NO_ACCESS_TEXT.format(why=err or "no App credentials yet"))
+    kept = tuple(r for r in new.repos if r.lower() in had)
+    try:
+        checked, _lines = setup_mod.add_repos(replace(new, repos=kept), added, accessible)
+    except setup_mod.RepoCommandError as exc:
+        raise ConfigError(str(exc)) from exc
+    return checked
+
+
+def save_form(
+    path: Path, form: dict[str, str], *, access: AccessCheck | None = None
+) -> tuple[Config, list[str]]:
     """Validate and write the form; the change lines. Raises ``ConfigError`` (file not
-    touched) or ``_Fail`` (stale page)."""
+    touched) or ``_Fail`` (stale page). Added repos go through ``check_added_repos``
+    (``access`` None: ``setup.installation_access``)."""
     seen = form.get("config_hash", "")
     if seen != file_hash(path):
         raise _Fail(
@@ -202,7 +241,7 @@ def save_form(path: Path, form: dict[str, str]) -> tuple[Config, list[str]]:
         )
     raw = read_raw(path)
     old = build(path, raw)
-    new = build(path, apply_form(raw, form))
+    new = check_added_repos(old, build(path, apply_form(raw, form)), access)
     lines = changes(old, new)
     if lines:
         config_mod.save(new, path)
@@ -290,9 +329,11 @@ def routes(
     config_path: str | Path | None = None,
     guard: forms.FormGuard | None = None,
     nav: Sequence[tuple[str, str]] | None = None,
+    access: AccessCheck | None = None,
 ) -> list[BaseRoute]:
     """The page's routes. ``config_path`` defaults to ``paths.config_path()`` (looked up
-    per request); ``guard`` to the per-process ``forms.default_guard()``."""
+    per request); ``guard`` to the per-process ``forms.default_guard()``; ``access`` (the
+    repos the App's installation can see) to ``setup.installation_access``."""
     db = Path(store_path)
     guard = guard or forms.default_guard()
     nav = tuple(nav) if nav is not None else (*web.M4_NAV, NAV_ENTRY)
@@ -350,7 +391,7 @@ def routes(
     def save(request: Request, form: dict[str, str]) -> Response:
         path = cfg_path()
         try:
-            _new, lines = save_form(path, form)
+            _new, lines = save_form(path, form, access=access)
         except _Fail as f:
             return render(_message(str(f), True), status=f.status)
         except ConfigError as exc:

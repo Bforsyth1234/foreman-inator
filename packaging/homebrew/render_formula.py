@@ -34,6 +34,9 @@ PROJECT = "foreman-inator"
 # uv_build (like every PEP 625 backend) names the sdist with the normalized name.
 SDIST_RE = re.compile(r"foreman_inator-(?P<version>[0-9][0-9A-Za-z.+!-]*)\.tar\.gz")
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
+# The whole url, so nothing that means something inside a Ruby string (``"``, ``\\``,
+# ``#{``) can reach the formula.
+URL_RE = re.compile(r"^https://[A-Za-z0-9._~/%-]+$")
 PLACEHOLDERS = ("@@URL@@", "@@SHA256@@")
 GITHUB_ASSET = "https://github.com/Bforsyth1234/foreman-inator/releases/download/v{version}/{name}"
 PYPI_JSON = "https://pypi.org/pypi/{project}/{version}/json"
@@ -56,6 +59,8 @@ def render(template: str, *, url: str, sha256: str, version: str | None = None) 
     """Return ``template`` with url and sha256 filled in, after checking both."""
     if not url.startswith("https://"):
         raise RenderError(f"url must be https: {url!r}")
+    if URL_RE.fullmatch(url) is None:
+        raise RenderError(f"url has characters a formula url must not have: {url!r}")
     found = sdist_version(url)
     if version is not None and found != version:
         raise RenderError(f"url is version {found}, expected {version}")

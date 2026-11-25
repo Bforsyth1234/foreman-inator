@@ -117,6 +117,9 @@ def test_render_fills_both_placeholders() -> None:
         ({"url": PYPI_URL, "sha256": "A" * 64}, "64 lowercase hex"),
         ({"url": PYPI_URL, "sha256": "a" * 63}, "64 lowercase hex"),
         ({"url": PYPI_URL, "sha256": SHA, "version": "0.3.0"}, "expected 0.3.0"),
+        ({"url": 'https://x/"#{system}/foreman_inator-0.2.0.tar.gz', "sha256": SHA}, "characters"),
+        ({"url": "https://x/a b/foreman_inator-0.2.0.tar.gz", "sha256": SHA}, "characters"),
+        ({"url": "https://x/a?q=#{1}/foreman_inator-0.2.0.tar.gz", "sha256": SHA}, "characters"),
     ],
 )
 def test_render_rejects_bad_inputs(kwargs: dict, message: str) -> None:

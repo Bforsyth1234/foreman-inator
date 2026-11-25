@@ -172,3 +172,20 @@ def test_fman_run_watches_config_toml_and_restart_text_names_restart_fields() ->
     assert "worker.watch_config(paths.config_path())" in src
     assert "next poll" in setup_mod.RESTART_TEXT
     assert all(f in setup_mod.RESTART_TEXT for f in RESTART_FIELDS)
+
+
+def test_activity_retry_reads_the_current_config_toml_per_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: dict[str, Any] = {}
+    real = activity_ui.routes
+
+    def spy(*a: Any, **kw: Any) -> Any:
+        seen.update(kw)
+        return real(*a, **kw)
+
+    monkeypatch.setattr(activity_ui, "routes", spy)
+    _client(Config(repos=("acme/widgets",)))  # the config `fman metrics` started with
+    config_mod.save(Config(repos=("acme/gadgets",)))  # edited afterwards
+    load = seen["load_config"] or config_mod.load
+    assert load().repos == ("acme/gadgets",)
