@@ -65,7 +65,7 @@ in the item, and put the shape you rely on behind one small adapter so a
 change touches one file.
 ============================================================ -->
 
-Next ID: #83
+Next ID: #85
 Legend: `[ ]` todo · `[~]` in progress · `[~] live` built, waiting on its live check · `[x]` done (move to DONE.md)
 
 ## Wave plan
@@ -403,12 +403,26 @@ Live (user): restart the worker, re-label bot-inator#56: verify collects its tes
 Scheduled: wave 16 (built with the wave 16 review fixes).
 Deviations:
 
-#82 — A worker restart throws away an unused spend approval [ ] · Added: 2026-11-25 · Source: user (bot-inator ticket 11, live) · GH #80
-Why: `fman approve-spend` approvals are consumed when the cloud attempt starts (`spend.py` `writer_gate` ~line 665 for thrifty, `_try_grant` ~line 580 for over-cap; that grant lives only in memory). A restart mid-attempt marks the attempt `superseded` (`worker.py` ~line 301) and nothing gives the approval back, so the ticket waits for approval again having spent nothing. Seen 2026-11-25: approval 1 used at 18:37:06, SIGTERM at 18:37:52, ticket 11 paused at the cap again at 18:38:10, cloud spend unchanged. With the editable install every merge means a restart, so this will recur.
-DECISIONS (assistant, 2026-11-25, proposed): record the attempt on the approval (`spend_approvals.attempt_id`, migration); when an attempt ends `superseded` or cancelled having spent $0 under its approval, re-open the approval. If it spent anything, leave it consumed and say why in `fman status` (the approval cap stays hard: no silent extra budget).
-Files: ⚬ EDITED: src/foreman_inator/spend.py, src/foreman_inator/db/store.py, src/foreman_inator/worker.py (startup sweep), new `db/migrations/013_*.sql` (after wave 19's 012), tests (new).
-Verify: fake store + clock: approve, start a thrifty attempt, restart before any call → resumes next pass with no new approval; same with one recorded cloud call → stays consumed, status says why. Non-vacuous: remove the re-open, first test fails. pytest + ruff gate (rule 8).
+#82 — A worker restart throws away a spend approval's unspent budget [ ] · Added: 2026-11-25 · Source: user (bot-inator ticket 11, live) · GH #80
+Why: `fman approve-spend` approvals are consumed when the cloud attempt starts (`spend.py` `writer_gate` ~line 665 for thrifty, `_try_grant` ~line 580 for over-cap; that grant lives only in memory, `Spend._state.grants`). A restart mid-attempt marks the attempt `superseded` (`worker.py` ~line 301) and the unspent part of the approval is lost, so the ticket waits for approval again. Seen twice on 2026-11-25: approval 1 used at 18:37:06, SIGTERM at 18:37:52, $0 spent; approval 2 used at 18:41:07, attempt 48 cancelled by `launchctl kickstart -k` at 18:47:46 after spending $0.41 of $5.00. Every merge means a restart (editable install from `~/dev/fman-live`), so this recurs.
+DECISIONS (assistant, 2026-11-25, proposed): carry the grant, not just re-open a $0 one. Persist the grant (approval id, limit, spent) on the ticket instead of only in memory. An attempt that ends `superseded` or cancelled leaves it open; the ticket's next attempt continues it with `approval_usd - spent` left, no new approval needed. The approval closes only when used up or when the ticket's attempt finishes (passed, failed checks, flagged). `fman status` shows "approval #2: $4.59 of $5.00 left". The approval cap stays hard: a carried grant never adds budget past `approval_usd`.
+Files: ⚬ EDITED: src/foreman_inator/spend.py, src/foreman_inator/db/store.py, src/foreman_inator/worker.py (startup sweep), src/foreman_inator/worker_status.py (left-over line), new `db/migrations/013_*.sql` (after wave 19's 012), tests (new).
+Verify: fake store + clock: approve, start a thrifty attempt, restart before any call → resumes next pass on the same approval; restart after one recorded $0.41 call → next attempt runs with $4.59 left; restart after spending it all → pauses for a new approval. Non-vacuous: drop the carry and the second test fails. pytest + ruff gate (rule 8).
 Scheduled: after wave 19 merges (wave 19 slot d edits `spend.py`).
+Deviations:
+
+#83 — `fman status` calls a spend-paused blocker "flagged" [ ] · Added: 2026-11-25 · Source: user (live `fman status`) · GH #82
+Why: ticket #13's wait line said "#12 is flagged: close or re-label issue …" while the footer said "0 flagged for you". #12 was only paused for a spend approval (`flag_reason` starts with `FLAG_SPEND_CAP`). `worker_status.py` `_release_hint` (~line 100) treats any `flag_reason` as a flag; the footer count (~line 176) and the ticket's own line (~line 83) already treat a spend pause as a wait. The wrong hint tells the user to close the issue when one command would unblock it.
+DECISIONS (assistant, 2026-11-25): for a spend-paused blocker the hint reads "#12 waits for spend approval: run `fman approve-spend 12`"; real flags keep "close or re-label".
+Files: ⚬ EDITED: src/foreman_inator/worker_status.py, tests/test_worker_status.py.
+Verify: spend-paused blocker → hint names `fman approve-spend <id>`, flagged count unchanged; real flag → old text. Non-vacuous: drop the new branch, first test fails. pytest + ruff gate (rule 8).
+Deviations:
+
+#84 — Images attached to issues are dropped: GitHub's S3 redirect is refused [ ] · Added: 2026-11-25 · Source: user (bot-inator ticket 11, attempt 48 log) · GH #83
+Why: `https://github.com/user-attachments/assets/<id>` redirects to a pre-signed URL on `github-production-user-asset-6210df.s3.amazonaws.com`. `tickets/images.py` checks every redirect with `allowed_url` (~line 120), which allows only `github.com/user-attachments/` and the two `*.githubusercontent.com` hosts, so `fetch` (~line 236) raises "redirect off GitHub's attachment hosts" and the image never reaches the model. This is GitHub's normal path for new attachments, so #78 (images reach a vision model) likely does nothing in practice.
+DECISIONS (assistant, 2026-11-25): allow that exact S3 host only as a redirect target from a `github.com/user-attachments/` URL, never as a starting URL found in issue text; https, no port or userinfo. The App token still goes only to `github.com`. Size, type and redirect caps unchanged, so the no-SSRF rule holds. Check GitHub's docs first and record the URL and date here (rule 12).
+Files: ⚬ EDITED: src/foreman_inator/tickets/images.py, its tests.
+Verify: fake transport `user-attachments` → 302 to the S3 host → 200 PNG is used; the same S3 URL given directly in issue text is refused; a redirect to another `*.s3.amazonaws.com` bucket is refused. Non-vacuous: remove the redirect-target allowance, first test fails. Live (user): re-run a ticket whose issue has a screenshot; no "redirect off" warning in `worker.out.log`. pytest + ruff gate (rule 8).
 Deviations:
 
 ### Unscheduled (status on the issue, 2026-11-25)
