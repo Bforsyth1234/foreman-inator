@@ -21,7 +21,7 @@ import sqlite3
 import threading
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 from datetime import UTC, datetime
 from importlib import resources
 from importlib.resources.abc import Traversable
@@ -52,6 +52,9 @@ WriterMode = Literal["thrifty", "normal", "fast"]
 ReviewMode = Literal["off", "light", "normal", "strict"]
 WRITER_MODES: tuple[str, ...] = ("thrifty", "normal", "fast")
 REVIEW_MODES: tuple[str, ...] = ("off", "light", "normal", "strict")
+#: post_merge_signals.kind (#24, migration 009).
+SignalKind = Literal["reverted", "followup"]
+SIGNAL_KINDS: tuple[str, ...] = ("reverted", "followup")
 CiStatus = Literal["passed", "failed", "base_red", "no_ci", "timed_out", "no_permission"]
 
 COLUMNS: tuple[str, ...] = ("todo", "in_progress", "testing", "done", "dropped")
@@ -266,6 +269,19 @@ class FileLock:
     path: str
     ticket_id: int
     acquired_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class PostMergeSignal:
+    """#24 (migration 009): a merged ticket was reverted, or followed up by another."""
+
+    id: int
+    ticket_id: int
+    attempt_id: int | None
+    kind: SignalKind
+    at: datetime
+    detail: str
+    recorded_at: datetime
 
 
 @dataclass(frozen=True, slots=True)
@@ -1335,3 +1351,62 @@ class Store:
         with self.transaction() as conn:
             cur = conn.execute("DELETE FROM file_locks WHERE ticket_id = ?", (ticket_id,))
             return cur.rowcount
+
+    # -- post-merge signals (#24, migration 009) --
+
+    def merged_tickets(self, *, since: datetime, repo: str | None = None) -> list[Ticket]:
+        """Tickets the user merged (done, with an accepted attempt and a PR) whose
+        ``done_at`` is at or after ``since``, oldest first."""
+        sql = (
+            "SELECT * FROM tickets WHERE \"column\" = 'done' AND accepted_attempt_id IS NOT NULL"
+            " AND pr_number IS NOT NULL AND done_at >= ?"
+        )
+        params: list[Any] = [_ts(since)]
+        if repo is not None:
+            sql += " AND repo = ?"
+            params.append(repo)
+        return [_row_to(Ticket, r) for r in self.query(sql + " ORDER BY done_at, id", params)]
+
+    def record_post_merge_signal(
+        self,
+        ticket_id: int,
+        kind: SignalKind,
+        *,
+        at: datetime,
+        detail: str = "",
+        attempt_id: int | None = None,
+    ) -> bool:
+        """Record a signal once per (ticket, kind). True if new, False if already there.
+
+        ``attempt_id`` defaults to the ticket's accepted attempt."""
+        if kind not in SIGNAL_KINDS:
+            raise ValueError(f"unknown post-merge signal kind {kind!r}")
+        if attempt_id is None:
+            attempt_id = self.get_ticket(ticket_id).accepted_attempt_id
+        with self.transaction() as conn:
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO post_merge_signals"
+                " (ticket_id, attempt_id, kind, at, detail, recorded_at)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                (ticket_id, attempt_id, kind, _ts(at), detail, _ts(self.now())),
+            )
+            return cur.rowcount == 1
+
+    def list_post_merge_signals(
+        self, *, ticket_id: int | None = None, kind: SignalKind | None = None
+    ) -> list[PostMergeSignal]:
+        where, params = [], []
+        if ticket_id is not None:
+            where.append("ticket_id = ?")
+            params.append(ticket_id)
+        if kind is not None:
+            where.append("kind = ?")
+            params.append(kind)
+        sql = "SELECT * FROM post_merge_signals"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        out = []
+        for r in self.query(sql + " ORDER BY id", params):
+            sig = _row_to(PostMergeSignal, r)
+            out.append(replace(sig, at=datetime.fromisoformat(r["at"])))
+        return out
