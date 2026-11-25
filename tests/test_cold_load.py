@@ -163,7 +163,14 @@ def test_retry_is_capped_at_one():
     model = ColdModel(slow_replies=5, delay=2.0)  # every reply outlasts both budgets
     _questions(model, 5)
     key = "fake-" + secrets.token_hex(8)
-    p = ModelProxy(CONFIG, transport=httpx.MockTransport(model.handle), key_resolver=lambda e: key)
+    # Two local slots: the abandoned first call still holds one until its slow reply ends
+    # (#34), and this test counts calls that reach the model, not queueing.
+    p = ModelProxy(
+        CONFIG,
+        transport=httpx.MockTransport(model.handle),
+        key_resolver=lambda e: key,
+        max_local_inference=2,
+    )
     p.start()
     try:
         r = assess(

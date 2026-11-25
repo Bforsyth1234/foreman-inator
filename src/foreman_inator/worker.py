@@ -131,6 +131,7 @@ from foreman_inator.github.client import GitHubAPI
 from foreman_inator.github.poller import Poller
 from foreman_inator.locks import Locks
 from foreman_inator.pr.publisher import Publisher
+from foreman_inator.resources.ollama import OllamaWatch
 from foreman_inator.routing import escalation
 from foreman_inator.runner import sandbox
 from foreman_inator.runner.worktree import WorktreeManager
@@ -190,6 +191,7 @@ class Worker(
         attempt_timeout: float | None = None,
         verify_timeout: float = 20 * 60,
         review_timeout: float | None = None,
+        ollama_watch: OllamaWatch | None = None,
     ) -> None:
         self.api = api
         self.store = store
@@ -228,6 +230,10 @@ class Worker(
         self._local = threading.local()
         #: #23: the embedding model; the proxy must serve it (``Config.proxy_models``).
         self.embedder = config.embedder()
+        #: #52: what Ollama has loaded (tier 1's local host), for the cold-load allowance
+        #: of the clarity check and the router. ``run()`` passes ``ollama_watch_for``;
+        #: None (tests) asks nothing and keeps the plain timeout.
+        self.ollama_watch = ollama_watch
         self._init_background()
         self._ensure_variants()
         self.actions: dict[Action, Callable[[Ctx], None]] = {
@@ -330,9 +336,12 @@ class Worker(
     # ------------------------------------------------------------------ policy
 
     def policy_for(self, ticket: Ticket) -> escalation.Step | None:
-        """Escalation's decision for ``ticket`` from its stored rows (crash safe). #51's
-        repo profiles plug their limits in here."""
-        return self.policy(self.history(ticket))
+        """Escalation's decision for ``ticket`` from its stored rows (crash safe). #51:
+        a repo profile other than ``default`` passes its limits."""
+        h = self.history(ticket)
+        if (lim := self.limits(ticket)) is not None:
+            return self.policy(h, limits=lim)  # type: ignore[call-arg]
+        return self.policy(h)
 
     def history(self, ticket: Ticket) -> escalation.History:
         """What escalation reads. Attempts paused by a spend cap or a lock yield are left
@@ -348,6 +357,7 @@ class Worker(
             tuple(self.store.list_reviews(ticket_id=ticket.id, shadow=False)),
             routed_tier=ticket.routed_tier,
             explore=self.explore(ticket),
+            start_tier=self.start_tier(ticket),
         )
 
     # ------------------------------------------------------------------ events
@@ -494,6 +504,14 @@ class Worker(
 
 
 # ====================================================================== run()
+
+
+def ollama_watch_for(config: Config) -> OllamaWatch:
+    """#52: one ``OllamaWatch`` on tier 1's local endpoint (else any local one, else the
+    embedding host): the Ollama the clarity check and the router ask about cold loads."""
+    local = [m for m in config.models if m.kind == "local"]
+    first = next((m for m in local if m.tier == 1), local[0] if local else None)
+    return OllamaWatch(first.base_url if first is not None else config.embedding_base_url)
 
 
 def run(*, once: bool = False) -> int:

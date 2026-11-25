@@ -43,6 +43,8 @@ as `"keychain:foreman-inator/<name>"`.
 | `attempt_budget_usd` | `1.50` | Cloud spend one attempt may use. Over it, the attempt ends and the ticket is handed to you (`attempt_budget`), with no retry on any tier. Above 0. |
 | `attempt_max_input_tokens_cloud` | `1500000` | Input tokens one attempt may send to cloud models, with the same effect. At least 1. |
 | `attempt_max_input_tokens_local` | `4000000` | Input tokens one attempt may send to local models, with the same effect. At least 1. |
+| `cold_load_timeout_seconds` | `120` | Extra seconds the clarity check and the router wait when Ollama says their model is not loaded yet (a cold load); a timeout while the model loads is retried once. The worker asks tier 1's local Ollama (`/api/ps`). 0 to 3600. |
+| `max_local_inference` | `1` | Local-model calls in flight at once, across the worker and its experiment runs; the rest queue. Time spent queued never counts against an attempt's writer timeout. Cloud calls and embeddings are not limited. 1 to 16. |
 | `retention_days` | `90` | Days `fman prune` and the worker's daily prune keep an unmerged ticket's recordings and traces and ended attempts' scratch. At least 1. |
 
 ## `[spend_caps]`
@@ -69,6 +71,36 @@ the model proxy. Repos not listed get `"none"`.
 
 `"allow"` is needed today for a repo whose checks install dependencies (todo
 #45). It also lets check code send anything it can read.
+
+## `[rules_file]`
+
+Per repo, one more rules file put into the writer's prompt (a path; `~` is
+expanded; use an absolute path). Repos not listed have none.
+
+```toml
+[rules_file]
+"owner/name" = "~/notes/owner-name-rules.md"
+```
+
+## Rules the writer is given
+
+Every attempt's prompt carries the rules from these sources, in this order:
+
+1. `~/.foreman-inator/AGENTS.md`: your rules for every repo. It is kept at
+   mode 600 (a looser mode is tightened when read).
+2. The repo's `[rules_file]`, if set.
+3. The repo's root `AGENTS.md` and `CLAUDE.md`, both of them. A file that is a
+   symlink of, or identical to, an earlier one is skipped.
+4. `AGENTS.md` / `CLAUDE.md` in the folders on the path of the files the issue
+   names, shallow folders first.
+
+The prompt tells the model that a repository file wins where it disagrees with
+your global or per-repo rules. All sources share one budget of 6,000
+characters. When they do not fit, the global file is cut first, then the
+`[rules_file]`, then nested files (deepest first), then `CLAUDE.md`, and the
+root `AGENTS.md` last; each cut is logged as a warning. Repo files are read only
+from inside the worktree. The attempt's trace span records the hash of the
+block the model saw (`conventions.sha256`).
 
 ## `[experiments]`
 
@@ -157,8 +189,34 @@ api_key_ref = "keychain:foreman-inator/glm"
 
 ## Per-repo settings in the database
 
-One setting is kept in the worker's database rather than in `config.toml`:
-the verify command, set with `fman repo set-verify <owner/name> '<command>'`
-and cleared with `--clear`. The per-repo profiles described in SPEC.md
-(`writer` and `review` modes, `fman repo set-profile`) are not built yet
-(todo #51).
+Two settings are kept in the worker's database rather than in `config.toml`:
+
+* the verify command, set with `fman repo set-verify <owner/name> '<command>'`
+  and cleared with `--clear`;
+* the repo profile, set with `fman repo set-profile` (below).
+
+### Repo profiles
+
+A profile is two modes. `writer` sets how hard the writer tries:
+
+| `writer` | Effect |
+| --- | --- |
+| `thrifty` | 3 failed checks on a tier before moving up; a cloud writer attempt waits for `fman approve-spend`; 25% of tickets start one tier lower. |
+| `normal` | Today's rules: 2 failed checks per tier; `explore_rate` applies. |
+| `fast` | Starts one configured tier above the router's pick (capped at the top tier); the first failed check moves up; never starts lower. |
+
+`review` sets how much review a change gets before the PR is marked ready:
+
+| `review` | Effect |
+| --- | --- |
+| `off` | No review: checks pass, the PR is marked ready and handed to you, as with `review:skip`. |
+| `light` | The reviewer's tests, coverage and revert checks only; no model reads the diff. |
+| `normal` | Today's AI review; `review:skip` counts. |
+| `strict` | The full AI review; `review:skip` is ignored; one AI kickback moves up a tier. |
+
+Presets: `prototype` = fast + off, `personal` = thrifty + light, `default` =
+normal + normal, `production` = fast + strict. A `tier:N` label is never
+shifted, and user kickbacks work the same in every mode. A repo with no profile
+is `default`. `fman status` lists every repo whose profile is not `default`,
+and that repo's PR descriptions carry a `Repo profile:` line. A change takes
+effect on the worker's next decision.

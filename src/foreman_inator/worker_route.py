@@ -143,6 +143,8 @@ class RouteSteps:
                 config=self.config,
                 proxy=self.proxy,
                 timeout=float(self.config.router_timeout_seconds),
+                watch=self.ollama_watch,  # type: ignore[attr-defined]
+                cold_load_allowance=float(self.config.cold_load_timeout_seconds),
             )
         if isinstance(result, clarify.Clear):
             self.store.set_cursor(t.repo, "clear", key)
@@ -199,6 +201,8 @@ class RouteSteps:
                     config=self.config,
                     proxy=self.proxy,
                     timeout=float(self.config.router_timeout_seconds),
+                    watch=self.ollama_watch,  # type: ignore[attr-defined]
+                    cold_load_allowance=float(self.config.cold_load_timeout_seconds),
                 )
         p = self.repo_profile(t)
         limits = prof.limits_for(p)

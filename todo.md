@@ -99,9 +99,9 @@ Package root below is `src/foreman_inator/` (written `pkg/`).
 | 9 | A: #29 (alone: wiring) | `pkg/worker.py`, `pkg/cli.py` (`experiment`, `replay`), `pkg/metrics/web.py` (new routes and failure-step columns), `tests/test_worker_v3.py` | [x] built; live check open for #29 |
 | 10 | A: #30 · B: #31 · C: #32 | A `pkg/export.py` · B `pyproject.toml` (metadata, entry points), `.github/workflows/release.yml`, `docs/releasing.md` · C `README.md`, `docs/setup.md`, `docs/how-it-works.md`, `docs/demo.gif` (+ own tests). Runner at close: `cli.py` (`export`) | [x] built; live checks open for #31, #32 |
 | 13 | A1: GH #50, #55 · A2: GH #51 · A3: GH #57 · A4: GH #58 · A5: GH #56 · A6: todo #58 (GH #35) | A1 `pkg/worker_status.py`, `pkg/locks.py` · A2 `pkg/setup/deps.py`, `pkg/routing/knn.py`, `pkg/worker_background.py` · A3 `pkg/runner/install.py`, `pkg/worker_install.py` · A4 `pkg/spend.py`, `pkg/worker_attempt.py`, `pkg/routing/escalation.py`, `pkg/pr/summary.py`, `pkg/db/store.py`, `007_attempt_budget.sql` · A5 `pkg/prune.py`, `pkg/worker_prune.py`, `pkg/tracing/recorder.py`, `docs/setup.md`, `docs/how-it-works.md` · A6 `pkg/resources/` (+ own tests). Runner at close: config keys `attempt_budget_usd`, `attempt_max_input_tokens_cloud/_local`, `retention_days`, `install_refill_cache`; `PruneSteps` + daily prune in the poll; `fman prune`; budget in status/summary/export | [x] built |
+| 14 | B1: GH #52 · B2: todo #57 (GH #34) · B3: todo #59 (GH #36) · B4: todo #51 (GH #28) · B5: todo #46 (GH #23) · B6: todo #61, #63 (GH #38, #40) | B1 `pkg/tickets/clarify.py`, `pkg/routing/rules.py` · B2 `pkg/proxy/server.py`, `pkg/runner/opencode.py` · B3 `pkg/resources/memory.py`, `pkg/worker_attempt.py` · B4 `pkg/routing/profile.py`, `pkg/routing/escalation.py`, `pkg/review/reviewer.py`, `pkg/spend.py`, `pkg/worker_review.py`, `pkg/worker_route.py`, `pkg/worker_status.py`, `pkg/db/store.py`, `008_profiles.sql` · B5 `pkg/metrics/queries.py`, `pkg/metrics/web.py` · B6 `pkg/tickets/conventions.py`, `pkg/tickets/prompt.py`, `pkg/paths.py` (+ own tests). GH #52 (cold-load allowance for the clarity check and router) has no todo id. Runner at close: config `cold_load_timeout_seconds`, `max_local_inference`, `[rules_file]`; `OllamaWatch` on the worker; shared `LocalSlots` + driver `extra_time`; profile limits/start tier in the policy, `writer_gate`, review-off hand-over, `fman repo set-profile`, PR profile line; `conventions.gather` in the attempt | [x] built; live check open for #51 |
 | — | #33–#39 | unscheduled (SPEC milestone 5) | open |
 | — | #45–#50 | unscheduled (gap review, 2026-11-23) | open |
-| — | #51 | unscheduled (user request, 2026-11-23); proposed as its own wave after 6b | open |
 | — | #52 | unscheduled (user request, 2026-11-23); after 6b, can share a wave with #51 (disjoint files) | open |
 | — | #53–#56 | unscheduled (first live run, 2026-11-23); #45 gained live evidence in the same run | open |
 
@@ -257,9 +257,7 @@ Why: no install step exists anywhere in the code (no `npm ci`, `uv sync` or `swi
 Idea: detect an install command next to the verify command, save it per repo like `fman repo set-verify`, run it once per worktree. Needs network, so decide it together with #40's `sandbox_network`.
 Live evidence (2026-11-23, first live run, `Bforsyth1234/fman-playground`, ticket 2, attempt 11): with the sandbox on, verify ran `uv run pytest` and failed with "Network connectivity is disabled, but the requested data wasn't found in the cache" (`~/.foreman-inator/traces/2/attempt-11-verify.log`). The sandbox moves `UV_CACHE_DIR` into an empty scratch dir and the repo had no `sandbox_network = "allow"`, so nothing could be installed. The change itself was correct. The writer hit the same wall in its own bash tool and spent most of 18.6 minutes and 585k input tokens trying to get pytest to run. This now blocks every repo with dependencies, so it is no longer only a gap-review idea. Options seen: a read-only shared package cache inside the sandbox, an install step that runs with network before the sandboxed verify, or telling the user to set `sandbox_network` when verify fails this way.
 
-#46 — Metrics: attempt minutes and review count next to dollars [ ] · Added: 2026-11-23 · Source: assistant (gap review; user asked "why wouldnt local llms be priced at 0")
-Why: local models cost $0 per token (correct), so "cost per accepted ticket" shows a local model that took 3 attempts and 2 reviews as free.
-Idea: metrics page only. `attempts.seconds` is already recorded; add total attempt minutes and the user's review count per accepted ticket, per model.
+#46 — Metrics: attempt minutes and review count next to dollars [x] · done 2026-11-25, wave 14, see DONE.md · Added: 2026-11-23 · Source: assistant (gap review)
 
 #47 — Post-merge quality signal [ ] · Added: 2026-11-23 · Source: assistant (gap review)
 Why: a merge counts as success forever. A merged change that is reverted, or fixed by a follow-up ticket a few days later, still counts as accepted for its model and still trains the router.
@@ -279,38 +277,7 @@ Idea: for `large`, a tier 3 model proposes sub-issues in a comment; the user app
 
 ### Unscheduled (user request, 2026-11-23)
 
-#51 — Repo profiles: per-repo `writer` and `review` settings [ ]
-Wave: _ (proposed: its own wave after 6b) · Agent: _ · Added: 2026-11-23 · Source: user
-Ask: "a setting per repo that prioritizes speed over cost saving and correctness over cost … personal project can take a lot of time and have bugs but cost little", and "sometimes i build prototypes and i want speed to be most important minor bugs dont matter".
-Why: the retry and kickback limits are module constants (`routing/escalation.py:75-79`), the router's pick is used as is, and AI review is the same for every repo. `repo_settings` holds only the verify command.
-DECISIONS (assistant, 2026-11-23; the user approved the two settings, `review = off` and the four presets, and can overturn the rest):
-1. Two settings per repo, not three sliders: cost is what the other two are bought with. `writer` = `thrifty` | `normal` | `fast`. `review` = `off` | `light` | `normal` | `strict`. No setting means `normal` + `normal`, which must behave exactly as the code does today.
-2. `writer`: `thrifty` allows 2 retries on a tier before moving up (3 check attempts) and makes a cloud writer attempt wait for approval. `fast` starts one tier above the router's pick (capped at the top tier) and moves up on the first failed check. User-kickback rules are the same in all three.
-3. `review`: `off` takes the existing `review:skip` path (checks pass → PR marked ready). `light` runs review checks 1–3 (tests, coverage, revert) and gives its verdict from hard findings alone: no run-app, no model call. `strict` ignores `review:skip` and moves the writer up on the first AI kickback.
-4. Presets: `prototype` = fast + off · `personal` = thrifty + light · `default` = normal + normal · `production` = fast + strict.
-5. Stored in `repo_settings` (`writer_mode`, `review_mode`), set by `fman repo set-profile <repo> <preset>` or `--writer` / `--review`, shown by `fman status` and in the PR description. Same home as `fman repo set-verify`; #49 (`cloud = false`) and #45 (install command) should use it too.
-6. A `tier:N` label is never shifted. The shift is applied after the router's guess; `route_reason` records both ("profile fast: tier 1 → 2"), and every attempt records `writer_mode` and `review_mode`. #23 must learn from the router's own pick, not the shifted start, and #20's metrics can split by mode.
-7. Exploration rate per mode (thrifty 25%, normal 10%, fast 0%) is defined here and read by #23 (`routing/explore.py`, wave 8); nothing explores until #23 is built.
-8. No per-repo budget in this item. The global daily and monthly caps apply to every profile. `thrifty`'s approval reuses the refusal and `approve` path in `spend.py` with its own reason.
-9. Invariants: every mode keeps a finite attempt bound (7e); `light` and `off` run no model reviewer, so 7f is not in play; `off` marks the PR ready with no review, as `review:skip` already does.
-SPEC change needed: "Routing and escalation" gains "Repo profiles" and `attempts` gains `writer_mode, review_mode`. Both are already in SPEC.md (2026-11-23); the Claude doc, the source of truth, still needs them.
-Files:
-⚬ OWNED: `src/foreman_inator/routing/profile.py`, `tests/test_profile.py`, one migration with the next free number when this is built (002 and 003 are claimed by #41 and #43)
-⚬ EDITED (additive, earlier waves): `src/foreman_inator/routing/escalation.py` (limits passed in; today's constants stay as the defaults), `src/foreman_inator/review/reviewer.py` (a `depth` argument on `review_change`), `src/foreman_inator/db/store.py` (`RepoSettings` fields, `set_profile`, the two attempt columns), `src/foreman_inator/spend.py` (the approval reason)
-⚬ Do NOT touch: `cli.py`, `worker.py`, `pr/publisher.py` (rule 9: the runner wires them at close).
-Scheduling: `store.py` and the migrations belong to wave 6b slot B, and the wiring needs #21's loop, so this runs after 6b. Because `normal` is the default and equals today's behaviour, #21 needs no change to be built first.
-Approach: `profile.py` is pure: `Profile(writer, review)`, `PRESETS`, `limits_for(profile) -> Limits` (check attempts, user and AI kickback limits, start shift, explore rate, cloud approval), `shift_start(tier, ladder, limits)`, `review_plan(profile)` (off | hard checks only | full; whether the skip label counts). `make_policy(ladder, limits=...)`, `next_step` and `attempt_bound` take `Limits`. Runner at close: `fman repo set-profile`, the profile line in `fman status` and the PR description, and three call sites in `worker.py` (route, policy, review). Fallback if `light` can't reuse the reviewer cleanly: `light` calls the check functions in `review/checks.py` directly and builds the verdict in `profile.py`'s caller.
-Verify:
-⚬ `default` gives the same decision as today on every existing escalation test, and `attempt_bound(4)` is unchanged.
-⚬ `fast`: tier 1 pick starts on tier 2, tier 3 stays 3, a `tier:N` label is not shifted, the first failed check escalates.
-⚬ `thrifty`: three failed checks before moving up; a cloud writer attempt is refused until approved.
-⚬ For every `writer` × `review` pair, any history ends with the user within `attempt_bound` (invariant 7e).
-⚬ `off`: no review row, no model call, PR ready. `light`: the fake reviewer model is called 0 times and a hard finding still gives `request_changes`. `strict`: `review:skip` is ignored and one AI kickback escalates.
-⚬ `set_profile` round-trips through the store; an unknown preset is rejected with the valid names; an attempt row records both modes.
-⚬ pytest + ruff gate (rule 8).
-⚬ Non-vacuous: make `limits_for(fast)` return the default limits, the `fast` tests fail; let `light` call the model, the zero-calls test fails.
-Live (user): set a toy repo to `prototype` and label 2 issues: both PRs arrive ready with no bot review. Set it to `production`, label one issue with `review:skip`: the review still runs.
-Deviations:
+#51 — Repo profiles: per-repo `writer` and `review` settings [~] live · done 2026-11-25, wave 14, see DONE.md · Added: 2026-11-23 · Source: user
 
 #52 — Prompt caching: native Anthropic route in the proxy, cached-token accounting for Claude and GLM [ ]
 Wave: _ (after 6b; can share a wave with #51) · Agent: _ · Added: 2026-11-23 · Source: user
@@ -374,15 +341,11 @@ Idea: setup shows the count and asks which repos to work on when the installatio
 
 Asked by the user: "should we add the ability for the app to track gpu / memory usage and keep track of how many local models are running at a time?", then "lets add all 4 to the todo.md". GPU utilization % is left out on purpose: on macOS it needs `sudo powermetrics`, which a launchd worker cannot run, and on Apple Silicon the GPU shares system memory, so memory pressure plus Ollama's loaded-model list covers it.
 
-#57 — Global cap on concurrent local-model inference [ ] · Added: 2026-11-23 · Source: user
-Why: `max_parallel_per_repo` (default 1, "one local GPU") is counted per repo, and nothing limits local work across repos. Three watched repos can send three tickets to Ollama at once, each loading `qwen3.8:27b` or `inkling-2-mini`: models get evicted and reloaded, the machine swaps, and attempts slow down or time out. Those runs are then recorded as model failures in the metrics and the kNN router's data.
-Idea: a `max_local_inference` config setting (default 1). The proxy holds one shared semaphore for requests to `local` tier endpoints; cloud tiers are not limited. Time spent waiting for a slot is recorded on the `llm.call` span and not counted against the attempt's timeout. Estimate: about 2 hours with tests.
+#57 — Global cap on concurrent local-model inference [x] · done 2026-11-25, wave 14, see DONE.md · Added: 2026-11-23 · Source: user
 
 #58 — Poll Ollama for loaded models [x] · done 2026-11-25, wave 13, see DONE.md · Added: 2026-11-23 · Source: user
 
-#59 — Record memory state on each attempt [ ] · Added: 2026-11-23 · Source: user
-Why: a slow or failed local attempt can't be told apart from a starved machine. Without this, resource contention looks like model quality in the metrics and replay sets.
-Idea: at attempt start (and optionally at end), store the loaded models from #58 plus system memory used and memory pressure (`psutil`, or `vm_stat` / `memory_pressure` on macOS) on the attempt's trace. Decide whether it belongs on a span attribute (no schema change) or in an attempt column. Estimate: about 2 hours.
+#59 — Record memory state on each attempt [x] · done 2026-11-25, wave 14, see DONE.md · Added: 2026-11-23 · Source: user
 
 #60 — Resource panel on the metrics page [ ] · Added: 2026-11-23 · Source: user
 Why: makes #57–#59 visible: current loaded models and their memory, system memory used, and local inference slots in use vs. the cap.
@@ -392,17 +355,13 @@ Idea: a panel in `metrics/web.py` fed by #58's poller and the #57 semaphore; per
 
 Asked by the user: "what about agent md files? do we need to tell the agents to read those? Should we add the ability to add them? maybe the users want some global rules etc?", then "ok add these as todos to todo.md should we add the ability to test these rules?". Today `tickets/prompt.py` reads the first of `AGENTS.md` / `CLAUDE.md` in the worktree (`CONVENTIONS_FILES`, 6,000-char budget) into the writer prompt's `conventions` section. Nothing else sees it, and there is no user-level rules file.
 
-#61 — Global rules file for every repo [ ] · Added: 2026-11-23 · Source: user
-Why: users want rules that apply to every repo the worker touches (commit style, "never add dependencies", language preferences). There is nowhere to put them: OpenCode's own `~/.config/opencode/AGENTS.md` is never read because `XDG_CONFIG_HOME` points at foreman-inator's dirs, on purpose (`runner/opencode.py`).
-Idea: `~/.foreman-inator/AGENTS.md` (mode 600, invariant d) plus an optional per-repo `rules_file` in config. Shown in the prompt before the repo's own file, under its own heading; the prompt says the repo's file wins on a conflict. Shares `CONVENTIONS_BUDGET` with the repo file (global clipped first) or gets its own budget: decide and record. Replays record which global text was used so a later edit doesn't change old results. Estimate: about 1 hour with tests.
+#61 — Global rules file for every repo [x] · done 2026-11-25, wave 14, see DONE.md · Added: 2026-11-23 · Source: user
 
 #62 — The reviewer sees the repo's conventions [ ] · Added: 2026-11-23 · Source: assistant (gap review)
 Why: `reviewer-v1.md` defines the `style` tag as "ignores the repository's conventions", but `review/` never calls `read_conventions`, so the reviewer judges style with no conventions to compare against. Style kickbacks are guesses.
 Idea: pass the same conventions text (repo + #61 global) into the reviewer prompt, same budget and `defuse`. Invariant f is unaffected: conventions are repo input, not the writer's reasoning. Needs a reviewer prompt bump (`reviewer-v2`) so replays can compare it to v1. Estimate: about 45 minutes.
 
-#63 — Read both AGENTS.md and CLAUDE.md, not the first one found [ ] · Added: 2026-11-23 · Source: assistant (gap review)
-Why: `CONVENTIONS_FILES` is "first one found wins". A repo with both files loses every `CLAUDE.md` rule without a warning. Nested files (`pkg/AGENTS.md`) are also ignored.
-Idea: read both root files, skip one that is identical to or a symlink of the other, and label each in the prompt. Nested files: include those on the path of the ticket's `owned_files` when there are any, within the budget. Log a warning when the budget clips the text. Estimate: about 45 minutes.
+#63 — Read both AGENTS.md and CLAUDE.md, not the first one found [x] · done 2026-11-25, wave 14, see DONE.md · Added: 2026-11-23 · Source: assistant (gap review)
 
 #64 — Check whether OpenCode loads AGENTS.md on its own [ ] · Added: 2026-11-23 · Source: assistant (gap review)
 Why: OpenCode reads `AGENTS.md` from the project dir by default (not confirmed for 1.18.7). If it does, the writer gets the file twice: once from OpenCode, once from our prompt (clipped). That doubles its token cost and makes replays depend on OpenCode's behaviour too.

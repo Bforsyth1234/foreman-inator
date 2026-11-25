@@ -3,7 +3,7 @@
 Commands: ``setup`` (#8), ``config set-key`` (#2), ``run`` and ``status`` and
 ``repo set-verify`` (#14), ``metrics`` and ``approve-spend`` (#21), ``experiment run |
 status | promote`` and ``replay`` (#29), ``repo add | remove | list`` (#56), ``prune``
-(#56). Later waves
+(#56), ``repo set-profile`` (#51). Later waves
 add ``@app.command()`` functions here.
 
 The callback below keeps `app` a multi-command group, so adding commands
@@ -254,6 +254,38 @@ def repo_set_verify(
     typer.echo(f"Saved. {repo} is verified with: {command}")
     if cleared:
         typer.echo(f"Unflagged ticket(s) {', '.join(f'#{i}' for i in cleared)}; work resumes.")
+
+
+@repo_app.command("set-profile")
+def repo_set_profile(
+    repo: Annotated[str, typer.Argument(help="owner/name")],
+    preset: Annotated[
+        str | None,
+        typer.Argument(help="prototype | personal | default | production"),
+    ] = None,
+    writer: Annotated[str | None, typer.Option("--writer", help="thrifty | normal | fast")] = None,
+    review: Annotated[
+        str | None, typer.Option("--review", help="off | light | normal | strict")
+    ] = None,
+) -> None:
+    """Set REPO's profile: how hard the writer tries and how much review a change gets."""
+    import re
+
+    from foreman_inator import paths
+    from foreman_inator.db.store import Store
+    from foreman_inator.routing import profile as prof
+    from foreman_inator.worker_status import set_profile
+
+    if not re.match(r"^[\w.-]+/[\w.-]+$", repo):
+        raise typer.BadParameter("repo must look like owner/name")
+    if preset is None and writer is None and review is None:
+        raise typer.BadParameter("give a preset, --writer or --review")
+    with Store(paths.db_path()) as store:
+        try:
+            p = set_profile(store, repo, preset, writer=writer, review=review)
+        except prof.ProfileError as exc:
+            raise typer.BadParameter(str(exc)) from exc
+    typer.echo(f"Saved. {repo}: {prof.describe(p)}. The worker uses it from its next decision.")
 
 
 @repo_app.command("set-install")

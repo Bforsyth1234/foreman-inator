@@ -802,7 +802,7 @@ def test_experiment_run_cli_lock_and_signals(tmp_path: Path, monkeypatch) -> Non
         return P()
 
     monkeypatch.setattr(wx, "make_proxy", fake_proxy)
-    monkeypatch.setattr("foreman_inator.runner.opencode.OpenCodeDriver", lambda: object())
+    monkeypatch.setattr("foreman_inator.runner.opencode.OpenCodeDriver", lambda **kw: object())
     r = CliRunner().invoke(app, ["experiment", "run", "--all"])
     assert r.exit_code == 0, r.output
     assert "No unfinished replays" in r.output and proxies == ["stopped"]
