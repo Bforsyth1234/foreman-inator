@@ -1,7 +1,8 @@
 """Check the tools the worker needs. Prints install/pull commands; never runs them.
 
 Checked: ``git`` >= 2.31 (worktree manager), ``opencode``, ``ollama``, and whether each
-local tier 1/2 model in the config is pulled in Ollama.
+local tier 1/2 model in the config, and the kNN router's local embedding model (#51), is
+pulled in Ollama.
 
 Shapes relied on (rule 12, read 2026-11-23):
 - Ollama ``GET /api/tags`` -> ``{"models": [{"name": ..., "model": ...}, ...]}`` on the
@@ -94,36 +95,55 @@ def _matches(wanted: str, pulled: set[str]) -> bool:
     return wanted in pulled or (":" not in wanted and f"{wanted}:latest" in pulled)
 
 
+def _pulled(host: str, transport: httpx.BaseTransport | None) -> set[str] | str:
+    """The model names pulled on the Ollama at ``host``, or why they could not be read."""
+    try:
+        with httpx.Client(transport=transport, timeout=5.0) as http:
+            resp = http.get(f"{host}/api/tags")
+            resp.raise_for_status()
+            data = resp.json()
+        names: set[str] = set()
+        for entry in data.get("models", []):
+            names.update(str(entry[k]) for k in ("name", "model") if entry.get(k))
+        return names
+    except (httpx.HTTPError, ValueError, AttributeError, TypeError) as exc:
+        return f"Ollama not reachable at {host} ({exc.__class__.__name__})"
+
+
+def _model_check(label: str, model: str, pulled: set[str] | str) -> Check:
+    if isinstance(pulled, str):
+        fix = f"start Ollama (open the app or `ollama serve`), then: ollama pull {model}"
+        return Check(label, False, pulled, fix)
+    if _matches(model, pulled):
+        return Check(label, True, "pulled")
+    return Check(label, False, "not pulled", f"ollama pull {model}")
+
+
 def check_models(
-    cfg: Config, *, transport: httpx.BaseTransport | None = None, tiers: Sequence[int] = (1, 2)
+    cfg: Config,
+    *,
+    transport: httpx.BaseTransport | None = None,
+    tiers: Sequence[int] = (1, 2),
+    embedding: bool = True,
 ) -> list[Check]:
-    """One check per local model of ``tiers``: is it pulled in Ollama?"""
-    wanted = [m for t in tiers for m in cfg.models_for_tier(t) if m.kind == "local"]
-    checks: list[Check] = []
+    """One check per local model of ``tiers``, plus the embedding model when it is local
+    (``embedding``): is it pulled in Ollama? Each host's ``/api/tags`` is read once."""
+    wanted = [
+        (f"model tier {m.tier}: {m.model}", m.model, m.base_url)
+        for t in tiers
+        for m in cfg.models_for_tier(t)
+        if m.kind == "local"
+    ]
+    emb = cfg.embedder()
+    if embedding and emb.kind == "local":
+        wanted.append((f"embedding model: {emb.model}", emb.model, emb.base_url))
     pulled_by_host: dict[str, set[str] | str] = {}
-    for m in wanted:
-        host = ollama_host(m.base_url)
+    checks: list[Check] = []
+    for label, model, base_url in wanted:
+        host = ollama_host(base_url)
         if host not in pulled_by_host:
-            try:
-                with httpx.Client(transport=transport, timeout=5.0) as http:
-                    resp = http.get(f"{host}/api/tags")
-                    resp.raise_for_status()
-                    data = resp.json()
-                names: set[str] = set()
-                for entry in data.get("models", []):
-                    names.update(str(entry[k]) for k in ("name", "model") if entry.get(k))
-                pulled_by_host[host] = names
-            except (httpx.HTTPError, ValueError) as exc:
-                pulled_by_host[host] = f"Ollama not reachable at {host} ({exc.__class__.__name__})"
-        pulled = pulled_by_host[host]
-        label = f"model tier {m.tier}: {m.model}"
-        if isinstance(pulled, str):
-            fix = f"start Ollama (open the app or `ollama serve`), then: ollama pull {m.model}"
-            checks.append(Check(label, False, pulled, fix))
-        elif _matches(m.model, pulled):
-            checks.append(Check(label, True, "pulled"))
-        else:
-            checks.append(Check(label, False, "not pulled", f"ollama pull {m.model}"))
+            pulled_by_host[host] = _pulled(host, transport)
+        checks.append(_model_check(label, model, pulled_by_host[host]))
     return checks
 
 
