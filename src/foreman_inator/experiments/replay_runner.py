@@ -83,11 +83,12 @@ both sides, so the comparison isolates the rules. The override text's hash is pa
 the challenger's variant id (``<model>/<prompt>@<hash8>+rules@<rules hash8>``) and its
 full sha256 is in the experiment's result note, so a later edit of the file is a new
 variant and never changes an old result. The reviewer side passes the override as
-``review_change``'s ``conventions`` argument (``REVIEW_TAKES_CONVENTIONS``, true since
-wave 15); it reaches the model only through a template with a ``conventions`` section
-(``reviewer-v2``). A reviewer result's ``detail`` ends with
-``[tag: <tag>]`` when the review tagged a kickback, so ``SideTotals.style_tags`` counts
-``style`` kickbacks.
+``review_change``'s ``conventions`` argument; it reaches the model only through a
+template with a ``conventions`` section (``reviewer-v2``), so a reviewer rules replay
+whose challenger prompt has none is refused up front (``check_reviewer_rules``). Both
+reviewer sides read the repo's ``rules_file``, as the live review does. A reviewer
+result's ``detail`` ends with ``[tag: <tag>]`` when the review tagged a kickback, so
+``SideTotals.style_tags`` counts ``style`` kickbacks.
 
 Never: a push, a PR, a GitHub call of any kind (this module takes no GitHub client), or a
 write to ``tickets``/``attempts``/``reviews``/``kickbacks``. Its writes go to
@@ -98,7 +99,6 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
-import inspect
 import itertools
 import logging
 import shutil
@@ -144,8 +144,20 @@ WRITER_FAIL_STATUSES = ("failed", "no_change", "agent_failed", "timed_out")
 RULES_SUFFIX = "+rules@"  # challenger variant id: <model>/<prompt>@<hash8>+rules@<hash8>
 RULES_HASH_LEN = 8
 TAG_MARK = "[tag: {tag}]"  # appended to a reviewer result's detail when the review tagged
-# #43: the reviewer takes a rules override only once review_change accepts one (#39).
-REVIEW_TAKES_CONVENTIONS = "conventions" in inspect.signature(rv.review_change).parameters
+#: Why a reviewer rules replay with a prompt lacking a ``conventions`` section is refused.
+NO_CONVENTIONS_SECTION = (
+    "reviewer rules replays need a prompt with a conventions section, such as reviewer-v2;"
+    " {prompt} has none, so the override would reach no model and the replay would compare"
+    " nothing. Pass --challenger <model>/reviewer-v2"
+)
+
+
+def check_reviewer_rules(prompt_name: str) -> None:
+    """#43: refuse a reviewer rules override whose prompt never shows the conventions."""
+    if not rv.wants_conventions(rv.load_reviewer_template(prompt_name)):
+        raise ValueError(NO_CONVENTIONS_SECTION.format(prompt=prompt_name))
+
+
 _EPS = 1e-9
 
 
@@ -888,9 +900,8 @@ def _check_variants(role: Role, champion: Variant, challenger: Variant) -> None:
     if challenger.rules is not None:
         if not challenger.variant_id.endswith(f"{RULES_SUFFIX}{challenger.rules.hash8}"):
             raise ValueError("the challenger's id must name its rules hash (with_rules)")
-        if role == "reviewer" and not REVIEW_TAKES_CONVENTIONS:
-            raise ValueError("the reviewer does not read repo rules yet, so a reviewer rules"
-                             " replay would compare nothing; replay the writer")  # fmt: skip
+        if role == "reviewer":
+            check_reviewer_rules(challenger.prompt_name)  # type: ignore[union-attr]
 
 
 def _drive(
@@ -1245,7 +1256,7 @@ def _reviewer_side(ctx: _SideCtx) -> CaseResult:
     try:
         policy = ctx.policy(work, "review", writer=False)
         extra: dict[str, Any] = {}
-        if ctx.rules is not None:  # #43 (refused in _check_variants unless supported)
+        if ctx.rules is not None:  # #43 (_check_variants: the prompt shows conventions)
             extra["conventions"] = ctx.rules.conventions()
             ctx.conventions_sha256 = extra["conventions"].sha256
         with ctx.tap.watch(ctx.budget, attempt_id=aid) as meter, sandbox.active(policy):
@@ -1263,6 +1274,7 @@ def _reviewer_side(ctx: _SideCtx) -> CaseResult:
                 timeout=settings.review_timeout_s,
                 check_timeout=min(settings.review_timeout_s, settings.verify_timeout_s),
                 cancel=ctx.cancel,
+                rules_file=_rules_file(deps.config, rc.repo),  # production's, as live
                 **extra,
             )
         if meter.refused:

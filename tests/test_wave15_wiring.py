@@ -113,10 +113,43 @@ def test_live_review_gets_the_repos_rules_file(
         e.close()
 
 
+def test_shadow_review_gets_the_repos_rules_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A shadow challenger reads the same ``rules_file`` as the live review it shadows."""
+    from foreman_inator import prompts
+    from foreman_inator.experiments import variants
+    from test_worker_v3 import exp_env, ticket_to_testing
+
+    rules = tmp_path / "team-rules.md"
+    rules.write_text("Always write a docstring.\n")
+    e = exp_env(tmp_path / "e", rules_file={REPO: str(rules)})
+    try:
+        champ = variants.champion(e.store, "reviewer").id
+        ref = variants.register(e.store, "reviewer", "rev-y", prompts.load("reviewer-v1"))
+        wx.ensure_shadow(e.store, champ, ref.id)
+        seen: list[Any] = []
+        real = e.worker._launch_shadow
+
+        def launch(**kw: Any) -> Any:
+            seen.append(kw.get("rules_file"))
+            return real(**kw)
+
+        e.worker._launch_shadow = launch
+        ticket_to_testing(e, 1)
+        e.once()
+        e.drain()
+        assert seen and all(f is not None and Path(f) == rules for f in seen)
+    finally:
+        e.close()
+
+
 def test_review_change_uses_a_given_conventions_override(make_pr, monkeypatch) -> None:  # noqa: F811
     """``conventions=`` (#43) replaces the base-commit gather on a ``reviewer-v2`` review,
-    and the replay runner sees that ``review_change`` takes it."""
-    assert rr.REVIEW_TAKES_CONVENTIONS
+    and the replay runner accepts reviewer-v2 for a rules replay (not reviewer-v1)."""
+    rr.check_reviewer_rules("reviewer-v2")
+    with pytest.raises(ValueError, match="conventions section"):
+        rr.check_reviewer_rules("reviewer-v1")
 
     def boom(*_a: Any, **_kw: Any) -> Any:
         raise AssertionError("an override must not gather the base's rules")

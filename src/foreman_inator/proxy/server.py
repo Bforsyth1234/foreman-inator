@@ -651,6 +651,10 @@ class _AnthropicTee(_Tee):
     def __init__(self) -> None:
         super().__init__()
         self.stream_error: str | None = None
+        #: Whether ``usage.output_tokens`` is final: a whole body, or a streamed
+        #: ``message_delta`` was seen. ``message_start`` reports only the first token
+        #: or so, so a stream cut before its ``message_delta`` must not trust it.
+        self.usage_final = False
 
     def _data(self, data: bytes) -> None:
         try:
@@ -680,6 +684,7 @@ class _AnthropicTee(_Tee):
                 self.finish_reason = delta["stop_reason"]
             if isinstance(obj.get("usage"), dict):
                 self.usage = {**(self.usage or {}), **obj["usage"]}
+                self.usage_final = True
         elif kind == "message_stop":
             self.done = True
         elif kind == "error":
@@ -707,6 +712,7 @@ class _AnthropicTee(_Tee):
             return
         if isinstance(obj.get("usage"), dict):
             self.usage = obj["usage"]
+            self.usage_final = True
         self.finish_reason = obj.get("stop_reason") or self.finish_reason
         for i, block in enumerate(obj.get("content") or []):
             if isinstance(block, dict):
@@ -1389,6 +1395,13 @@ class _Call:
         if not isinstance(tokens_out, int):
             tokens_out = pricing.estimate_tokens(text) if text else 0
             estimated = True
+        elif isinstance(tee, _AnthropicTee) and not tee.usage_final:
+            # A stream cut before its message_delta: message_start's output_tokens is
+            # only the first token, so charge at least what was streamed (as the
+            # OpenAI route does when its stream ends without a usage chunk).
+            guess = pricing.estimate_tokens(text) if text else 0
+            if guess > tokens_out:
+                tokens_out, estimated = guess, True
         if status >= 400 and tee.usage is None:
             tokens_in = tokens_out = 0  # refused upstream: nothing billed
         cache_read = cache["cache_read"]

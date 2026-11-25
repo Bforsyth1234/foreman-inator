@@ -305,6 +305,50 @@ async def test_message_delta_usage_is_cumulative_and_replaces_start(fake):
     assert (got[0].tokens_in, got[0].tokens_out, got[0].cache_read_tokens) == (120, 9, 70)
 
 
+async def test_stream_cut_before_message_delta_charges_the_streamed_text():
+    # message_start reports output_tokens 1; with no message_delta (here an error event
+    # ends the stream) that 1 must not stand in for everything that was streamed.
+    def sse(kind: str, data: dict) -> bytes:
+        return f"event: {kind}\ndata: {json.dumps(data)}\n\n".encode()
+
+    piece = "lorem ipsum dolor sit amet " * 20
+    start = {
+        "type": "message_start",
+        "message": {"usage": {"input_tokens": 10, "output_tokens": 1}},
+    }
+    events = [sse("message_start", start)]
+    events.append(
+        sse(
+            "content_block_start",
+            {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "text", "text": ""},
+            },
+        )
+    )
+    for _ in range(50):
+        delta = {"type": "text_delta", "text": piece}
+        events.append(
+            sse("content_block_delta", {"type": "content_block_delta", "index": 0, "delta": delta})
+        )
+    err = {"type": "error", "error": {"type": "overloaded_error", "message": "Overloaded"}}
+    events.append(sse("error", err))
+    data = b"".join(events)
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=data, headers={"content-type": "text/event-stream"})
+
+    got: list[CallUsage] = []
+    proxy = ModelProxy(MODELS, transport=httpx.MockTransport(handle), on_usage=got.append)
+    async with client_for(proxy) as c:
+        await c.post("/a/1/v1/messages", content=messages_body(stream=True))
+    expected = pricing.estimate_tokens(piece * 50)
+    assert expected > 1_000
+    assert got[0].tokens_out == expected
+    assert got[0].usage_estimated
+
+
 def test_price_cost_with_cache_counts():
     sonnet = pricing.price_for(MODELS[0])
     plain = sonnet.cost(12_000, 0)

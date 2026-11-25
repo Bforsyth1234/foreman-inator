@@ -423,11 +423,11 @@ def run_experiment(
     chall = resolve_challenger(env.store, env.config, r, rr.split_rules_id(spec)[0])
     if rules is not None:
         override = read_rules(rules)
-        if r == "reviewer" and not rr.REVIEW_TAKES_CONVENTIONS:
-            raise ExperimentError(
-                "the reviewer does not read repo rules yet, so a reviewer --rules replay"
-                " would compare nothing; use --role writer"
-            )
+        if r == "reviewer":
+            try:
+                rr.check_reviewer_rules(chall.prompt_name)  # type: ignore[union-attr]
+            except ValueError as exc:
+                raise ExperimentError(str(exc)) from None
         chall = rr.with_rules(chall, override)
         keep_rules(override, home)
     if chall.variant_id == champ.variant_id:
