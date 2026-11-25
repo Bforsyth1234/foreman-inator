@@ -186,7 +186,7 @@ def test_one_server_many_turns_each_with_its_own_model_and_tally(tmp_path: Path,
     turn's counts are its own, and its final text is its own."""
     fake = FakeOpenCode(tmp_path / "oc", Script([edit("app.py", "x = 1\n"), say("did it")]))
     server = make(fake, wt, tmp_path)
-    rec = Recorder(tmp_path / "rec", 0, 3, role="chat")
+    rec = Recorder(tmp_path / "rec", None, 3, role="chat")
     try:
         sid = server.start()
         assert not server.resumed and server.alive()

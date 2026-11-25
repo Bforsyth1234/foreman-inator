@@ -87,7 +87,6 @@ from __future__ import annotations
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass
-from datetime import UTC
 from typing import Literal
 
 from foreman_inator.db.store import Store, Ticket
@@ -427,6 +426,18 @@ class LockResult:
         return _chat_ids(self.conflicts)
 
 
+def holders_text(blockers: Iterable[int], chats: Iterable[int] = ()) -> str:
+    """For log lines: ``ticket(s) #3, #5``, ``chat session 2`` or both, joined by "and"."""
+    parts = []
+    bs, cs = list(blockers), list(chats)
+    if bs:
+        parts.append("ticket(s) " + ", ".join(f"#{b}" for b in bs))
+    if cs:
+        word = "chat session" if len(cs) == 1 else "chat sessions"
+        parts.append(f"{word} " + ", ".join(str(c) for c in cs))
+    return " and ".join(parts) or "nobody"
+
+
 @dataclass(frozen=True, slots=True)
 class Waiter:
     """An open ticket that wants paths other tickets (``blockers``) or chat sessions
@@ -464,7 +475,6 @@ class Locks:
 
     def __init__(self, store: Store) -> None:
         self.store = store
-        self._chat_column = False  # cached once seen: a migration never drops it
 
     # -- reads --
 
@@ -569,21 +579,17 @@ class Locks:
 
         Returns the tickets holding the others (oldest ticket first), whose locks the chat
         does not take; the chat goes on editing (the user decides) and the page warns.
-        A path another chat session holds is left to it (one holder per path). Before
-        migration 012 nothing is locked and nothing is returned.
+        A path another chat session holds is left to it (one holder per path).
         """
         keys = [lock_key(p) for p in clean_paths(paths)]
-        if not keys or not self._has_chat_column():
+        if not keys:
             return []
         by_ticket: dict[int, list[str]] = {}
-        with self.store.transaction() as conn:
+        with self.store.transaction():
             self._sweep_repo(repo)
             rows = self._rows(repo)
             mine = [r.path for r in rows if r.chat_session_id == session_id]
-            now = self.store.now()
-            if now.tzinfo is None:
-                now = now.replace(tzinfo=UTC)
-            stamp = now.astimezone(UTC).isoformat(timespec="microseconds")
+            free: list[str] = []
             for k in keys:
                 if covered(k, mine):
                     continue
@@ -591,17 +597,13 @@ class Locks:
                     r for r in rows if r.chat_session_id != session_id and overlaps(k, r.path)
                 ]
                 if not others:
-                    conn.execute(
-                        "INSERT INTO file_locks (repo, path, ticket_id, chat_session_id,"
-                        " acquired_at) VALUES (?, ?, NULL, ?, ?) ON CONFLICT (repo, path)"
-                        " DO NOTHING",
-                        (repo, k, session_id, stamp),
-                    )
+                    free.append(k)
                     rows.append(_Row(k, None, session_id))
                     mine.append(k)
                     continue
                 for tid in sorted({r.ticket_id for r in others if r.ticket_id is not None}):
                     by_ticket.setdefault(tid, []).append(k)
+            self.store.insert_chat_locks(session_id, repo, free)
         return [
             TicketHolder(tid, self.store.get_ticket(tid).issue_number, tuple(ps))
             for tid, ps in sorted(by_ticket.items())
@@ -609,42 +611,24 @@ class Locks:
 
     def chat_held(self, session_id: int) -> tuple[str, ...]:
         """The lock keys a chat session holds, in path order."""
-        if not self._has_chat_column():
-            return ()
-        rows = self.store.query(
-            "SELECT path FROM file_locks WHERE chat_session_id = ? ORDER BY repo, path",
-            (session_id,),
-        )
-        return tuple(r["path"] for r in rows)
+        held = self.store.chat_lock_rows(session_id)
+        return tuple(lk.path for lk in sorted(held, key=lambda lk: (lk.repo, lk.path)))
 
     def release_chat(self, session_id: int) -> int:
         """Drop every lock the chat session holds (``/pr``, ``/discard``, session end).
         Idempotent; returns how many rows went."""
-        if not self._has_chat_column():
-            return 0
-        with self.store.transaction() as conn:
-            cur = conn.execute("DELETE FROM file_locks WHERE chat_session_id = ?", (session_id,))
-            return cur.rowcount
+        return self.store.delete_chat_locks(session_id)
 
     # -- internals --
 
     def _ticket(self, ticket: Ticket | int) -> Ticket:
         return self.store.get_ticket(ticket) if isinstance(ticket, int) else ticket
 
-    def _has_chat_column(self) -> bool:
-        """Has migration 012 added ``file_locks.chat_session_id``?"""
-        if not self._chat_column:
-            cols = self.store.query("PRAGMA table_info(file_locks)")
-            self._chat_column = any(c["name"] == "chat_session_id" for c in cols)
-        return self._chat_column
-
     def _rows(self, repo: str) -> list[_Row]:
-        chat = "chat_session_id" if self._has_chat_column() else "NULL AS chat_session_id"
-        rows = self.store.query(
-            f"SELECT path, ticket_id, {chat} FROM file_locks WHERE repo = ? ORDER BY path",
-            (repo,),
-        )
-        return [_Row(r["path"], r["ticket_id"], r["chat_session_id"]) for r in rows]
+        return [
+            _Row(lk.path, lk.ticket_id, lk.chat_session_id)
+            for lk in sorted(self.store.list_locks(repo=repo), key=lambda lk: lk.path)
+        ]
 
     def _want(self, t: Ticket, add: list[str]) -> Ticket:
         wanted = clean_paths([*t.owned_files, *add])
@@ -666,23 +650,10 @@ class Locks:
         for tid in sorted(held - live):
             n += self.store.release_locks(tid)
         chats = sorted({r.chat_session_id for r in rows if r.chat_session_id is not None})
-        if chats and self._has_chat_sessions():
-            marks = ", ".join("?" for _ in chats)
-            finals = ", ".join("?" for _ in CHAT_FINAL_STATES)
-            done = self.store.query(
-                f"SELECT id FROM chat_sessions WHERE id IN ({marks}) AND state IN ({finals})",
-                [*chats, *CHAT_FINAL_STATES],
-            )
-            for r in done:
-                n += self.release_chat(r["id"])
+        for sid in chats:
+            if self.store.get_chat_session(sid).state in CHAT_FINAL_STATES:
+                n += self.release_chat(sid)
         return n
-
-    def _has_chat_sessions(self) -> bool:
-        return bool(
-            self.store.query(
-                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'chat_sessions'"
-            )
-        )
 
     def _cycle_through(self, start: Ticket) -> list[int] | None:
         """A wait-for cycle through ``start`` (ticket ids), or None."""

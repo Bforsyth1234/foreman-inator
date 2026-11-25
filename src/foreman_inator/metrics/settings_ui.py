@@ -6,7 +6,7 @@
   ``writer_timeout_seconds``, ``max_parallel_per_repo``, ``max_open_prs_per_repo``,
   ``allowed_users``, the watched ``repos``, ``status_comment``) and one form per watched
   repo for its settings in the database (verify and install commands, profile, cloud
-  on/off). Read-only;
+  on/off, chat network on/off). Read-only;
 * ``POST /settings``: reads config.toml as TOML, sets the submitted keys, and builds the
   new config with ``config.from_dict`` (exactly the validation ``config.load`` runs); a
   refusal shows ``config.load``'s own message (``"<path>: <error>"``) and the file is not
@@ -20,7 +20,8 @@
 * ``POST /settings/repo``: one watched repo's settings, through the CLI's own functions:
   ``worker_status.set_verify_command`` (``fman repo set-verify``; unflags tickets waiting
   for one), ``Store.set_install_command`` (``set-install``), ``worker_status.set_profile``
-  (``set-profile``), ``Store.set_cloud`` (``set-cloud``). Only changed values are written.
+  (``set-profile``), ``Store.set_cloud`` (``set-cloud``), ``Store.set_chat_network``
+  (``set-chat-network``). Only changed values are written.
 
 Every POST goes through ``forms.FormGuard`` (CSRF token, own loopback Origin/Host: 403
 and no change otherwise). Every value from the file or the database is HTML-escaped; no
@@ -302,6 +303,7 @@ def repo_values(settings: Any) -> dict[str, str]:
         "writer_mode": p.writer,
         "review_mode": p.review,
         "cloud": "on" if getattr(settings, "cloud", True) is not False else "off",
+        "chat_network": "on" if getattr(settings, "chat_network", False) else "off",
     }
 
 
@@ -316,6 +318,8 @@ def _repo_form(guard: forms.FormGuard, repo: str, v: dict[str, str]) -> str:
         f"</label> <label>Review {_options('review_mode', prof.REVIEW_MODES, v['review_mode'])}"
         f"</label> <label>Cloud models {_options('cloud', ('on', 'off'), v['cloud'])}</label>"
         " (off: local only)</p>"
+        f"<p><label>Chat network {_options('chat_network', ('off', 'on'), v['chat_network'])}"
+        "</label> (chat sessions only: on opens ports 443/80; tickets are unaffected)</p>"
     )
     return f"<h3>{e(repo)}</h3>" + guard.form(REPO_PATH, inner, button=f"Save {repo}")
 
@@ -425,8 +429,10 @@ def routes(
                 p = prof.resolve(None, writer=want["writer_mode"], review=want["review_mode"])
             except prof.ProfileError as exc:
                 return render(_message(f"Not saved: {exc}", True), status=400)
-            if want["cloud"] not in ("on", "off"):
-                return render(_message("Not saved: cloud must be on or off", True), status=400)
+            for key, label in (("cloud", "cloud"), ("chat_network", "chat network")):
+                if want[key] not in ("on", "off"):
+                    msg = f"Not saved: {label} must be on or off"
+                    return render(_message(msg, True), status=400)
             if want["verify_command"] != cur["verify_command"]:
                 cleared = set_verify_command(store, repo, want["verify_command"] or None)
                 lines.append(_line("verify command", cur, want, "verify_command"))
@@ -443,6 +449,9 @@ def routes(
             if want["cloud"] != cur["cloud"]:
                 store.set_cloud(repo, want["cloud"] == "on")
                 lines.append(f"cloud models: {cur['cloud']} -> {want['cloud']}")
+            if want["chat_network"] != cur["chat_network"]:
+                store.set_chat_network(repo, want["chat_network"] == "on")
+                lines.append(f"chat network: {cur['chat_network']} -> {want['chat_network']}")
         return render(f"<h2>{e(repo)}</h2>" + _changed(lines))
 
     return [

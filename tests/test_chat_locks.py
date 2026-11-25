@@ -1,8 +1,8 @@
 """Chat sessions as file-lock holders (#71 decision 6, wave C1e).
 
 Migration 012 (store slot C1a) adds ``file_locks.chat_session_id`` with an exactly-one-
-holder CHECK and the ``chat_sessions`` table. Until it lands, ``chat_store`` rebuilds
-``file_locks`` to that shape here; once it has landed the fixture changes nothing.
+holder CHECK and the ``chat_sessions`` table; every Store has it, so the fixtures here use
+the store's own chat helpers.
 """
 
 from __future__ import annotations
@@ -18,65 +18,10 @@ from foreman_inator.worker_status import render_status
 
 REPO = "me/toy"
 
-_CHAT_SESSIONS = """
-CREATE TABLE chat_sessions (
-    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-    repo                TEXT NOT NULL,
-    base_branch         TEXT NOT NULL,
-    base_commit         TEXT,
-    branch              TEXT NOT NULL CHECK (branch LIKE 'fman/chat/%'),
-    worktree            TEXT,
-    state               TEXT NOT NULL DEFAULT 'starting'
-                        CHECK (state IN ('starting','idle','busy','closing','opened_pr',
-                                         'discarded','ended','failed')),
-    tier                INTEGER NOT NULL CHECK (tier BETWEEN 1 AND 3),
-    model               TEXT NOT NULL,
-    opencode_session_id TEXT,
-    trace_id            TEXT,
-    pr_number           INTEGER,
-    end_reason          TEXT,
-    started_at          TEXT NOT NULL,
-    ended_at            TEXT
-) STRICT
-"""
-
-_FILE_LOCKS_012 = """
-CREATE TABLE file_locks_012 (
-    repo            TEXT NOT NULL,
-    path            TEXT NOT NULL,
-    ticket_id       INTEGER REFERENCES tickets (id),
-    chat_session_id INTEGER REFERENCES chat_sessions (id),
-    acquired_at     TEXT NOT NULL,
-    PRIMARY KEY (repo, path),
-    CHECK ((ticket_id IS NULL) != (chat_session_id IS NULL))
-) STRICT
-"""
-
-
-def ensure_chat_schema(store: Store) -> bool:
-    """Give ``file_locks`` its 012 shape if 012 is not applied; True if it had to."""
-    have = {r["name"] for r in store.query("PRAGMA table_info(file_locks)")}
-    if "chat_session_id" in have:
-        return False
-    with store.transaction() as conn:
-        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master")}
-        if "chat_sessions" not in tables:
-            conn.execute(_CHAT_SESSIONS)
-        conn.execute(_FILE_LOCKS_012)
-        conn.execute(
-            "INSERT INTO file_locks_012 (repo, path, ticket_id, acquired_at)"
-            " SELECT repo, path, ticket_id, acquired_at FROM file_locks"
-        )
-        conn.execute("DROP TABLE file_locks")
-        conn.execute("ALTER TABLE file_locks_012 RENAME TO file_locks")
-        conn.execute("CREATE INDEX file_locks_ticket ON file_locks (ticket_id)")
-    return True
-
 
 @pytest.fixture
 def store(tmp_path: Path) -> Store:
     s = Store(tmp_path / "fman.db")
-    ensure_chat_schema(s)
     yield s
     s.close()
 
@@ -102,18 +47,14 @@ def ticket(store: Store, *, owned: tuple[str, ...] = (), repo: str = REPO) -> Ti
 
 
 def chat(store: Store, *, state: str = "busy", repo: str = REPO) -> int:
-    with store.transaction() as conn:
-        cur = conn.execute(
-            "INSERT INTO chat_sessions (repo, base_branch, branch, state, tier, model,"
-            " started_at) VALUES (?, 'main', 'fman/chat/x', ?, 1, 'm', ?)",
-            (repo, state, store.now().isoformat()),
-        )
-        return int(cur.lastrowid)
+    sid = store.create_chat_session(repo, base_branch="main", tier=1, model="m").id
+    if state != "starting":
+        store.set_chat_state(sid, state, pr_number=1 if state == "opened_pr" else None)
+    return sid
 
 
 def set_state(store: Store, sid: int, state: str) -> None:
-    with store.transaction() as conn:
-        conn.execute("UPDATE chat_sessions SET state = ? WHERE id = ?", (state, sid))
+    store.set_chat_state(sid, state, pr_number=1 if state == "opened_pr" else None)
 
 
 def rows(store: Store) -> list[sqlite3.Row]:
@@ -278,18 +219,3 @@ def test_status_says_held_by_chat_session(store: Store, locks: Locks) -> None:
     assert f"held by ticket(s) #{holder.id}" in block
     assert f"held by chat session {sid}" in block
     assert "2 waiting." in out
-
-
-def test_no_chat_column_is_a_noop(tmp_path: Path) -> None:
-    """Before migration 012 the chat calls lock nothing and the ticket paths still work."""
-    s = Store(tmp_path / "old.db")
-    try:
-        have = {r["name"] for r in s.query("PRAGMA table_info(file_locks)")}
-        if "chat_session_id" in have:
-            pytest.skip("migration 012 is applied")
-        lk = Locks(s)
-        assert lk.chat_touch(1, REPO, ["a.py"]) == []
-        assert lk.chat_held(1) == () and lk.release_chat(1) == 0
-        assert lk.may_start(ticket(s, owned=("a.py",))).ok
-    finally:
-        s.close()

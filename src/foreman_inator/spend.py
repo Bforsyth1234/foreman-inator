@@ -153,7 +153,7 @@ DEFAULT_ATTEMPT_MAX_INPUT_TOKENS_LOCAL = config_defaults.DEFAULT_ATTEMPT_MAX_INP
 #: Chat (todo #71, option C): the most of the month's live spend chat may take, and the
 #: cloud spend one chat message (turn) may use. The wiring step adds the config keys
 #: ``spend_caps.chat_monthly_usd`` and ``chat_turn_budget_usd`` with these defaults.
-DEFAULT_CHAT_MONTHLY_USD = 20.0
+DEFAULT_CHAT_MONTHLY_USD = config_defaults.DEFAULT_CHAT_MONTHLY_USD
 DEFAULT_CHAT_TURN_BUDGET_USD = DEFAULT_ATTEMPT_BUDGET_USD
 #: Caps a chat ``/approve`` can lift (the others stop the turn whatever the user says).
 _CHAT_APPROVABLE: frozenset[str] = frozenset({"daily", "monthly", "chat_monthly", "approval"})
@@ -471,23 +471,15 @@ class Spend:
         chat_session_id: int | None = None,
     ) -> SpendEntry | None:
         """Write spend that happened to the ledger. Zero cost writes nothing. A chat row
-        carries ``chat_session_id`` (passed to the store only when set)."""
+        carries ``chat_session_id`` (store column from migration 012)."""
         if bucket not in BUCKETS:
             raise ValueError(f"unknown spend bucket {bucket!r}")
         if cost <= 0:
             return None
         if chat_session_id is not None:
-            try:
-                return self.store.record_spend(
-                    bucket, cost, model=model, chat_session_id=chat_session_id
-                )
-            except TypeError as exc:
-                if "chat_session_id" not in str(exc):
-                    raise
-                # A store without the chat column (before migration 012): the spend
-                # happened, so keep it (it still counts toward the live caps).
-                log.error("spend: store cannot tag chat spend; recorded untagged")
-                return self.store.record_spend(bucket, cost, model=model)
+            return self.store.record_spend(
+                bucket, cost, model=model, chat_session_id=chat_session_id
+            )
         return self.store.record_spend(
             bucket,
             cost,
@@ -877,7 +869,11 @@ class Spend:
             if cloud and not self.store.repo_allows_cloud(st.repo):
                 bare = Refusal("live", "local_only", 0.0, 0.0, 0.0, estimate, None, now)
                 return self._chat_refuse(bare, session_id, ep)
-            if ep.name not in (st.turn_model or st.model, st.small_model):
+            allowed = (st.turn_model or st.model, st.small_model)
+            # The proxy's 5 s local-slot fallback (decision 2): a cloud call standing in
+            # for a queued call to one of this turn's own (local) models.
+            fallback = cloud and getattr(ctx, "fallback_from", None) in allowed
+            if ep.name not in allowed and not fallback:
                 bare = Refusal("live", "chat_model", 0.0, 0.0, 0.0, estimate, None, now)
                 return self._chat_refuse(bare, session_id, ep)
             if not cloud:

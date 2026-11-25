@@ -59,6 +59,7 @@ from foreman_inator.config import ConfigError, ModelEndpoint
 from foreman_inator.db.store import Attempt, Ticket
 from foreman_inator.experiments import split as split_mod
 from foreman_inator.experiments import variants
+from foreman_inator.locks import holders_text
 from foreman_inator.pr.publisher import pr_head_branch
 from foreman_inator.resources import memory
 from foreman_inator.routing import escalation as esc
@@ -384,11 +385,11 @@ class AttemptSteps:
         if not widened.ok:
             self.set_lock_wait(ticket, att, widened.blockers)  # type: ignore[attr-defined]
             log.info(
-                "ticket %d: attempt %d passed but changed files held by ticket(s) %s; "
+                "ticket %d: attempt %d passed but changed files held by %s; "
                 "publishing when they are free",
                 ticket.id,
                 att.id,
-                ", ".join(f"#{b}" for b in widened.blockers),
+                holders_text(widened.blockers, widened.chats),
             )
             return True
         self.publish_job_for(ticket.id, att, verify=vr, diff=diff, cancel=cancel)  # type: ignore[attr-defined]

@@ -134,13 +134,16 @@ def test_chat_call_records_live_row_with_session(store) -> None:
     assert sp.chat_turn_spent(7) == pytest.approx(0.25)
 
 
-def test_record_falls_back_untagged_on_old_store(tmp_path, clock) -> None:
-    plain = Store(tmp_path / "old.db", clock=clock)
+def test_record_tags_the_real_store_column(tmp_path, clock) -> None:
+    """With migration 012 the plain Store takes ``chat_session_id=`` (no fallback)."""
+    plain = Store(tmp_path / "real.db", clock=clock)
     try:
+        sid = plain.create_chat_session(REPO, base_branch="main", tier=1, model="claude").id
         sp = make_spend(plain)
-        chat(sp)
-        assert call(sp, CLAUDE, 0.5, 0.25)
-        assert plain.spend_total("live", since=clock.at - timedelta(days=1)) == 0.25
+        chat(sp, sid=sid)
+        assert call(sp, CLAUDE, 0.5, 0.25, sid=sid)
+        assert plain.chat_spend(sid) == pytest.approx(0.25)
+        assert plain.chat_spend_total(since=clock.at - timedelta(days=1)) == 0.25
     finally:
         plain.close()
 

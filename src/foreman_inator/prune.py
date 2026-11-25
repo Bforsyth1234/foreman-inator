@@ -6,6 +6,10 @@ Everything here deletes user data, so every rule errs toward keeping:
   deleted once its mtime is older than ``days`` (default 90), unless its ticket is
   *kept*: merged (``accepted_attempt_id`` set), still open (todo, in progress, testing),
   or with an attempt still running. ``tracing.recorder.prune`` does the deleting.
+* **Chat recordings** (``recordings/chat/<session>.jsonl.gz``, #71): the same age rule,
+  for ended sessions only (``ended``, ``discarded``, ``failed``) and recordings with no
+  session row. A session still open, or opened as a PR, is kept (whether that PR merged
+  is not tracked, so it is kept like a merged ticket). ``recorder.prune_chats`` deletes.
 * **Scratch space** (``sandbox/<key>/``, ``opencode/attempts/<dir>/``): one entry per
   launch, normally removed by the launch itself; what is left is a crash's leftovers. An
   entry named after an attempt (``a12-writer``, ``r12-work``, ``a12-3f9a1c``) or a replay
@@ -35,7 +39,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from foreman_inator.db.store import OPEN_COLUMNS, Store
+from foreman_inator.db.store import CHAT_ENDED_STATES, OPEN_COLUMNS, Store
 from foreman_inator.tracing import recorder
 
 RETENTION_DAYS = recorder.RETENTION_DAYS
@@ -108,6 +112,12 @@ def _state(store: Store) -> _State:
         running_repos=frozenset(repo_of[t] for t in running_tickets if t in repo_of),
         running_experiments=frozenset(e.id for e in store.list_experiments(status="running")),
     )
+
+
+def _kept_chats(store: Store) -> frozenset[int]:
+    """Chat sessions whose recording stays: still open, or opened as a PR."""
+    prunable = set(CHAT_ENDED_STATES) - {"opened_pr"}
+    return frozenset(s.id for s in store.list_chat_sessions() if s.state not in prunable)
 
 
 def _last_change(p: Path) -> float:
@@ -255,6 +265,19 @@ def run(
         gone = []
     for p in gone:
         report.removed.append(Removal(p, f"unmerged ticket, older than {days:g} days"))
+    try:
+        gone = recorder.prune_chats(
+            rec_dir,
+            merged=_kept_chats(store).__contains__,
+            max_age_days=days,
+            now=now,
+            dry_run=dry_run,
+        )
+    except OSError as exc:
+        report.errors.append(f"chat recordings: {exc}")
+        gone = []
+    for p in gone:
+        report.removed.append(Removal(p, f"ended chat session, older than {days:g} days"))
 
     stale = stale_hours * 3600
     _sweep_scratch(r, home / "sandbox", st, days, stale)

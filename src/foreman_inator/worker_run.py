@@ -204,6 +204,8 @@ def run_worker(*, once: bool = False) -> int:
         attempt_budget_usd=cfg.attempt_budget_usd,
         attempt_max_input_tokens_cloud=cfg.attempt_max_input_tokens_cloud,
         attempt_max_input_tokens_local=cfg.attempt_max_input_tokens_local,
+        chat_monthly_usd=cfg.spend_caps.chat_monthly_usd,
+        chat_turn_budget_usd=cfg.chat_turn_budget,
     )
     proxy, driver = build_proxy_and_driver(cfg, store, spend)
     if not once:
