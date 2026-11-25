@@ -276,6 +276,14 @@ class AttemptSteps:
             endpoint.name,
             step.reason,
         )
+        self.status_update(  # type: ignore[attr-defined]  # #77
+            ticket,
+            "escalated" if step.trigger == "escalation" else "attempt_started",
+            attempt=ordinal,
+            tier=endpoint.tier,
+            model=endpoint.name,
+            started_at=att.started_at,
+        )
         if split_pick is not None:
             log.info("ticket %d: attempt %d: %s", ticket.id, att.id, split_pick.reason)
         self._run_and_finish(ticket, att, wt, endpoint, cmd, cancel, template=template)
@@ -513,6 +521,14 @@ class AttemptSteps:
                 )
                 passed = False
             else:
+                self.status_update(  # type: ignore[attr-defined]  # #77
+                    ticket,
+                    "verifying",
+                    attempt=len(self.store.list_attempts(ticket.id)),
+                    tier=att.tier,
+                    model=att.model,
+                    started_at=att.started_at,
+                )
                 with tracing.verify_span(cmd.display) as vspan:
                     vr = self._launch_verify(
                         cmd, wt.path, ticket=ticket, attempt_id=att.id,

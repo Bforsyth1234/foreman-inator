@@ -117,6 +117,10 @@ def test_knn_and_backfill_never_use_a_cloud_embedder_for_local_only(
         )
         e.label()
         e.worker.poll_and_handle()
+        # The poll queues one backfill on the local lane; let it finish so the calls
+        # below are the only ones counted (wave 17: the poll does more after queueing).
+        e.worker.drain_background(timeout=10.0)
+        seen.clear()
         t = e.ticket()
         e.worker._knn_route(t)
         e.worker._backfill_once()

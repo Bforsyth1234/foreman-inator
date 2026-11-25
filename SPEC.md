@@ -107,7 +107,7 @@ Each ticket mirrors one GitHub issue, so tickets also store `issue_number` and `
 | status | enum | running · promoted · rejected |
 | started_at, ended_at, result_note | time, text | |
 
-Agents receive their ticket (request, owned files, kickback notes) in the session prompt, so there is no markdown copy of the board.
+Agents receive their ticket (request, owned files, kickback notes) in the session prompt, so there is no markdown copy of the board. The writer's input is the issue body, the clarification Q&A and allowed users' comments, plus a text description of each image allowed users attached (fetched by the worker from GitHub's attachment hosts only, described once by a model with `vision = true`, local first and cloud only where the repo allows it; replays reuse the stored descriptions). The writer never sees an image itself, nor its own earlier transcript.
 
 ## Routing and escalation
 
@@ -125,7 +125,7 @@ Tier 2 is open-weights cloud by default (todo #70, 2026-11-25): a 27B model on a
 
 1. **v1, rules:** small local model classifies the request as small, normal, or large → tier 1, 2, or 3.
 2. **After about 50 accepted tickets, nearest neighbors:** embed the request, find the 10 most similar finished tickets, and start at the cheapest tier that was accepted for most of them. A ticket you kicked back on the tier that was finally accepted counts one tier up, because that tier cost you a review. One the AI reviewer kicked back there counts half for that tier and half for the tier above, because it cost time and a review call but none of your time. `route_reason` records which tickets it matched.
-3. **After a few hundred, a classifier**, and LoRA fine-tuning only if it beats the classifier on held-out tickets.
+3. **After a few hundred, a classifier** (`classifier_min_tickets`, default 300) on the same embeddings, used only while it beats nearest neighbors on the newest 20% of accepted tickets held out chronologically (a tie keeps nearest neighbors; rechecked daily; `classifier_router = false` turns it off). LoRA fine-tuning only if it beats the classifier on held-out tickets (not built).
 
 A `tier:N` label on the issue overrides the router for that ticket, and the override is recorded in `route_reason`.
 
@@ -224,6 +224,8 @@ A **variant** is a model plus a prompt version, for example `inkling-2-mini / wr
 | Shadow reviewer | Reviewer | Challenger reviews every live PR alongside the champion; only the champion's verdict counts; both are scored against your eventual merge or kickback | None | Always on once a challenger exists |
 | Traffic split | Writer | 10–20% of live tickets go to the challenger; you review as normal | Normal | After a challenger wins on replay |
 | Head-to-head | Writer | Two PRs for one issue, you pick one (`ab:pair` label) | Double | Rarely, for a close call |
+
+**LLM-drafted challengers:** `fman experiment propose --role R` (or the metrics page's "Propose an experiment") has a tier 3 model, independent of the reviewer that scores the result, draft the next prompt of the role's champion from the patterns in kickbacks created before a cutoff (default 30 days ago). It only drafts: nothing is registered until you approve it (`fman experiment approve-draft`), and its replay then uses only tickets created after the cutoff, so it is never scored on what it was written from. One LLM-drafted challenger per role at a time; the call is costed to the experiment budget. Promotion is unchanged: the rule below, and only when you run it.
 
 **Promotion rule:** a challenger becomes champion only after it wins on replay *and* holds up live (shadow for a reviewer; for a writer, a traffic split, `fman experiment split start`, giving it a stable ~15% of first attempts). Its live accept rate must not fall below the champion's, and its cost per accepted ticket must not be higher. Both variants are judged on the same tickets wherever possible.
 

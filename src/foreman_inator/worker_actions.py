@@ -162,12 +162,23 @@ class ActionHandlers:
         ctx.publish = res
         ctx.ticket = self.store.get_ticket(t.id)
         log.info("ticket %d: PR #%d %s (draft until reviewed)", t.id, res.pr.number, res.action)
+        if res.action == "created":
+            self.status_update(ctx.ticket, "pr_opened", pr_number=res.pr.number)  # type: ignore[attr-defined]  # #77
         if res.action in ("closed", "merged"):
             ctx.stop = True  # a person closed or merged it; the poller reports that next
 
     def _a_ai_review(self, ctx: Ctx) -> None:
         """Checks passed and the draft PR is up: the AI review (``worker_review``)."""
         assert ctx.ticket is not None and ctx.attempt is not None
+        att = ctx.attempt
+        self.status_update(  # type: ignore[attr-defined]  # #77
+            ctx.ticket,
+            "reviewing",
+            attempt=len(self.store.list_attempts(ctx.ticket.id)),
+            tier=att.tier,
+            model=att.model,
+            started_at=att.started_at,
+        )
         self.review_stage(ctx.ticket, ctx.attempt, ctx.cancel)  # type: ignore[attr-defined]
 
     def _a_mark_ready(self, ctx: Ctx) -> None:
@@ -349,6 +360,8 @@ class ActionHandlers:
     def _a_release_locks(self, ctx: Ctx) -> None:
         if ctx.ticket is not None and self.locks.release(ctx.ticket):
             log.info("ticket %d: file locks released", ctx.ticket.id)
+        if ctx.ticket is not None and ctx.ticket.column == "dropped":
+            self.status_update(ctx.ticket, "dropped")  # type: ignore[attr-defined]  # #77
 
     def _a_cleanup_worktree(self, ctx: Ctx) -> None:
         if ctx.ticket is not None:

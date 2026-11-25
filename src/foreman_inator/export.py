@@ -862,8 +862,8 @@ ROWS = Schema(
 
 # =========================================================================== sources
 
-_RECORDING = re.compile(r"([0-9]{1,18})(?:\.([a-z][a-z_\-]{0,31}))?\.jsonl(\.gz)?", re.ASCII)
-_SIDE_DIR = re.compile(r"[0-9]{1,18}(?:\.[a-z][a-z_\-]{0,31})?\.files", re.ASCII)
+_RECORDING = re.compile(r"([0-9]{1,18})(?:\.([a-z][a-z0-9_\-]{0,31}))?\.jsonl(\.gz)?", re.ASCII)
+_SIDE_DIR = re.compile(r"[0-9]{1,18}(?:\.[a-z][a-z0-9_\-]{0,31})?\.files", re.ASCII)
 _SIDE_FILE = re.compile(r"[0-9]{1,8}-[a-z]{1,16}\.txt", re.ASCII)
 _SPAN_FILE = re.compile(r"[0-9a-f]{32}\.jsonl", re.ASCII)
 _LOG_FILE = re.compile(r"attempt-[0-9]{1,18}-[a-z]{1,16}\.log", re.ASCII)

@@ -389,6 +389,7 @@ class ReviewSteps:
             assert att is not None
             self._mark_ready(t, att, "handover", handover=True)
         self.store.flag_ticket(t.id, reason)
+        self.status_update(t, "handed_over", reason=reason)  # type: ignore[attr-defined]  # #77
         log.info("ticket %d: handed to the user (%s)", t.id, kind)
 
     # ------------------------------------------------------------------ helpers

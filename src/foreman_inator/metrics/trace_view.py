@@ -241,7 +241,9 @@ def _recording(r: replay.RecordingTimeline, resources: Resources | None = None) 
         head.append(f"${r.cost_usd:.4f}")
     if r.failure_steps:
         head.append('<span class="failure-label">failure step marked</span>')
-    prefix = f"{'a' if r.role == 'attempt' else e(r.role)}{r.attempt_id}"
+    # Attempts keep ``a<id>``; any other role gets a separator so ``fork_1`` of attempt 15
+    # and ``fork_11`` of attempt 5 never share an anchor (both were ``fork_115``).
+    prefix = f"a{r.attempt_id}" if r.role == "attempt" else f"{e(r.role)}-a{r.attempt_id}"
     steps = "".join(_step(s, f"{prefix}-{i}") for i, s in enumerate(r.steps))
     variant = f"<p><small>variant {e(r.variant_id)}</small></p>" if r.variant_id else ""
     res = ""

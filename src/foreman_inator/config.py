@@ -30,12 +30,24 @@ Layout (every key optional; missing keys take the defaults below)::
     install_refill_cache = true  # refill an empty install cache from the base commit (#57)
     cold_load_timeout_seconds = 120  # extra wait when the clarity/router model is not loaded (#52)
     max_local_inference = 1  # local-model calls at once, process-wide (#34)
+    classifier_router = true # #19: a trained router replaces kNN once it beats kNN held out
+    classifier_min_tickets = 300 # accepted tickets before the classifier is trained at all
+    status_comment = true    # #77: one status comment on the issue, edited while work runs
+    status_label = false     # #77: also label the issue `fman:working` while it runs
+    status_show_cost = false # #77: put the spend so far in the status comment
+    # relay_url = "https://smee.io/<channel>"  # #15: webhook relay (nudges a poll)
+    # relay_secret_ref = "keychain:foreman-inator/relay-webhook-secret"
 
     [experiments]        # replays (#25) and the shadow reviewer (#26), wave 9 (#29)
     run_budget_usd = 2.0
     min_cases = 10       # replay cases scored on both sides before a verdict
     live_min_sample = 30 # paired, user-decided PRs before "holds live" is judged
     nightly_hour = 2     # the launchd agent runs `fman experiment run --all` then
+    proposer_holdout_days = 30   # #49: the proposer reads kickbacks older than this
+    proposer_lookback_days = 90  # ... and no older than cutoff minus this
+    proposer_model = ""          # #49: a tier 3 model name; "" = the first independent one
+    fork_budget_usd = 1.0        # #18: cloud spend one `fman replay --fork` may use
+    fork_writer_timeout_s = 1200 # #18: one fork's writer session
 
     [sandbox_network]    # per repo: "allow" opens outbound network for its verify + checks
     "you/project" = "none"
@@ -59,6 +71,7 @@ Layout (every key optional; missing keys take the defaults below)::
     base_url = "https://api.z.ai/api/coding/paas/v4"
     family = "glm"       # reviewer must be a different family from the writer
     api_key_ref = "keychain:foreman-inator/glm"
+    # vision = true      # #71: may describe issue images for the writer
     # wire = "openai"    # openai | anthropic: how OpenCode talks to it through the proxy
     #                    # (#52). "anthropic": the native Messages route, with prompt caching.
 
@@ -189,6 +202,9 @@ class ModelEndpoint:
     #: Messages route (prompt caching); "openai" (default) the OpenAI-compatible one. The
     #: reviewer and router use ``chat/completions`` whatever this says.
     wire: Wire = "openai"
+    #: #71: this model takes images; issue images from allowed users are described by it
+    #: (``tickets.images``) and the writer gets the description as text.
+    vision: bool = False
 
     @property
     def is_cloud(self) -> bool:
@@ -225,6 +241,14 @@ class ExperimentSettings:
     shadow_timeout_s: float = 15 * 60.0  # one shadow review, checks and model call
     nightly_hour: int = 2  # local time of the nightly `fman experiment run --all`
     nightly_minute: int = 0
+    #: #49 (``fman experiment propose``): the proposer reads kickbacks created before
+    #: ``now - proposer_holdout_days`` and after that cutoff minus ``proposer_lookback_days``.
+    proposer_holdout_days: int = 30
+    proposer_lookback_days: int = 90
+    proposer_model: str = ""  # "" = the first tier 3 model independent of the reviewer
+    #: #18 (``fman replay --fork``): one fork's cloud spend cap and writer bound.
+    fork_budget_usd: float = 1.0
+    fork_writer_timeout_s: float = 1200.0
 
 
 OLLAMA_URL = "http://127.0.0.1:11434/v1"
@@ -379,6 +403,20 @@ class Config:
     failure_label_timeout_seconds: float = 30.0
     allow_cloud_labeler: bool = False
     experiments: ExperimentSettings = field(default_factory=ExperimentSettings)
+    #: #19: route with the trained classifier once it beats kNN on the held-out 20%
+    #: (chronological; ties keep kNN; rechecked daily). Trained only past
+    #: ``classifier_min_tickets`` accepted tickets.
+    classifier_router: bool = True
+    classifier_min_tickets: int = 300
+    #: #15: a webhook relay (smee.io or self-hosted) whose verified deliveries nudge an
+    #: immediate poll. None = polling only. ``relay_secret_ref`` None reads the secret
+    #: ``fman setup`` stored (``keychain:foreman-inator/relay-webhook-secret``).
+    relay_url: str | None = None
+    relay_secret_ref: str | None = None
+    #: #77: one status comment per issue, edited at each state change while work runs.
+    status_comment: bool = True
+    status_label: bool = False  # also add `fman:working` while active
+    status_show_cost: bool = False  # issue comments on a public repo are public
 
     def __post_init__(self) -> None:
         for name in ("sandbox_network", "sandbox_install", "rules_file"):
@@ -513,6 +551,7 @@ def _validate(cfg: Config) -> None:
     if not 0 < cfg.writer_timeout_seconds <= 24 * 3600:
         raise ConfigError("writer_timeout_seconds must be > 0 and <= 86400")
     _validate_learning(cfg)
+    _validate_wave17(cfg)
     names = [m.name for m in cfg.models]
     if len(set(names)) != len(names):
         raise ConfigError("model names must be unique")
@@ -569,6 +608,34 @@ def _validate_learning(cfg: Config) -> None:
         raise ConfigError("experiments.shadow must be true or false")
 
 
+def _validate_wave17(cfg: Config) -> None:
+    """#19, #15, #77 top-level keys and the #49/#18 ``[experiments]`` keys."""
+    for name in ("classifier_router", "status_comment", "status_label", "status_show_cost"):
+        if not isinstance(getattr(cfg, name), bool):
+            raise ConfigError(f"{name} must be true or false")
+    if cfg.classifier_min_tickets < 1:
+        raise ConfigError("classifier_min_tickets must be >= 1")
+    if cfg.relay_url is not None:
+        from foreman_inator.github.relay import RelayConfigError, check_relay_url
+
+        try:
+            check_relay_url(cfg.relay_url)
+        except RelayConfigError as exc:
+            raise ConfigError(f"relay_url: {exc}") from None
+    if cfg.relay_secret_ref is not None:
+        parse_key_ref(cfg.relay_secret_ref)
+    ex = cfg.experiments
+    for name in ("proposer_holdout_days", "proposer_lookback_days"):
+        if getattr(ex, name) < 1:
+            raise ConfigError(f"experiments.{name} must be >= 1")
+    if ex.fork_budget_usd < 0:
+        raise ConfigError("experiments.fork_budget_usd must be >= 0")
+    if ex.fork_writer_timeout_s <= 0:
+        raise ConfigError("experiments.fork_writer_timeout_s must be > 0")
+    if ex.proposer_model and ex.proposer_model not in {m.name for m in cfg.models}:
+        raise ConfigError(f"experiments.proposer_model names unknown model {ex.proposer_model!r}")
+
+
 def _validate_model(m: ModelEndpoint) -> None:
     where = f"model {m.name!r}"
     if m.tier not in TIERS:
@@ -579,6 +646,8 @@ def _validate_model(m: ModelEndpoint) -> None:
         raise ConfigError(f"{where}: wire must be 'openai' or 'anthropic'")
     if not m.family:
         raise ConfigError(f"{where}: family is required")
+    if not isinstance(m.vision, bool):
+        raise ConfigError(f"{where}: vision must be true or false")
     url = urlparse(m.base_url)
     if url.scheme not in ("http", "https") or not url.hostname:
         raise ConfigError(f"{where}: base_url must be an http(s) URL")
@@ -648,7 +717,7 @@ def _model_from_dict(raw: Any, where: str) -> ModelEndpoint:
     _typed(raw, dict, where)
     allowed = {f.name for f in fields(ModelEndpoint)}
     _check_keys(raw, allowed, where)
-    missing = sorted(allowed - {"api_key_ref", "wire"} - set(raw))
+    missing = sorted(allowed - {"api_key_ref", "wire", "vision"} - set(raw))
     if missing:
         raise ConfigError(f"{where}: missing key(s) {', '.join(missing)}")
     return ModelEndpoint(
@@ -660,6 +729,7 @@ def _model_from_dict(raw: Any, where: str) -> ModelEndpoint:
         family=_typed(raw["family"], str, f"{where}.family"),
         api_key_ref=_typed(raw.get("api_key_ref"), (str, type(None)), f"{where}.api_key_ref"),
         wire=_typed(raw.get("wire", "openai"), str, f"{where}.wire"),  # type: ignore[arg-type]
+        vision=_typed(raw.get("vision", False), bool, f"{where}.vision"),
     )
 
 
@@ -757,6 +827,14 @@ _LEARNING_TYPES: dict[str, Any] = {
     "failure_labels": bool,
     "failure_label_timeout_seconds": float,
     "allow_cloud_labeler": bool,
+    # wave 17 (#19, #15, #77)
+    "classifier_router": bool,
+    "classifier_min_tickets": int,
+    "relay_url": str,
+    "relay_secret_ref": str,
+    "status_comment": bool,
+    "status_label": bool,
+    "status_show_cost": bool,
 }
 
 
@@ -827,6 +905,7 @@ def to_dict(cfg: Config) -> dict[str, Any]:
             for f in fields(ModelEndpoint)
             if getattr(m, f.name) is not None
             and not (f.name == "wire" and m.wire == "openai")  # the default stays implicit
+            and not (f.name == "vision" and not m.vision)
         }
         for m in cfg.models
     ]

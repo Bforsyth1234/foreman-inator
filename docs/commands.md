@@ -24,7 +24,11 @@ current text. `fman --version` prints the version.
 | [`fman experiment status`](#fman-experiment-status) | Champions, running and ended experiments with their results. |
 | [`fman experiment promote`](#fman-experiment-promote) | Make a challenger champion if it won on replay and holds live. |
 | [`fman experiment split`](#fman-experiment-split) | Send a share of first attempts to a writer challenger (the live check). |
-| [`fman replay`](#fman-replay) | Check that today's logic still decides a recorded ticket as it did. |
+| [`fman experiment propose`](#fman-experiment-propose) | Draft the next prompt of a role's champion from recent kickbacks (you approve or discard it). |
+| [`fman experiment approve-draft`](#fman-experiment-approve-draft) | Approve a drafted prompt: register it as a challenger and run its replay. |
+| [`fman experiment discard-draft`](#fman-experiment-discard-draft) | Discard a drafted prompt and remove its files. |
+| [`fman replay`](#fman-replay) | Check that today's logic still decides a recorded ticket as it did; `--fork` restarts an attempt at its failure step. |
+| [`fman retry`](#fman-retry) | Retry a flagged or dropped ticket, keeping its history. |
 | [`fman export`](#fman-export) | Export one ticket's trace, recordings and rows for a bug report, redacted. |
 | [`fman prune`](#fman-prune) | Delete old recordings, traces and scratch of unmerged tickets. |
 
@@ -43,6 +47,7 @@ setup asks which ones to work on (or takes `--repo`), and a re-run leaves the
 | `--allowed-user <login>` | GitHub login allowed to start work. Repeatable. |
 | `--no-service` | Skip installing the launchd agents. |
 | `--repo <owner/name>` | A repo to work on. Repeatable. Replaces the `repos` list, with no question. |
+| `--relay-url <url>` | A webhook relay (https; http only for localhost) whose deliveries trigger an early poll. A new App gets its webhook pointed there and its webhook secret is stored in the Keychain (`relay-webhook-secret`); for an existing App, see [relay.md](relay.md). |
 
 ## `fman config set-key`
 
@@ -78,8 +83,12 @@ What each line means: [setup.md](setup.md#6-reading-fman-status).
 
 ## `fman metrics`
 
-Serve the metrics page on 127.0.0.1 (read-only; Ctrl-C stops it). Pages: `/`,
-`/api/metrics`, `/traces`, `/failures`, `/experiments`.
+Serve the metrics page on 127.0.0.1 (Ctrl-C stops it). Pages: `/`,
+`/api/metrics`, `/traces`, `/failures`, `/experiments`, `/resources` (the
+models Ollama holds, memory and local slots, from the snapshot the worker
+writes once per poll) and `/experiments/manage` (start, stop, cancel, propose
+and promote experiments; its buttons are the only writes, each behind a form
+token and a loopback check).
 
 | Option | Meaning |
 | --- | --- |
@@ -237,7 +246,8 @@ fman experiment status [experiment]
 ```
 
 Champions, running and ended experiments with their replay and live results.
-With an experiment id, that experiment's details.
+With an experiment id, that experiment's details, including its origin (you,
+or an LLM-drafted prompt you approved) and its cutoff.
 
 ## `fman experiment promote`
 
@@ -266,6 +276,41 @@ rest. `status`: the split's share and each side's live accept rate and cost per
 accepted ticket. `stop`: end it as rejected (its attempts are kept).
 `fman experiment promote` judges a running split as the "holds live" check.
 
+## `fman experiment propose`
+
+```bash
+fman experiment propose --role writer|reviewer [--proposer <model>]
+```
+
+A tier 3 model drafts the next prompt of the role's champion from the
+patterns in recent kickbacks: those created before the cutoff (now minus
+`experiments.proposer_holdout_days`, default 30) and no older than
+`proposer_lookback_days` before it. Prints the draft's path, its rationale and
+the estimated cost. Nothing is registered. The proposer must not be the
+reviewer that scores the challenger (nor of its family); `--proposer` (or
+`experiments.proposer_model`) picks it. One LLM-drafted challenger per role at
+a time. The call is costed to the experiments budget. The metrics page's
+"Propose an experiment" button does the same.
+
+## `fman experiment approve-draft`
+
+```bash
+fman experiment approve-draft <draft id>
+```
+
+Install the draft (as you left the file), register it as a challenger with the
+champion's model, and run its replay exactly as `fman experiment run --role R
+--challenger V` would, on tickets created after the draft's cutoff only.
+Nothing is promoted: `fman experiment promote` is still the only way.
+
+## `fman experiment discard-draft`
+
+```bash
+fman experiment discard-draft <draft id>
+```
+
+Mark the draft discarded and remove its files.
+
 ## `fman replay`
 
 ```bash
@@ -281,6 +326,25 @@ on any difference.
 | `--recordings <path>` | Recordings folder (default: yours). |
 | `--traces <path>` | Traces folder (default: yours). |
 | `--rows <path>` | Stored rows as JSON (a checked-in regression case). |
+| `--fork <attempt>` | Instead: restart that attempt at its labelled failure step with `--model` and/or `--prompt`, in a scratch worktree under the sandbox (never pushed). Its recorded file edits before that step are re-applied; the result is recorded next to the attempt (`<attempt>.fork_<n>.jsonl.gz`) and shown in the trace view. Model calls go to the experiments budget, at most `experiments.fork_budget_usd` per fork. Exits 2 when it cannot start. |
+| `--model <name>` | With `--fork`: the model to continue with. |
+| `--prompt <name>` | With `--fork`: a writer prompt to rebuild the prompt with. |
+| `--step <n>` | With `--fork`: restart at this step instead of the labelled one. |
+
+## `fman retry`
+
+```bash
+fman retry <owner/repo#issue | ticket id> [--tier N | --up]
+```
+
+Retry a flagged or dropped ticket, keeping its history: the same ticket, its
+attempts, traces, reviews and PR branch. Same tier by default; `--tier N` or
+`--up` moves it. The worker picks it up on its next pass; the retry gets one
+more round (at most two attempts), then the ticket comes back to you, and a
+ticket can be retried at most a few times. Refused (exit 1, with the reason)
+for a merged ticket, a PR waiting on your review, a flag a retry cannot fix
+(for example a missing verify command: `fman repo set-verify`), a spend cap
+still reached, or a cloud tier on a local-only repo. Writes nothing to GitHub.
 
 ## `fman export`
 

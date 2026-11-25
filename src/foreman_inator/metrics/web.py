@@ -770,6 +770,7 @@ def render_experiments(
         "<h1>Experiments</h1>"
         '<p class="lede">A challenger becomes champion only after it wins on replay and '
         "holds up live, and only when you run <code>fman experiment promote</code>.</p>"
+        '<p><a href="/experiments/manage">Start, stop, propose or promote experiments</a></p>'
         f"<h2>Champions</h2><ul>{champs}</ul>"
         "<h2>Running</h2>"
         + table([r for r in rows if r["status"] == "running"])
@@ -837,10 +838,11 @@ def full_app(
     failure-step and experiment pages and ``/resources`` (#60, from ``resources_path``,
     default ``<home>/run/resources.json``), all behind the loopback guard."""
     from foreman_inator.config import Config
-    from foreman_inator.metrics import trace_view
+    from foreman_inator.metrics import experiments_ui, trace_view
     from foreman_inator.routing import escalation, explore
 
     cfg = config if config is not None else Config()
+    nav = (*M4_NAV, experiments_ui.NAV_ENTRY)  # #67: the page that runs experiments
     res_path = resources_path if resources_path is not None else res.default_path()
     ladder = escalation.build_ladder(cfg.models)
     plain = trace_view.store_rows_for(
@@ -866,16 +868,21 @@ def full_app(
     routes = [
         *trace_view.trace_routes(
             recordings_dir, traces_dir, store_path=store_path, ladder=ladder,
-            rows_for=rows_for, nav=M4_NAV,
+            rows_for=rows_for, nav=nav,
         ),
         *m4_routes(
             store_path,
             min_cases=cfg.experiments.min_cases,
             min_sample=cfg.experiments.live_min_sample,
+            nav=nav,
         ),
-        *resources_routes(res_path, nav=M4_NAV),
+        *resources_routes(res_path, nav=nav),
+        # #67/#69: start, stop, cancel, promote and propose (POSTs behind forms.FormGuard).
+        *experiments_ui.routes(
+            store_path, load_config=(lambda: cfg) if config is not None else None, nav=nav
+        ),
     ]  # fmt: skip
-    return create_app(store_path, extra_routes=routes, nav=M4_NAV, resources_path=res_path)
+    return create_app(store_path, extra_routes=routes, nav=nav, resources_path=res_path)
 
 
 def metrics_url(host: str, port: int, **params: str) -> str:

@@ -15,6 +15,13 @@ read-only ``GET /experiments``):
   the CLI); the replay stops cleanly and ``run --all`` resumes it;
 * ``POST /experiments/{id}/cancel``: ``worker_experiments.cancel_experiment`` (ends it as
   rejected; refused while a run holds the run lock);
+* "Propose an experiment" (todo #69, GH #49): ``POST /experiments/propose`` drafts the
+  next prompt of a role's champion (``worker_experiments.propose_command``, what ``fman
+  experiment propose --role R`` calls; one proposer call, experiments budget) and shows the
+  draft, its rationale, cutoff and estimated cost; the button is disabled, with the reason,
+  while ``propose.availability`` says no. ``POST /experiments/drafts/{id}/approve``
+  approves it (``worker_experiments.approve_draft_only``, as ``fman experiment
+  approve-draft``) and starts its replay as a background run; ``.../discard`` discards it;
 * ``GET /experiments/{id}/promote``: the comparison (``status_lines``, what ``fman
   experiment status ID`` prints) and a confirm form; ``POST /experiments/{id}/promote``
   calls ``worker_experiments.promote`` (the CLI's function) only with ``confirm=yes`` and
@@ -205,6 +212,58 @@ def _start_form(guard: forms.FormGuard, config: Config) -> str:
     )
 
 
+def _propose_section(guard: forms.FormGuard, store: Store) -> str:
+    """#69: the "Propose an experiment" form and the drafts that wait for you."""
+    from foreman_inator.experiments import propose as pp
+    from foreman_inator.experiments import variants
+
+    try:
+        avail = {r: pp.availability(store, r) for r in variants.ROLES}
+        drafts = store.list_prompt_drafts(status="draft")
+    except Exception as exc:  # an old database without migration 011, say
+        return (
+            "<h2>Propose an experiment</h2>"
+            f'<p class="empty">Not available here: {e(type(exc).__name__)} (run the worker'
+            " once to update the database).</p>"
+        )
+    ok = [r for r in variants.ROLES if avail[r].ok]
+    why = "".join(
+        f"<li>{e(r)}: {e(avail[r].reason or 'not available')}</li>"
+        for r in variants.ROLES
+        if not avail[r].ok
+    )
+    intro = (
+        "<h2>Propose an experiment</h2>"
+        "<p>A tier 3 model drafts the next prompt of the role's champion from recent kickbacks"
+        " (one call, the experiments budget; it can take a few minutes). It only drafts: you"
+        " read it, then approve it (it becomes a challenger and its replay starts, on tickets"
+        " after the draft's cutoff) or discard it. One LLM-drafted challenger per role at a"
+        " time.</p>"
+    )
+    if ok:
+        form = guard.form("/experiments/propose", _select("role", "Role", [(r, r) for r in ok]),
+                          button="Propose")  # fmt: skip
+    else:
+        form = '<p><button type="button" disabled>Propose</button></p>'
+    reasons = f"<ul>{why}</ul>" if why else ""
+    return intro + form + reasons + "".join(_draft_block(guard, d) for d in drafts)
+
+
+def _draft_block(guard: forms.FormGuard, d: Any) -> str:
+    """One waiting draft: the prompt, its rationale, cutoff and cost, and the decisions."""
+    actions = guard.form(f"/experiments/drafts/{d.id}/approve", button="Approve and start")
+    actions += guard.form(f"/experiments/drafts/{d.id}/discard", button="Discard")
+    return (
+        f"<h3>Draft #{d.id}: {e(d.role)} prompt {e(d.prompt_name)}</h3>"
+        f"<p>From <code>{e(d.base_variant)}</code>, drafted by {e(d.proposer_model)}. Cutoff"
+        f" {d.cutoff_at:%Y-%m-%d} (its replay uses only tickets created after it). Estimated"
+        f" cost ${d.est_cost_usd:.4f}; spent ${d.cost_usd:.4f}. File: <code>{e(d.path)}</code>"
+        " (edit it before approving if you like).</p>"
+        f"<details><summary>Rationale</summary><pre>{e(d.rationale)}</pre></details>"
+        f"<details><summary>Prompt</summary><pre>{e(d.prompt_text)}</pre></details>" + actions
+    )
+
+
 def _jobs_table(guard: forms.FormGuard, jobs: Sequence[Job]) -> str:
     if not jobs:
         return '<h2>Runs started here</h2><p class="empty">None.</p>'
@@ -327,6 +386,7 @@ def routes(
         try:
             champs = "".join(f"<li>{e(line)}</li>" for line in variants.status_lines(store))
             running = _running_table(guard, store, cfg)
+            propose = _propose_section(guard, store)
         finally:
             store.close()
         body = (
@@ -335,6 +395,7 @@ def routes(
             "holds up live, and only when you confirm a promotion.</p>"
             f"<h2>Champions</h2><ul>{champs}</ul>"
             + _start_form(guard, cfg)
+            + propose
             + _jobs_table(guard, jobs.list())
             + running
         )
@@ -387,6 +448,59 @@ def routes(
             store.close()
         msg = f"Experiment #{exp.id} ({exp.challenger_variant}) cancelled: ended as rejected."
         return page("Cancelled", f"<h1>Cancelled</h1>{_message(msg)}")
+
+    @guarded
+    def propose(request: Request, form: dict[str, str]) -> Response:
+        cfg = config()
+        role = form.get("role", "").strip()
+        if role not in variants.ROLES:
+            raise _Fail(f"role must be one of {', '.join(variants.ROLES)}", 400)
+        try:
+            draft = _wx().propose_command(role=role, echo=lambda _line: None, config=cfg,
+                                          db=path)  # fmt: skip
+        except ExperimentError as exc:
+            raise _Fail(str(exc), 409) from None
+        lines = _wx().draft_lines(draft)
+        body = (
+            f"<h1>Draft #{draft.id} written</h1><pre>{e(chr(10).join(lines))}</pre>"
+            + _draft_block(guard, draft)
+        )
+        return page("Draft written", body)
+
+    @guarded
+    def approve_draft(request: Request, form: dict[str, str]) -> Response:
+        draft_id = int(request.path_params["id"])
+        store = write_store()
+        try:
+            a = _wx().approve_draft_only(store, draft_id)
+        except ExperimentError as exc:
+            raise _Fail(str(exc), 409) from None
+        finally:
+            store.close()
+        try:
+            job = jobs.start(a.draft.role, a.variant_id)
+        except ExperimentError as exc:
+            msg = f"Approved draft #{a.draft.id} as {a.variant_id}; its run did not start: {exc}."
+            return page("Approved", f"<h1>Approved</h1>{_message(msg + ' ' + a.run_hint, True)}")
+        msg = (
+            f"Approved draft #{a.draft.id}: challenger {a.variant_id}, replay experiment"
+            f" #{a.experiment_id}, running in the background as run #{job.id}."
+        )
+        return page("Approved", f"<h1>Approved</h1>{_message(msg)}")
+
+    @guarded
+    def discard_draft(request: Request, form: dict[str, str]) -> Response:
+        draft_id = int(request.path_params["id"])
+        from foreman_inator.experiments import propose as pp
+
+        store = write_store()
+        try:
+            d = pp.discard_draft(store, draft_id)
+        except pp.ProposeError as exc:
+            raise _Fail(str(exc), 409) from None
+        finally:
+            store.close()
+        return page("Discarded", f"<h1>Discarded</h1>{_message(f'Draft #{d.id} discarded.')}")
 
     def confirm_body(store: Store, cfg: Config, exp_id: int, note: str = "") -> str:
         wx = _wx()
@@ -462,6 +576,9 @@ def routes(
         guard.post_route("/experiments/jobs/{job:int}/stop", stop),
         guard.post_route("/experiments/{id:int}/cancel", cancel),
         guard.post_route("/experiments/{id:int}/promote", promote),
+        guard.post_route("/experiments/propose", propose),
+        guard.post_route("/experiments/drafts/{id:int}/approve", approve_draft),
+        guard.post_route("/experiments/drafts/{id:int}/discard", discard_draft),
     ]
 
 

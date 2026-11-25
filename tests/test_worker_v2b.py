@@ -572,7 +572,9 @@ def test_a_tier_labeled_issue_is_checked_once_too(env: Env) -> None:
     env.once(passing())
     t = env.ticket(n)
     assert env.clarify_calls == 1 and env.route_calls == 0 and t.routed_tier == 2
-    assert len(env.attempts(n)) == 1 and env.issue_comments(n) == []
+    # #77: the status comment (its own marker) is not a clarifying question.
+    asked = [c for c in env.issue_comments(n) if "foreman-inator:status" not in c]
+    assert len(env.attempts(n)) == 1 and asked == []
     assert env.store.get_cursor(REPO, clarify_cursor(t.id)) == "clear"
 
 

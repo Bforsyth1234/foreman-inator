@@ -130,6 +130,7 @@ from foreman_inator.runner import sandbox
 from foreman_inator.runner import verify as verify_mod
 from foreman_inator.runner.worktree import RepoMirror, Worktree, WorktreeError
 from foreman_inator.tickets import conventions as conventions_mod
+from foreman_inator.tickets import images as images_mod
 from foreman_inator.tickets.prompt import CONVENTIONS_BUDGET, build_writer_prompt, clip_head
 from foreman_inator.worker_setup import setup_failure
 
@@ -312,6 +313,9 @@ class ReplayDeps:
     recordings_dir: Path | None = None  # read for head commits when building sets
     clock: Callable[[], float] = time.monotonic
     config: Any = None  # the repos' ``rules_file`` (``rules_file_for``); None = no config
+    #: #78: where the live attempts stored the issue's described images
+    #: (``images.stored_text``); None = no image block in replayed prompts.
+    traces_dir: Path | None = None
 
 
 def _forget_queue_wait(proxy: Any, run_id: int) -> None:
@@ -727,7 +731,7 @@ def compare(store: Store, experiment_id: int, *, min_cases: int = 10) -> Compari
     champ = _totals(exp.champion_variant, [a for a, _ in paired])
     chall = _totals(exp.challenger_variant, [b for _, b in paired])
     verdict, reason = verdict_for(role, champ, chall, len(paired), min_cases)
-    total = len(rs.list_cases(store, int(run["set_id"])))
+    total = len(rs.list_cases(store, int(run["set_id"]), experiment_id=experiment_id))
     return Comparison(
         role=role,
         experiment_id=experiment_id,
@@ -935,7 +939,7 @@ def _drive(
         # #49: a local-only repo's cases run only when both sides are local models.
         cloud = bool(champion.endpoint.is_cloud or challenger.endpoint.is_cloud)
         if cases is None:
-            cases = rs.list_cases(store, set_id, cloud_models=cloud)
+            cases = rs.list_cases(store, set_id, cloud_models=cloud, experiment_id=experiment_id)
         else:
             local = store.local_only_repos() if cloud else frozenset()
             cases = [c for c in cases if c.repo not in local]
@@ -1174,6 +1178,12 @@ def _writer_side(ctx: _SideCtx) -> CaseResult:
             conventions=conv,
             template=variant.template,
             clarification=wc.clarification,
+            # #78: the descriptions the live attempt stored; no fetch, no model call.
+            images=(
+                images_mod.stored_text(deps.traces_dir, wc.ticket_id)
+                if deps.traces_dir is not None
+                else None
+            ),
         )
         run_id = _synthetic_id()
         with (
@@ -1592,7 +1602,10 @@ def run_seeded(
     stored = {
         c.id: c
         for c in rs.list_cases(
-            store, run_set, cloud_models=champion.endpoint.is_cloud or challenger.endpoint.is_cloud
+            store,
+            run_set,
+            cloud_models=champion.endpoint.is_cloud or challenger.endpoint.is_cloud,
+            experiment_id=experiment_id,
         )
     }
     cases = [b.stored(stored[b.case_id]) for b in built if isinstance(b, sd.SeededCase)]

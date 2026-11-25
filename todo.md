@@ -102,7 +102,8 @@ Package root below is `src/foreman_inator/` (written `pkg/`).
 | 14 | B1: GH #52 · B2: todo #57 (GH #34) · B3: todo #59 (GH #36) · B4: todo #51 (GH #28) · B5: todo #46 (GH #23) · B6: todo #61, #63 (GH #38, #40) | B1 `pkg/tickets/clarify.py`, `pkg/routing/rules.py` · B2 `pkg/proxy/server.py`, `pkg/runner/opencode.py` · B3 `pkg/resources/memory.py`, `pkg/worker_attempt.py` · B4 `pkg/routing/profile.py`, `pkg/routing/escalation.py`, `pkg/review/reviewer.py`, `pkg/spend.py`, `pkg/worker_review.py`, `pkg/worker_route.py`, `pkg/worker_status.py`, `pkg/db/store.py`, `008_profiles.sql` · B5 `pkg/metrics/queries.py`, `pkg/metrics/web.py` · B6 `pkg/tickets/conventions.py`, `pkg/tickets/prompt.py`, `pkg/paths.py` (+ own tests). GH #52 (cold-load allowance for the clarity check and router) has no todo id. Runner at close: config `cold_load_timeout_seconds`, `max_local_inference`, `[rules_file]`; `OllamaWatch` on the worker; shared `LocalSlots` + driver `extra_time`; profile limits/start tier in the policy, `writer_gate`, review-off hand-over, `fman repo set-profile`, PR profile line; `conventions.gather` in the attempt | [x] built; live check open for #51 |
 | 15 | C1: todo #52, #64 (GH #29, #41) · C2: todo #62 (GH #39) · C3: todo #66 (GH #43) · C4: todo #48 (GH #25) · C5: todo #47 data (GH #24) · C6: todo #68, #58 status line (GH #45, #35) | C1 `pkg/proxy/server.py`, `pkg/proxy/pricing.py`, `pkg/runner/opencode.py`, `pkg/config.py`, `tests/fakes/anthropic.py` · C2 `pkg/review/reviewer.py`, `pkg/prompts/reviewer-v2.md` · C3 `pkg/experiments/replay_runner.py`, `pkg/worker_experiments.py` · C4 `pkg/tickets/prompt.py`, `pkg/worker_attempt.py` · C5 `pkg/metrics/quality.py`, `pkg/worker_quality.py`, `pkg/github/client.py`, `tests/fakes/github.py`, `pkg/db/store.py`, `009_post_merge.sql` · C6 `pkg/plugins.py`, `pkg/worker_status.py` (+ own tests). Runner at close: recorder cache counts; reviewer gets the repo's `rules_file`; `review_change(conventions=)` for reviewer rules replays; `fman experiment run --rules`; `QualitySteps` + daily scan in the poll; plugin CLI commands, startup lines, Ollama and plugin lines in `fman status`; SPEC Capture wording and Plugins section | [x] built; live checks open for #52, #64 |
 | 16 | D1: todo #65 (GH #42) · D2: #49 (GH #26) · D3: #47 display (GH #24) · D4: #34 split (GH #16) · D5: #35 (GH #17) · D6: #50 (GH #27) · D7: #77, #70 (GH #70, #59) · D8: #72 (GH #61) | D1 `pkg/rules_show.py`, `pkg/tickets/conventions.py` · D2 `pkg/routing/escalation.py`, `pkg/worker_review.py`, `pkg/spend.py`, `pkg/experiments/shadow.py`, `pkg/experiments/replay_sets.py`, `pkg/tracing/failure_label.py`, `pkg/db/store.py`, `010_local_only.sql` · D3 `pkg/metrics/queries.py`, `pkg/metrics/web.py`, `pkg/routing/knn.py` · D4 `pkg/experiments/split.py`, `pkg/worker_attempt.py`, `pkg/worker_experiments.py` · D5 `pkg/experiments/seeded.py`, `pkg/experiments/replay_runner.py` · D6 `pkg/tickets/decompose.py`, `pkg/prompts/split-v1.md`, `pkg/worker_route.py` · D7 `pkg/sweep.py`, `pkg/worker_queue.py`, `pkg/config.py` · D8 `pkg/review/reviewer.py` (+ own tests). Runner at close: `fman rules show`, `fman repo set-cloud`, `fman experiment split …`, `--mode seeded`, `fman sweep`; config `split_large`, `split_timeout_seconds`, `reviewer_order`; local-only limits/embedder/replay cases/status line; dormant `local_only`, `split_proposed`; reviewer pick + escalation in the review stage; Ollama "slow" status | [x] built; live check open for #77; #34 `ab:pair` open |
-| — | #33–#39 | unscheduled (SPEC milestone 5) | open |
+| 17 | E1: todo #60 (GH #37) · E2: #67 (GH #44) · E3: #69 (GH #49) · E4: #36 (GH #18) · E5: #37 (GH #19) · E6: #33 (GH #15) · E7: #78 (GH #71) · E8: #79 (GH #73) · E9: #81 (GH #77) | E1 `pkg/resources/snapshot.py`, `pkg/worker_resources.py`, `pkg/metrics/web.py`, `pkg/metrics/trace_view.py` · E2 `pkg/metrics/experiments_ui.py`, `pkg/metrics/forms.py`, `pkg/worker_experiments.py` · E3 `pkg/experiments/propose.py`, `pkg/experiments/replay_sets.py`, `pkg/prompts/proposer-v1.md`, `pkg/db/store.py`, `011_proposed.sql` · E4 `pkg/tracing/fork.py`, `pkg/tracing/replay.py` · E5 `pkg/routing/classifier.py`, `pkg/worker_route.py` · E6 `pkg/github/relay.py`, `pkg/setup/manifest.py`, `docs/relay.md` · E7 `pkg/tickets/images.py`, `pkg/tickets/prompt.py`, `pkg/worker_attempt.py` · E8 `pkg/retry.py`, `pkg/worker_actions.py` · E9 `pkg/worker_status_comment.py`, `pkg/github/client.py`, `tests/fakes/github.py` (+ own tests). Runner at close: `ResourceSteps` + `StatusCommentSteps` on `Worker`, snapshot per poll, status-comment call sites, relay start/nudge/stop, retry mark in `policy_for`; `fman experiment propose | approve-draft | discard-draft`, `fman replay --fork`, `fman retry`, `fman setup --relay-url`; config `classifier_router`, `classifier_min_tickets`, `relay_url`, `relay_secret_ref`, `status_comment`, `status_label`, `status_show_cost`, `[experiments] proposer_*`, `fork_*`, `[[models]] vision`; `/experiments/manage` in `full_app` with the propose section; replay cutoff + stored images; export/anchor fixes; docs + SPEC | [x] built; live check open for #33; #79's button in wave 18 |
+| — | #34 (`ab:pair`), #38, #39 | unscheduled (SPEC milestone 5; #33, #36, #37 built in wave 17) | open |
 | — | #45–#50 | unscheduled (gap review, 2026-11-23) | open |
 | — | #53–#56 | unscheduled (first live run, 2026-11-23); #45 gained live evidence in the same run | open |
 
@@ -142,6 +143,7 @@ One combined step list for wave 6b is in DONE.md's #40, #41 and #44 entries.
 - #31 packaging: decide how fde-kit reaches strangers (it is not on PyPI, so `uv tool install foreman-inator` cannot work yet; the release workflow's publish jobs are switched off). Then TestPyPI, then PyPI. Steps in `docs/releasing.md`.
 - #52 prompt caching: one real Claude writer attempt on a toy repo (from the second model call on, `cache_read_input_tokens` above zero in the trace; cost below the uncached figure), and one GLM attempt on the Coding Plan endpoint (note whether `cached_tokens` is ever above zero).
 - #64 OpenCode instruction files: in one real attempt on a repo with an `AGENTS.md`, the first `llm.call` carries the file's text once (from our prompt), not twice.
+- #33 webhook relay: a smee.io channel (or your own relay), `fman setup --relay-url <url>` (or the App's webhook set by hand plus `fman config set-key relay-webhook-secret`), restart the worker, label an issue: the log says `relay nudge for <repo>: polling now` within seconds.
 - #32 docs: follow `docs/setup.md` on a second Mac account from scratch; record `docs/demo.gif` from a real run.
 
 ## Completed items (archived to DONE.md)
@@ -241,11 +243,11 @@ Deviations:
 
 ### Unscheduled (SPEC milestone 5)
 
-#33 — Webhook relay for instant reactions [ ] · Added: 2026-11-23 · Source: spec
+#33 — Webhook relay for instant reactions [~] live · done 2026-11-25, wave 17, see DONE.md
 #34 — Traffic split and head-to-head (`ab:pair`) writer experiments [~] split done 2026-11-25, wave 16, see DONE.md; `ab:pair` not built (needs data-model rework)
 #35 — Seeded-bug reviewer test cases [x] · done 2026-11-25, wave 16, see DONE.md
-#36 — Fork from failure: restart a recorded attempt at its failure step with a new prompt or model [ ] · Added: 2026-11-23 · Source: user/spec
-#37 — Classifier router, then a LoRA router only if it beats the classifier on held-out tickets [ ] · Added: 2026-11-23 · Source: spec
+#36 — Fork from failure: restart a recorded attempt at its failure step with a new prompt or model [x] · done 2026-11-25, wave 17, see DONE.md
+#37 — Classifier router, then a LoRA router only if it beats the classifier on held-out tickets [x] · done 2026-11-25, wave 17, see DONE.md
 #38 — Homebrew tap [ ] · Added: 2026-11-23 · Source: spec
 #39 — Publish the App for others (each user still runs their own worker) [ ] · Added: 2026-11-23 · Source: spec
 
@@ -306,9 +308,7 @@ Asked by the user: "should we add the ability for the app to track gpu / memory 
 
 #59 — Record memory state on each attempt [x] · done 2026-11-25, wave 14, see DONE.md · Added: 2026-11-23 · Source: user
 
-#60 — Resource panel on the metrics page [ ] · Added: 2026-11-23 · Source: user
-Why: makes #57–#59 visible: current loaded models and their memory, system memory used, and local inference slots in use vs. the cap.
-Idea: a panel in `metrics/web.py` fed by #58's poller and the #57 semaphore; per-attempt memory from #59 shown on the attempt view. Depends on #57–#59. Estimate: about 2 hours.
+#60 — Resource panel on the metrics page [x] · done 2026-11-25, wave 17, see DONE.md
 
 ### Unscheduled (agent instructions and global rules, 2026-11-23)
 
@@ -330,12 +330,7 @@ Asked by the user: "what about agent md files? do we need to tell the agents to 
 
 Asked by the user: "are they setup in the command line or do we set them up with a gui", then "yes add it as a todo". Today experiments are started and promoted only from the CLI (`fman experiment run | status | promote`, `[experiments]` in config.toml, the nightly launchd job); `/experiments` on the metrics page is read-only (GET routes only).
 
-#67 — Start, cancel and promote experiments from the metrics page [ ] · Added: 2026-11-23 · Source: user
-Why: running an experiment means remembering variant ids (`MODEL/PROMPT@HASH8`) and typing them into the CLI, while the results are already on the web page. Starting and promoting from where the results are shown cuts that step.
-Idea: on `/experiments`: a "new experiment" form (role, challenger model and prompt picked from lists, later the #66 rules override), cancel on a running one, promote on a finished one. Each button calls the same functions as the CLI (`worker_experiments.run_command`, promote), so nothing new decides anything. Promote shows the comparison and asks for a confirm step, because it changes the live writer or reviewer.
-Safety: the page binds to loopback only (`metrics/web.py`, `DEFAULT_HOST`) and has no login, so any website open in the browser can send a POST to it. Every POST needs a CSRF token (per-process random, in the form) and an `Origin` / `Host` check that rejects anything but the page's own loopback origin; GETs stay side-effect free. A started run is a background job (the page does not block on a replay), and the cloud spend caps apply as on the CLI path.
-Verify: a POST without the token, or with a foreign `Origin`, is refused with 403 and changes nothing; promote without the confirm step changes nothing; a form-started run gives the same `experiments` row as the CLI with the same arguments. Non-vacuous: drop the Origin check and the foreign-origin test fails.
-Estimate: about 2–3 hours with tests.
+#67 — Start, cancel and promote experiments from the metrics page [x] · done 2026-11-25, wave 17, see DONE.md
 
 ### Unscheduled (plugins, 2026-11-23)
 
@@ -347,14 +342,7 @@ Asked by the user: "add the plugin hooks as a todo". Nothing in this repo loads 
 
 Asked by the user: "does it make sense for the llm to create experiments?", then "yes add it as a todo and open a github issue". Today every challenger is written by hand: someone has to notice a pattern in kickbacks, write `writer-vN.md` / `reviewer-vN.md`, then run `fman experiment run --challenger`.
 
-#69 — An LLM drafts challenger prompts from labeled kickbacks; promotion is unchanged [ ] · Added: 2026-11-24 · Source: user
-Why: the experiment machinery (replays, shadow reviewer, promotion rule) exists, but nothing proposes the next variant, so experiments only happen when someone thinks one up. Kickbacks already carry a failure step (`kickbacks.failure_step`, #27), which is exactly what a prompt author needs to know.
-Idea: `fman experiment propose --role writer|reviewer`. It groups recent kickbacks by failure step (and reviewer catch / false-kickback misses for the reviewer role), and a tier 3 model reads the current champion prompt plus the top patterns and drafts the next prompt version (`pkg/prompts/<role>-vN.md`, plus a short rationale naming the patterns it targets). The draft goes out as a PR or draft for the user to approve; only after approval is it registered as a challenger through the existing `run_command`. Model choice stays human (the list is short and known); the LLM writes prompts only. Promotion stays the existing rule-based gate (`promote`: wins on replay AND holds live); the LLM never promotes.
-Safety: (1) Overfitting: the proposer reads only kickbacks older than a cutoff, and the replay that scores the challenger uses only cases after that cutoff, so it is never scored on tickets it was written from; record the cutoff on the experiment. (2) Volume: at most one LLM-proposed challenger running per role, and the proposer call counts toward `spend_caps.experiments_monthly_usd`. (3) Independence: the proposer model is not the reviewer that scores the challenger (same idea as the reviewer-independence invariant). (4) Consent: nothing runs or changes until the user approves the prompt change, same idea as #51's sub-issues. Kickback text and issue bodies are untrusted input to the proposer: `defuse` them as in the writer prompt.
-Verify: with fake kickbacks clustered on one failure step, `propose` drafts a prompt whose rationale names that step and registers nothing until approval; a second `propose` while one LLM challenger is running for the role exits without a model call; the replay for a proposed challenger contains no case at or before the cutoff; `promote` behaves identically for proposed and hand-written challengers. Non-vacuous: drop the cutoff filter and the no-overlap test fails.
-UI (user, 2026-11-25: "ok can we have a button that has a tier 3 llm generate an expirment too"): a "Propose an experiment" button on `/experiments`, next to #67's "new experiment" form. Pick the role (writer or reviewer), press the button, and it runs the same code as `fman experiment propose`. The page then shows the drafted prompt, its rationale (the kickback patterns it targets), the cutoff and the estimated proposer cost, with "Approve and start" (registers the challenger through `run_command`, as #67's form does) and "Discard". Nothing starts without that approve click. The button is disabled with the reason shown when an LLM challenger is already running for that role or the experiments spend cap is reached. Uses #67's POST protection. Build after #67 and the CLI part of this item.
-SPEC change needed: one paragraph under "Experiments" saying challengers may be LLM-drafted, with the cutoff and the one-at-a-time rule.
-Estimate: about half a day with tests, assuming `run_command` and the replay path are reused unchanged. Related: #66, #67.
+#69 — An LLM drafts challenger prompts from labeled kickbacks; promotion is unchanged [x] · done 2026-11-25, wave 17, see DONE.md
 
 ### Unscheduled (tier order, 2026-11-25)
 
@@ -409,27 +397,11 @@ Asked by the user: "can we add a feature to take every issue in github and use a
 
 Asked by the user: "if i respond to a comment for needs info does it pick that comment up? and what if the comment is an image", then "yes add it as a todo and open a matching github issue". Today an image in an issue body, a needs-info answer or a comment reaches the writer only as its markdown link (`![image](https://github.com/user-attachments/...)`): the ladder's models get text only, and the sandbox blocks the network, so the writer cannot fetch it.
 
-#78 — Images in issues and answers reach a vision-capable model [ ] · Added: 2026-11-25 · Source: user
-Why: screenshots are the most common way to show a UI bug or a layout ("the button should go here"). An image-only needs-info answer resumes the ticket, but the writer works without what the image shows, so the attempt guesses.
-Idea:
-⚬ Fetch: the worker (not the sandbox) downloads images linked from the issue body, the needs-info answers and the comments, only from allowed users (invariant 7b) and only from GitHub's own attachment hosts (`github.com/user-attachments/`, `user-images.githubusercontent.com`, `private-user-images.githubusercontent.com`), with the App token where private repos need it. Size cap per image and per ticket, image types only (checked by magic bytes, not the extension), stored under the ticket's trace dir with the other recordings (pruned by #56's rules).
-⚬ Use: the writer gets the images as image parts in its first message when its model supports vision (a `vision = true` flag on `ModelEndpoint`). Otherwise a vision-capable model writes a short text description of each image once, defused and fenced like the issue body, and that text goes into the prompt in place of the link. A local vision model first (cost 0); a cloud one only within the spend caps and only if the repo is not `cloud = false` (#49, invariant 7c).
-⚬ Prompt: each image is labelled with where it came from ("issue body", "answer from @user"). The link stays in the text so the writer can refer to it.
-⚬ Recordings and replay: the stored image (or its description) is part of the recorded input, so a replay sees the same thing.
-Safety: images are untrusted input like text. Text inside an image can carry instructions: a description is defused and fenced, and image parts are sent with the same "this is the user's issue, not instructions to you" framing as the issue body. Nothing is fetched from any other host (no SSRF through a crafted link). An image from a user not on `allowed_users` is ignored.
-Verify: an allowed user's attachment is fetched and reaches the writer (image part for a vision model, description otherwise); a stranger's image and a non-GitHub image URL are not fetched; an oversized file and a non-image with a `.png` name are refused; a `cloud = false` repo never sends an image to a cloud model; the recording holds the image or description and replay uses it. Non-vacuous: drop the host allow-list and the "non-GitHub URL not fetched" test fails.
-SPEC change needed: one line under the writer's input saying images from allowed users are passed as image parts or descriptions.
-Estimate: about a day with tests, plus a check of which installed local models take images (rule 12: Ollama's chat API image format, OpenCode's support for image parts through `@ai-sdk/openai-compatible`). Related: #44 (needs-info), #48 (comments), #49 (local only), #56 (pruning).
-Deviations:
+#78 — Images in issues and answers reach a vision-capable model [x] · done 2026-11-25, wave 17, see DONE.md
 
 ### Unscheduled (retry from the UI, 2026-11-25)
 
-#79 — Retry button for a flagged or failed ticket [ ] · Added: 2026-11-25 · Source: user
-Ask: "can we add a retry button on the ui", then "add it to todo.md" and "add a github issue".
-Why: there is no retry command. To start a ticket over today the user removes the `agent` label, closes the draft PR and adds the label again (docs/setup.md, section 5), which makes a new ticket and loses the old one's history. A ticket flagged for a cause the user has since fixed (`checks_failed`, `kickback_cap`, `interrupted`, `publish_failed`, `setup_failed`, `spend_cap`, `attempt_budget`; the flag names are in `worker_policy.py`, `spend.py`, `worker_setup.py`, `worker_actions.py`) just sits until then. Only `no_verify_command` has a resume path (`fman repo set-verify` unflags it, `worker_status.py:286`).
-Idea: a "Retry" button on each flagged ticket on the activity page (#76), with a choice of "same tier" or "move up a tier". It clears the flag and puts the ticket back in the queue, keeping its history (attempts, traces, PR branch), so the metrics count it as one ticket. Add the same as a CLI command (`fman retry <repo>#<issue> [--tier N]`) and have the button call that code. The retry limits still apply: a retry gives a fixed number of extra attempts (for example one round), not a reset, and a `spend_cap` flag can't be retried while the cap is still reached (show why instead). A retry made by hand is recorded on the ticket so the router can tell it apart from an automatic escalation. Uses the shared POST protection from #67 / #73.
-Verify: retrying a `checks_failed` ticket clears the flag, queues it once and keeps its attempt rows; "move up a tier" starts the next attempt one tier higher; retry while the spend cap is reached is refused with the reason and changes nothing; two clicks queue it once; a POST without the token is refused with 403. Non-vacuous: drop the once-only guard and the double-click test queues two attempts.
-Estimate: about half a day with tests, after #76. Related: #67, #73, #76.
+#79 — Retry button for a flagged or failed ticket [x] · done 2026-11-25, wave 17, see DONE.md
 
 ### Unscheduled (second live run, bot-inator, 2026-11-25)
 
@@ -444,16 +416,4 @@ Deviations:
 
 ### Unscheduled (status on the issue, 2026-11-25)
 
-#81 — Say on the issue when work starts, and keep that one comment up to date [ ] · Added: 2026-11-25 · Source: user
-Ask: "add a todo and a github issue that states when the llm has started working on an issue to update it that states it is working on the issue".
-Why: today the worker posts on the issue only when something needs the user (needs-info questions, flags, the PR summary). Between labeling an issue and its PR appearing (often 20+ minutes, sometimes several attempts) the issue shows nothing, so from GitHub or the phone there is no way to tell "queued", "working" and "stuck" apart without `fman status` on the Mac.
-Idea:
-⚬ When a ticket's first attempt starts, post ONE status comment with a hidden marker (`<!-- foreman-inator:status -->`): "foreman-inator is working on this: attempt 1 on tier N (model), started HH:MM". On each later attempt, escalation, verify, review or PR step, EDIT that same comment (PATCH the issue comment) instead of posting a new one, so the issue gets one comment, not a stream. The last state stays: "PR #N opened", "handed over: <reason>", "dropped".
-⚬ Optional label `fman:working` while an attempt runs, removed when it ends. A bot-applied label never starts work (invariant 7b), and this label is not `agent`, so it can't loop.
-⚬ Config `status_comment = true` (default on) and `status_label = false`. Per repo off through the same repo settings as the profile.
-⚬ The status comment is excluded everywhere bot comments already are: it is never an answer to needs-info, never in #48's issue-comments context, never counted as user activity.
-⚬ Rate: at most one edit per state change (no per-turn updates), so a long attempt makes a handful of API calls.
-Safety: text in the comment is the worker's own (model name, tier, step, times, PR link); no model output and no cost figures unless the user turns `status_show_cost` on, since issue comments on a public repo are public.
-Verify: first attempt start posts exactly one marked comment; escalation and PR open edit it (comment count unchanged); a restart finds the existing comment by marker and edits it instead of posting a second; the needs-info answer detector and the issue-comments context ignore it; with `status_comment = false` nothing is posted. Non-vacuous: drop the marker lookup and the restart test posts a second comment.
-Estimate: about 2 hours with tests (needs `update_comment` in the GitHub client and the fake). Related: #44 (needs-info), #48 (comments), #76 (activity page shows the same state on the Mac).
-Deviations:
+#81 — Say on the issue when work starts, and keep that one comment up to date [x] · done 2026-11-25, wave 17, see DONE.md

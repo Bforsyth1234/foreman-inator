@@ -71,6 +71,7 @@ def status_lines(store: Store, config: Config, experiment_id: int | None = None)
             f"Experiment #{exp.id}: {exp.role} {exp.mode}, {exp.status}",
             f"  champion   {exp.champion_variant}",
             f"  challenger {exp.challenger_variant}",
+            f"  origin     {_origin(exp)}",  # #49: who wrote the challenger, and its cutoff
             f"  started {exp.started_at:%Y-%m-%d %H:%M}"
             + (f", ended {exp.ended_at:%Y-%m-%d %H:%M}" if exp.ended_at else ""),
             f"  {summary(store, exp, config)}",
@@ -90,10 +91,19 @@ def status_lines(store: Store, config: Config, experiment_id: int | None = None)
     return lines
 
 
+def _origin(e: Experiment) -> str:
+    origin = getattr(e, "origin", "human") or "human"
+    cutoff = getattr(e, "cutoff_at", None)
+    if origin == "llm":
+        origin = "LLM-drafted (approved by you)"
+    return origin + (f", cutoff {cutoff:%Y-%m-%d}" if cutoff is not None else "")
+
+
 def _line(store: Store, e: Experiment, config: Config) -> str:
+    tag = f" [{_origin(e)}]" if getattr(e, "origin", "human") == "llm" else ""
     return (
         f"  #{e.id:<4} {e.role:<8} {e.mode:<6} {e.status:<8} {e.challenger_variant}"
-        f" vs {e.champion_variant}: {summary(store, e, config)}"
+        f" vs {e.champion_variant}{tag}: {summary(store, e, config)}"
     )
 
 

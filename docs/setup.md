@@ -182,6 +182,10 @@ available, not added. If nothing else changed, `config.toml` is not rewritten.
 Re-run it after changing `[experiments] nightly_hour`, which is read only when
 the agent is installed.
 
+Optional: to have the worker react to a label in seconds instead of at the
+next poll, give setup a webhook relay with `--relay-url`. Polling keeps
+working without it. See [relay.md](relay.md).
+
 ### Changing the repos later
 
 ```bash
@@ -442,7 +446,9 @@ fman metrics
 serves a read-only page at `http://127.0.0.1:8642` (`--port` to change it):
 accept rates, kickbacks, escalation, cost per accepted ticket and trend lines,
 per model, filterable by model, repo and dates. It also has `/traces` (step
-through a recorded ticket), `/failures` and `/experiments`. See
+through a recorded ticket), `/failures`, `/experiments`, `/resources` (what
+Ollama holds, memory and local slots) and `/experiments/manage` (start,
+propose and promote experiments). See
 [how-it-works.md](how-it-works.md#metrics-and-the-trace-viewer).
 
 ## 8. Stopping, restarting and uninstalling

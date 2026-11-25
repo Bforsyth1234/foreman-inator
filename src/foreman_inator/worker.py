@@ -108,6 +108,18 @@ Milestone 4 (wired in wave 9, #29)
   reviews each finalized PR attempt on the "shadow lane" thread (never a job slot), under
   the sandbox, costed to the experiments bucket, posting nothing.
 
+Wave 17 (wired at the wave's close)
+-----------------------------------
+* #37 resources: ``ResourceSteps.write_resources`` once per poll (``run/resources.json``,
+  read by ``fman metrics``'s ``/resources`` panel).
+* #15 relay: ``serve_forever`` starts ``github.relay`` when ``relay_url`` is set; a
+  verified delivery calls ``nudge(repo)``, which wakes the loop to poll now. The poller
+  stays the only authority (a nudge is just an early poll).
+* #73 retry: ``policy_for`` applies ``retry.with_manual_retry`` (a ``fman retry`` mark).
+* #77 status comment: ``StatusCommentSteps.status_update`` at attempt start / escalation,
+  verify, review, PR opened, hand-over and drop (``worker_attempt``, ``worker_actions``,
+  ``worker_review``).
+
 Shutdown: SIGINT/SIGTERM set the stop flag and every running job's cancel event; the
 OpenCode driver aborts its session and kills its process group, verify and the reviewer
 kill their commands, a cut-short attempt is stored as ``superseded``, a cut-short review
@@ -124,9 +136,11 @@ from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
+from foreman_inator import retry as retry_mod
 from foreman_inator import tracing
-from foreman_inator.config import Config
+from foreman_inator.config import Config, key_ref
 from foreman_inator.db.store import OPEN_COLUMNS, Store, Ticket
+from foreman_inator.github import relay as relay_mod
 from foreman_inator.github.client import GitHubAPI
 from foreman_inator.github.poller import Poller
 from foreman_inator.locks import Locks
@@ -148,9 +162,11 @@ from foreman_inator.worker_publish import PublishSteps
 from foreman_inator.worker_quality import QualitySteps
 from foreman_inator.worker_queue import JOIN_TIMEOUT, Job, QueueSteps
 from foreman_inator.worker_rebase import RebaseSteps
+from foreman_inator.worker_resources import ResourceSteps
 from foreman_inator.worker_review import ReviewSteps
 from foreman_inator.worker_route import RouteSteps
 from foreman_inator.worker_sandbox import SandboxSteps
+from foreman_inator.worker_status_comment import StatusCommentSteps
 
 log = logging.getLogger("foreman_inator.worker")
 
@@ -171,6 +187,8 @@ class Worker(
     BackgroundSteps,
     PruneSteps,
     QualitySteps,
+    ResourceSteps,
+    StatusCommentSteps,
 ):
     def __init__(
         self,
@@ -226,6 +244,11 @@ class Worker(
         self.review_timeout = review_timeout
         self.parallel = int(config.max_parallel_per_repo)
         self._stop = threading.Event()
+        #: #15: set by ``nudge`` (a verified relay delivery) and by ``request_stop``;
+        #: ``serve_forever`` waits on it instead of on ``_stop``.
+        self._wake = threading.Event()
+        self._nudged: set[str] = set()
+        self._relay: relay_mod.RelayClient | None = None
         self._lock = threading.Lock()
         self._init_queue()
         self._finalized: set[int] = set()  # review ids whose GitHub side is done here
@@ -305,18 +328,50 @@ class Worker(
             interval,
             self.parallel,
         )
+        self.start_relay()
         while not self._stop.is_set():
+            if self._wake.is_set():  # a relay nudge (or a stop): poll now
+                self._wake.clear()
+                with self._lock:
+                    nudged, self._nudged = self._nudged, set()
+                if nudged and not self._stop.is_set():
+                    log.info("relay nudge for %s: polling now", ", ".join(sorted(nudged)))
+                    next_poll = 0.0
+            if self._stop.is_set():
+                break
             if self.clock() >= next_poll:
                 self.poll_and_handle()
                 next_poll = self.clock() + interval
             self.dispatch(inline=False)
-            self._stop.wait(min(1.0, max(0.0, next_poll - self.clock())))
+            self._wake.wait(min(1.0, max(0.0, next_poll - self.clock())))
         self.shutdown()
+
+    def start_relay(self) -> relay_mod.RelayClient | None:
+        """#15: start the webhook relay client when ``relay_url`` is set (else None)."""
+        if self._relay is None:
+            cfg = self.config
+            secret_ref = getattr(cfg, "relay_secret_ref", None) or key_ref(
+                relay_mod.DEFAULT_SECRET_NAME
+            )
+            self._relay = relay_mod.start_relay(
+                getattr(cfg, "relay_url", None), secret_ref, self.nudge, repos=self.repos
+            )
+        return self._relay
+
+    def nudge(self, repo: str) -> None:
+        """#15: a verified relay delivery for ``repo``: poll now instead of at the next
+        interval. Thread safe (called on the relay's thread)."""
+        with self._lock:
+            self._nudged.add(repo)
+        self._wake.set()
 
     def request_stop(self, why: str = "stop requested") -> None:
         if not self._stop.is_set():
             log.info("worker stopping: %s", why)
         self._stop.set()
+        self._wake.set()
+        if self._relay is not None:
+            self._relay.stop(timeout=0.0)
         with self._lock:
             for run in self._running.values():
                 run.cancel.set()
@@ -341,11 +396,14 @@ class Worker(
 
     def policy_for(self, ticket: Ticket) -> escalation.Step | None:
         """Escalation's decision for ``ticket`` from its stored rows (crash safe). #51:
-        a repo profile other than ``default`` passes its limits."""
+        a repo profile other than ``default`` passes its limits. #73: a ``fman retry``
+        mark changes the decision (``retry.with_manual_retry``)."""
         h = self.history(ticket)
         if (lim := self.limits(ticket)) is not None:
-            return self.policy(h, limits=lim)  # type: ignore[call-arg]
-        return self.policy(h)
+            step = self.policy(h, limits=lim)  # type: ignore[call-arg]
+        else:
+            step = self.policy(h)
+        return retry_mod.with_manual_retry(self.store, ticket, h, step)
 
     def history(self, ticket: Ticket) -> escalation.History:
         """What escalation reads. Attempts paused by a spend cap or a lock yield are left
@@ -387,6 +445,7 @@ class Worker(
             for repo, exc in result.errors.items():
                 log.warning("poll of %s failed: %s: %s", repo, type(exc).__name__, exc)
         self.queue_backfill()  # #23: at most one small embedding batch per poll, in the back
+        self.write_resources()  # #37: run/resources.json for `fman metrics` (never raises)
         if self._recovered:  # #56: after recover(), so a dead process's attempts are ended
             self.maybe_prune()
             self.maybe_scan_quality()  # #24: daily post-merge revert / follow-up scan
