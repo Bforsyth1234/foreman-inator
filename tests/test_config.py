@@ -341,3 +341,27 @@ def test_launch_writer_passes_the_configured_timeout(tmp_path):
     )
     AttemptSteps._launch_writer(stub, ticket=None, worktree=tmp_path, attempt_id=1, prompt="p")
     assert seen["timeout"] == 2700.0
+
+
+# --------------------------------------------------------------------------- #52 wire
+
+
+def test_wire_defaults_parses_validates_and_round_trips(tmp_path):
+    defaults = {m.name: m.wire for m in config.default_models()}
+    assert defaults == {
+        "inkling-2-mini": "openai",
+        "qwen3.8-27b": "openai",
+        "glm": "openai",
+        "claude-opus": "anthropic",
+        "claude-fable": "anthropic",
+    }
+    path = config.save(Config(), tmp_path / "c.toml")
+    text = path.read_text()
+    assert text.count('wire = "anthropic"') == 2 and 'wire = "openai"' not in text
+    assert config.load(path) == Config()
+    # an older file with no wire key loads as "openai"
+    path.write_text(text.replace('wire = "anthropic"\n', ""))
+    assert {m.wire for m in config.load(path).models} == {"openai"}
+    path.write_text(text.replace('wire = "anthropic"', 'wire = "grpc"', 1))
+    with pytest.raises(ConfigError, match="wire"):
+        config.load(path)

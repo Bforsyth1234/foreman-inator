@@ -176,14 +176,31 @@ PERMISSIONS: dict[str, Any] = {
 }
 
 
+#: #52: the AI SDK provider package OpenCode loads for each ``ModelEndpoint.wire``.
+#: OpenCode 1.18.7 (the installed binary, inspected 2026-11-25) builds an
+#: ``@ai-sdk/anthropic`` model from ``options.baseURL`` and posts to
+#: ``{baseURL}/messages`` (its ``buildRequestUrl`` default) with ``x-api-key`` and
+#: ``anthropic-version: 2023-06-01``; with that package it also places the
+#: ``cacheControl: {type: "ephemeral"}`` markers itself. So ``baseURL`` is the proxy's
+#: ``.../v1`` and the request lands on the proxy's Messages route. 1.18.7 still reads the
+#: ``provider`` / ``npm`` / ``options`` schema written here; https://opencode.ai/docs/providers
+#: (read 2026-11-25) documents only the newer ``providers`` / ``package`` / ``settings``
+#: schema (``@opencode/ai/providers/anthropic-compatible``), so re-check on an upgrade.
+PROVIDER_PACKAGES = {"openai": "@ai-sdk/openai-compatible", "anthropic": "@ai-sdk/anthropic"}
+
+
 def build_config(endpoint: ModelEndpoint, proxy_base_url: str) -> dict[str, Any]:
-    """The per-attempt `opencode.json`: one provider pointing at the proxy, one model."""
+    """The per-attempt `opencode.json`: one provider pointing at the proxy, one model.
+
+    No ``instructions`` key (#64): our writer prompt is the only place the repo's
+    ``AGENTS.md`` / ``CLAUDE.md`` reach the model. OpenCode's own loading of those files
+    is turned off by ``server_env`` (see the note there)."""
     model_ref = f"{PROVIDER_ID}/{endpoint.model}"
     return {
         "$schema": "https://opencode.ai/config.json",
         "provider": {
             PROVIDER_ID: {
-                "npm": "@ai-sdk/openai-compatible",
+                "npm": PROVIDER_PACKAGES.get(endpoint.wire, PROVIDER_PACKAGES["openai"]),
                 "name": "foreman-inator proxy",
                 # The proxy holds the real keys (Keychain); OpenCode never sees one.
                 "options": {"baseURL": proxy_base_url.rstrip("/"), "apiKey": "fman-proxy"},
@@ -219,7 +236,18 @@ def server_env(
 ) -> dict[str, str]:
     """The `opencode serve` environment: the user's env minus credentials and minus the
     worker's own Python environment (#54: its venv on PATH, VIRTUAL_ENV and the other
-    activation variables, sandboxed or not), plus isolation."""
+    activation variables, sandboxed or not), plus isolation.
+
+    #64, instruction files: OpenCode loads ``AGENTS.md`` (else ``CLAUDE.md``, then
+    ``CONTEXT.md``) found up from the project dir, the ``AGENTS.md`` next to a file the
+    model reads, ``<config>/opencode/AGENTS.md`` and ``~/.claude/CLAUDE.md``
+    (https://opencode.ai/docs/rules, read 2026-11-25; confirmed in the 1.18.7 binary's
+    ``Instruction`` service). There is no config key that turns this off, only env vars:
+    ``OPENCODE_DISABLE_PROJECT_CONFIG=1`` skips every project and nearby file (the 1.18.7
+    code checks it before each ``findUp``), and ``OPENCODE_DISABLE_CLAUDE_CODE=1`` skips
+    every ``CLAUDE.md``. That leaves only ``<XDG_CONFIG_HOME>/opencode/AGENTS.md``, inside
+    the driver's own shared config dir, where nothing writes one. So the writer sees the
+    repo's rules once, from our prompt, and replays do not depend on OpenCode for them."""
     env = {
         k: v
         for k, v in sandbox_mod.scrub_worker_env(base).items()
@@ -234,7 +262,7 @@ def server_env(
             "XDG_CACHE_HOME": str(cache_home),
             "OPENCODE_SERVER_USERNAME": SERVER_USER,
             "OPENCODE_SERVER_PASSWORD": password,
-            "OPENCODE_DISABLE_PROJECT_CONFIG": "1",  # a repo's opencode.json can't widen perms
+            "OPENCODE_DISABLE_PROJECT_CONFIG": "1",  # no repo opencode.json, no AGENTS.md (#64)
             "OPENCODE_DISABLE_AUTOUPDATE": "1",
             "OPENCODE_DISABLE_SHARE": "1",
             "OPENCODE_DISABLE_MODELS_FETCH": "1",
