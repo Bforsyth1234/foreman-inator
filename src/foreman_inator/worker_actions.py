@@ -40,6 +40,7 @@ from foreman_inator.pr.summary import post_summary
 from foreman_inator.routing import Override
 from foreman_inator.routing import escalation as esc
 from foreman_inator.tickets import lifecycle
+from foreman_inator.tickets.decompose import FLAG_SPLIT_PROPOSED
 from foreman_inator.tickets.lifecycle import AIReviewed, ChecksPassed, HandedToUser
 from foreman_inator.worker_policy import (
     FLAG_CHECKS_FAILED,
@@ -116,6 +117,11 @@ class ActionHandlers:
         t = ctx.ticket
         if isinstance(ctx.event, lifecycle.TicketRequested) or not self.store.list_attempts(t.id):
             ctx.ticket = self._route_ticket(t, override=override)  # type: ignore[attr-defined]
+            if flag_kind(t.flag_reason) == FLAG_SPLIT_PROPOSED:
+                # #50: a tier:N label after a split proposal runs the issue as one ticket.
+                ctx.ticket = self.store.clear_flag(t.id)
+                log.info("ticket %d: %s after the split proposal; running as one", t.id,
+                         override.describe())  # fmt: skip
             return
         note = f"{override.describe()} noted after work started; escalation keeps the tier"
         reason = f"{t.route_reason}; {note}" if t.route_reason else note

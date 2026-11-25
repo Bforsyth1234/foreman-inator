@@ -117,10 +117,12 @@ The rules, counted per rung:
 - An attempt cut short by a crash or restart is rerun, at most 3 times per ticket.
 
 Every configured writer model is a rung. With the default config the ladder is
-Inkling 2 Mini, Qwen3.8 27B, GLM, Claude Opus, Claude Fable, so "tier 3 fails"
-means GLM, then Opus, then Fable, then you. The attempt bound is the number of
-rungs times 6, plus 3 interrupted reruns, plus 2 rebase attempts: 35 attempts
-on the default five-rung ladder. Nothing loops past it.
+Inkling 2 Mini, GLM, Claude Opus, Claude Fable (tier 2 is GLM, an open-weights
+cloud model; add Qwen3.8 27B as a local tier 2 to keep tier 2 on this Mac), so
+"tier 3 fails" means Opus, then Fable, then you. The attempt bound is the number
+of rungs times 6, plus 3 interrupted reruns, plus 2 rebase attempts: 29 attempts
+on the default four-rung ladder. A local-only repo (`fman repo set-cloud off`)
+stops at its last local rung. Nothing loops past it.
 
 ## AI review
 

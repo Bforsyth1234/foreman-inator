@@ -101,6 +101,7 @@ Package root below is `src/foreman_inator/` (written `pkg/`).
 | 13 | A1: GH #50, #55 · A2: GH #51 · A3: GH #57 · A4: GH #58 · A5: GH #56 · A6: todo #58 (GH #35) | A1 `pkg/worker_status.py`, `pkg/locks.py` · A2 `pkg/setup/deps.py`, `pkg/routing/knn.py`, `pkg/worker_background.py` · A3 `pkg/runner/install.py`, `pkg/worker_install.py` · A4 `pkg/spend.py`, `pkg/worker_attempt.py`, `pkg/routing/escalation.py`, `pkg/pr/summary.py`, `pkg/db/store.py`, `007_attempt_budget.sql` · A5 `pkg/prune.py`, `pkg/worker_prune.py`, `pkg/tracing/recorder.py`, `docs/setup.md`, `docs/how-it-works.md` · A6 `pkg/resources/` (+ own tests). Runner at close: config keys `attempt_budget_usd`, `attempt_max_input_tokens_cloud/_local`, `retention_days`, `install_refill_cache`; `PruneSteps` + daily prune in the poll; `fman prune`; budget in status/summary/export | [x] built |
 | 14 | B1: GH #52 · B2: todo #57 (GH #34) · B3: todo #59 (GH #36) · B4: todo #51 (GH #28) · B5: todo #46 (GH #23) · B6: todo #61, #63 (GH #38, #40) | B1 `pkg/tickets/clarify.py`, `pkg/routing/rules.py` · B2 `pkg/proxy/server.py`, `pkg/runner/opencode.py` · B3 `pkg/resources/memory.py`, `pkg/worker_attempt.py` · B4 `pkg/routing/profile.py`, `pkg/routing/escalation.py`, `pkg/review/reviewer.py`, `pkg/spend.py`, `pkg/worker_review.py`, `pkg/worker_route.py`, `pkg/worker_status.py`, `pkg/db/store.py`, `008_profiles.sql` · B5 `pkg/metrics/queries.py`, `pkg/metrics/web.py` · B6 `pkg/tickets/conventions.py`, `pkg/tickets/prompt.py`, `pkg/paths.py` (+ own tests). GH #52 (cold-load allowance for the clarity check and router) has no todo id. Runner at close: config `cold_load_timeout_seconds`, `max_local_inference`, `[rules_file]`; `OllamaWatch` on the worker; shared `LocalSlots` + driver `extra_time`; profile limits/start tier in the policy, `writer_gate`, review-off hand-over, `fman repo set-profile`, PR profile line; `conventions.gather` in the attempt | [x] built; live check open for #51 |
 | 15 | C1: todo #52, #64 (GH #29, #41) · C2: todo #62 (GH #39) · C3: todo #66 (GH #43) · C4: todo #48 (GH #25) · C5: todo #47 data (GH #24) · C6: todo #68, #58 status line (GH #45, #35) | C1 `pkg/proxy/server.py`, `pkg/proxy/pricing.py`, `pkg/runner/opencode.py`, `pkg/config.py`, `tests/fakes/anthropic.py` · C2 `pkg/review/reviewer.py`, `pkg/prompts/reviewer-v2.md` · C3 `pkg/experiments/replay_runner.py`, `pkg/worker_experiments.py` · C4 `pkg/tickets/prompt.py`, `pkg/worker_attempt.py` · C5 `pkg/metrics/quality.py`, `pkg/worker_quality.py`, `pkg/github/client.py`, `tests/fakes/github.py`, `pkg/db/store.py`, `009_post_merge.sql` · C6 `pkg/plugins.py`, `pkg/worker_status.py` (+ own tests). Runner at close: recorder cache counts; reviewer gets the repo's `rules_file`; `review_change(conventions=)` for reviewer rules replays; `fman experiment run --rules`; `QualitySteps` + daily scan in the poll; plugin CLI commands, startup lines, Ollama and plugin lines in `fman status`; SPEC Capture wording and Plugins section | [x] built; live checks open for #52, #64 |
+| 16 | D1: todo #65 (GH #42) · D2: #49 (GH #26) · D3: #47 display (GH #24) · D4: #34 split (GH #16) · D5: #35 (GH #17) · D6: #50 (GH #27) · D7: #77, #70 (GH #70, #59) · D8: #72 (GH #61) | D1 `pkg/rules_show.py`, `pkg/tickets/conventions.py` · D2 `pkg/routing/escalation.py`, `pkg/worker_review.py`, `pkg/spend.py`, `pkg/experiments/shadow.py`, `pkg/experiments/replay_sets.py`, `pkg/tracing/failure_label.py`, `pkg/db/store.py`, `010_local_only.sql` · D3 `pkg/metrics/queries.py`, `pkg/metrics/web.py`, `pkg/routing/knn.py` · D4 `pkg/experiments/split.py`, `pkg/worker_attempt.py`, `pkg/worker_experiments.py` · D5 `pkg/experiments/seeded.py`, `pkg/experiments/replay_runner.py` · D6 `pkg/tickets/decompose.py`, `pkg/prompts/split-v1.md`, `pkg/worker_route.py` · D7 `pkg/sweep.py`, `pkg/worker_queue.py`, `pkg/config.py` · D8 `pkg/review/reviewer.py` (+ own tests). Runner at close: `fman rules show`, `fman repo set-cloud`, `fman experiment split …`, `--mode seeded`, `fman sweep`; config `split_large`, `split_timeout_seconds`, `reviewer_order`; local-only limits/embedder/replay cases/status line; dormant `local_only`, `split_proposed`; reviewer pick + escalation in the review stage; Ollama "slow" status | [x] built; live check open for #77; #34 `ab:pair` open |
 | — | #33–#39 | unscheduled (SPEC milestone 5) | open |
 | — | #45–#50 | unscheduled (gap review, 2026-11-23) | open |
 | — | #53–#56 | unscheduled (first live run, 2026-11-23); #45 gained live evidence in the same run | open |
@@ -241,8 +242,8 @@ Deviations:
 ### Unscheduled (SPEC milestone 5)
 
 #33 — Webhook relay for instant reactions [ ] · Added: 2026-11-23 · Source: spec
-#34 — Traffic split and head-to-head (`ab:pair`) writer experiments [ ] · Added: 2026-11-23 · Source: spec
-#35 — Seeded-bug reviewer test cases [ ] · Added: 2026-11-23 · Source: spec
+#34 — Traffic split and head-to-head (`ab:pair`) writer experiments [~] split done 2026-11-25, wave 16, see DONE.md; `ab:pair` not built (needs data-model rework)
+#35 — Seeded-bug reviewer test cases [x] · done 2026-11-25, wave 16, see DONE.md
 #36 — Fork from failure: restart a recorded attempt at its failure step with a new prompt or model [ ] · Added: 2026-11-23 · Source: user/spec
 #37 — Classifier router, then a LoRA router only if it beats the classifier on held-out tickets [ ] · Added: 2026-11-23 · Source: spec
 #38 — Homebrew tap [ ] · Added: 2026-11-23 · Source: spec
@@ -261,20 +262,13 @@ Live evidence (2026-11-23, first live run, `Bforsyth1234/fman-playground`, ticke
 
 #46 — Metrics: attempt minutes and review count next to dollars [x] · done 2026-11-25, wave 14, see DONE.md · Added: 2026-11-23 · Source: assistant (gap review)
 
-#47 — Post-merge quality signal [~] data layer done, display in wave 16 · Added: 2026-11-23 · Source: assistant (gap review)
-Why: a merge counts as success forever. A merged change that is reverted, or fixed by a follow-up ticket a few days later, still counts as accepted for its model and still trains the router.
-Idea: detect a revert of the merge commit, and a later ticket touching the same files within N days; record it against the accepted attempt and show "accepted, then reverted" per model.
-Built (wave 15, C5): migration 009 `post_merge_signals(ticket_id, kind IN ('reverted','followup'), at, detail)`; `metrics/quality.scan` over tickets merged in the last 14 days (a revert commit naming the merge sha, or GitHub's `Revert "<title>"` with the PR number; a follow-up = a later accepted ticket with overlapping owned files within 7 days); `PullRequest.merge_commit_sha`, `GitHubAPI.list_commits`; `QualitySteps.maybe_scan_quality()` once a day in the poll loop after recover. Tests: `tests/test_post_merge_quality.py`, `tests/test_wave15_wiring.py`. Still to do (wave 16, D3): "accepted, then reverted" and follow-up counts per model on the metrics page; kNN leaves reverted tickets out.
+#47 — Post-merge quality signal [x] · done 2026-11-25, wave 16, see DONE.md
 
 #48 — Issue comments as context for the attempt [x] · done 2026-11-25, wave 15, see DONE.md · Added: 2026-11-23 · Source: assistant (gap review)
 
-#49 — Per-repo "local only" setting [ ] · Added: 2026-11-23 · Source: assistant (gap review)
-Why: config has one global model list and no per-repo settings, so any repo's code can go to a cloud tier on escalation or AI review (invariant 7c limits cloud by tier and spend, not by repo).
-Idea: `cloud = false` for a repo: escalation stops at tier 2 and flags the user, and AI review uses a local reviewer or is skipped with a note in the PR.
+#49 — Per-repo "local only" setting [x] · done 2026-11-25, wave 16, see DONE.md
 
-#50 — Split a large issue into smaller tickets [ ] · Added: 2026-11-23 · Source: assistant (gap review)
-Why: an issue classified `large` goes straight to tier 3 as one attempt. Nothing breaks it into pieces a local model could do, which is the work the v1 goal (replace Max usage with local models) most needs.
-Idea: for `large`, a tier 3 model proposes sub-issues in a comment; the user approves by labeling them; each runs as a normal ticket. No sub-issue is created without the user (same consent idea as invariant 7b).
+#50 — Split a large issue into smaller tickets [x] · done 2026-11-25, wave 16, see DONE.md
 
 ### Unscheduled (user request, 2026-11-23)
 
@@ -328,9 +322,7 @@ Asked by the user: "what about agent md files? do we need to tell the agents to 
 
 #64 — Check whether OpenCode loads AGENTS.md on its own [~] live · done 2026-11-25, wave 15, see DONE.md · Added: 2026-11-23 · Source: assistant (gap review)
 
-#65 — `fman rules show`: preview the rules an agent will get [ ] · Added: 2026-11-23 · Source: user (asked how to test rules)
-Why: there is no way to see what a rules file turns into before a real ticket runs: which files were found, which order, and whether the budget clipped them.
-Idea: `fman rules show <repo>` prints the assembled conventions block for the writer and the reviewer exactly as the prompt builder renders it, with each source file, its character count and a clear "CLIPPED at N chars" line. No model call. Estimate: about 30 minutes. Depends on #61–#63.
+#65 — `fman rules show`: preview the rules an agent will get [x] · done 2026-11-25, wave 16, see DONE.md
 
 #66 — Replay a rules change before it goes live [x] · done 2026-11-25, wave 15, see DONE.md · Added: 2026-11-23 · Source: user (asked how to test rules)
 
@@ -368,14 +360,7 @@ Estimate: about half a day with tests, assuming `run_command` and the replay pat
 
 Asked by the user: "do local llms make sense in this app or should the first tier be open source cloud llms then more expensive ones like claude etc", then "yes, add it". Today `config.py:208-217` gives tier 1 `inkling-2-mini` (local), tier 2 `qwen3.8-27b` (local), tier 3 `glm-5.3` then Claude.
 
-#70 — Tier 2 default becomes open-weights cloud (GLM); local 27B becomes optional [ ] · Added: 2026-11-25 · Source: user
-Goal (user, 2026-11-25): "the main goal of this app is to cancel my max plan at 100 a month." So the test is total monthly cost (cloud spend, with the $50 default `spend_caps.monthly_usd` well under $100) at an acceptable merge rate, not the share of tickets that run locally.
-Why: a 27B model on a Mac is slow on agent loops, which resend long prompts every turn (the writer timeout had to become configurable). Local runs also compete for memory (#57–#59), and those slowdowns get recorded as model failures. An open-weights cloud attempt costs a few cents, so a failed 15-minute local attempt that escalates anyway costs more in time than the cloud call costs in money. Tier 1 stays local: small mechanical changes are where small local models pass, and it keeps the v1 goal (replace Max usage with local models) and "local by default" for the easy work.
-Idea: default ladder becomes tier 1 `inkling-2-mini` (local), tier 2 `glm-5.3` (cloud), tier 3 Claude Opus then Fable. `qwen3.8-27b` stays in the code as an opt-in local tier 2 for users who want it (documented in docs/setup.md). Check that reviewer independence still holds: a GLM tier 2 writer must get `claude-opus` as reviewer, which `reviewer_models` order already gives. #49 (`cloud = false`) must still work: with no local tier 2, a local-only repo stops at tier 1 and flags the user, or uses the opt-in qwen tier if configured.
-Decide with data first: before changing the default, run tier 1 local and GLM on the same mix of tickets for about a week and compare accept rate and attempt minutes per accepted PR (needs #46). If qwen 27B matches GLM's accept rate within a reasonable time, keep it.
-Verify: default config lists tiers 1/2/3 as local/cloud/cloud; an existing config.toml with qwen at tier 2 loads unchanged; escalation from tier 1 goes to GLM; a GLM writer gets a non-GLM reviewer; a `cloud = false` repo never calls a cloud endpoint (once #49 lands). Non-vacuous: put GLM in both writer and reviewer slots and the independence test fails.
-SPEC change needed: the tier table in SPEC.md and README.md (tier 2 "Local, Ollama" → "Cloud, pay per use"), and the spend-cap note, since tier 2 now spends money.
-Estimate: about 30 minutes for config and docs, about 2 hours with tests. Related: #46, #49, #57.
+#70 — Tier 2 default becomes open-weights cloud (GLM); local 27B becomes optional [x] · done 2026-11-25, wave 16, see DONE.md
 
 #71 — Chat feature: interactive coding sessions through the same tiers and spend caps [ ] · Added: 2026-11-25 · Source: user
 Ask: after "the main goal of this app is to cancel my max plan at 100 a month", the user said Max also covers interactive Claude Code sessions, then: "yeah ill have to add a chat feature later".
@@ -383,14 +368,7 @@ Why: the worker handles only labeled issues. Interactive coding work also runs o
 Idea (not designed yet): a chat entry point (`fman chat` or similar) that drives OpenCode in a worktree, using the same model ladder, proxy and spend caps as tickets. It starts on a cheap tier, a command moves it up, and its spend shows next to ticket spend in metrics. Decide later: its own spend cap vs. a share of `monthly_usd`, and whether chat sessions feed the router's data.
 Estimate: not estimated; needs a design pass first. Related: #70.
 
-#72 — Cheapest-first cross-family reviewer [ ] · Added: 2026-11-25 · Source: user
-Ask: "having different families of models reviewing code should help raise the quality of the code", then "yes, add it" to cheapest-first reviewer picking.
-Why: the family rule (invariant 7f, `review/reviewer.py:322`) already makes the reviewer independent. But `pick_reviewer` → `config.reviewer_for` takes the first entry of `reviewer_models` from a different family, and the default order is `("claude-opus", "glm")`. So every Inkling, Qwen or GLM writer gets Claude Opus as its reviewer, at Opus prices on even the smallest ticket. Against the goal in #70 (cancel the $100/month Max plan), review is likely the largest cloud cost.
-Idea: pick the cheapest reviewer from a different family, with Opus last. Local/Qwen writer → GLM; GLM writer → a cheap cloud model of a third family (DeepSeek or Kimi; needs a new endpoint and Keychain key); Claude writer → GLM. Opus reviews only tier 3 work, or when the cheap reviewer's verdict is low confidence (a second review, at most one per attempt). Keep `reviewer_models` as an override for users who want a fixed order.
-Measure first: run the cheap reviewer as a shadow reviewer (`experiments/shadow.py`) next to Opus on live tickets, and compare catch rate and false kickbacks before changing the default.
-Verify: a local writer gets GLM; a GLM writer gets the third-family model, never GLM; with only Opus and GLM configured, behaviour matches today; a low-confidence cheap verdict triggers exactly one Opus review; review cost per ticket shows in metrics. Non-vacuous: drop the family check and the GLM-writer test picks GLM and fails.
-SPEC change needed: reviewer selection paragraph (cost order, family rule unchanged, the one-escalation limit).
-Estimate: about half a day with tests, plus a week of shadow data before switching the default. Related: #70, #46.
+#72 — Cheapest-first cross-family reviewer [x] · done 2026-11-25, wave 16, see DONE.md
 
 ### Unscheduled (web UI, 2026-11-25)
 
@@ -425,34 +403,7 @@ Estimate: about half a day with tests (read-only). Related: #58, #59, #60.
 
 Asked by the user: "can we add a feature to take every issue in github and use agent waves to complete them", then chose "Build `fman sweep` with dynamic waves and a cap on open PRs".
 
-#77 — `fman sweep`: start every open issue, dynamic waves, cap on open PRs [ ] · Added: 2026-11-25 · Source: user
-Why: today work starts only when you label an issue by hand, one at a time. The worker already runs tickets in parallel with file locks (`locks.py`: predicted files, all-or-nothing acquire, wait instead of fail), so "waves" mostly exist; what is missing is a bulk start and a way to keep the PR pile reviewable.
-DECISIONS (user, 2026-11-25):
-1. Dynamic waves: a ticket starts as soon as its files are free (existing lock gate + `max_parallel_per_repo`). No strict wave barrier waiting on merges, since the worker never merges (invariant 7a).
-2. A cap on open PRs per repo, so a sweep of 40 issues does not land 40 PRs on the user at once.
-DECISIONS (assistant, 2026-11-25):
-3. The label is applied with the user's own GitHub credentials (`gh` CLI token), not the App's. The poller counts a label only when an `allowed_users` user applied it (`github/poller.py:340`, invariant 7b), so a bot-applied label would start nothing, and that rule stays.
-4. Preview first, then one confirmation (`--yes` skips it). Nothing is labeled on a dry run (`--dry-run`).
-Files:
-⚬ OWNED: src/foreman_inator/sweep.py (new), tests/test_sweep.py (new), tests/test_open_pr_cap.py (new)
-⚬ EDITED: src/foreman_inator/config.py (`max_open_prs_per_repo`, default 5, 0 = no cap, validated like `max_parallel_per_repo`), src/foreman_inator/worker_queue.py (the gate), docs/setup.md (usage)
-⚬ Runner registers: `sweep` command in cli.py. No new dependencies.
-Approach:
-⚬ Select: open issues (not PRs) in `owner/repo` that have no `agent` label, no open ticket, and no `fman/` PR already. Filters: `--label`, `--exclude-label`, `--limit N`, `--author`. Skip issues whose author is not on `allowed_users` unless `--include-any-author` (shown in the preview).
-⚬ Preview: per issue, its predicted files (`locks.predict_files`), the tier the router would pick, and the wave it falls into: greedy grouping so no file appears in two issues of one wave (same rule as todo.md rule 3); issues that predict no files go in a separate "unknown files" group, since they may collide later (see `locks.py`, "No prediction"). Totals: issue count, waves, estimated cloud spend against the remaining `spend_caps` (cloud-tier issues × average cost from metrics, or "unknown" with no history).
-⚬ Apply: label each issue `agent` via `gh issue edit --add-label`, paced to stay under rate limits, printing progress; stop on the first auth error. Re-running is safe (already-labeled issues are skipped).
-⚬ Open-PR cap: in `job_for`, the `publish` step (opening a draft PR) waits while the repo has `max_open_prs_per_repo` open `fman/` PRs that are not merged or closed. Attempts may still run and finish; only opening new PRs waits. Waiting is not a failure: no attempt counted, nothing flagged (same as the lock gate). `fman status` shows "waiting: open-PR cap (5/5)".
-⚬ Fallback: if `gh` is missing or not logged in, print the exact `gh auth login` step and stop; never fall back to the App token.
-Verify:
-⚬ With a fake GitHub of 10 issues (2 labeled, 1 PR, 1 from a non-allowed author): the preview lists 6, waves have no shared file, `--dry-run` labels nothing.
-⚬ Apply labels through a fake `gh`; a re-run labels nothing new.
-⚬ With the cap at 2 and 2 open `fman/` PRs, a passed attempt's publish waits and a third PR is not opened; after one PR merges it publishes. Cap 0 means no limit.
-⚬ The poller still ignores a label applied by the bot (existing test stays green).
-⚬ Non-vacuous: remove the cap check from `job_for` and the "third PR is not opened" test fails; drop the shared-file check from wave grouping and the "no shared file" test fails.
-⚬ pytest + ruff gate (rule 8).
-Live (user): run `fman sweep owner/test-repo --dry-run` on the private test repo, check the preview, then run it for real with `--limit 3` and watch the PR count stay under the cap.
-Estimate: about 2 to 3 hours of agent work with tests. Related: #19 (file locks), #21 (queue), #76 (activity page would show sweep progress).
-Deviations:
+#77 — `fman sweep`: start every open issue, dynamic waves, cap on open PRs [~] live · done 2026-11-25, wave 16, see DONE.md
 
 ### Unscheduled (images in issues, 2026-11-25)
 
@@ -482,7 +433,7 @@ Estimate: about half a day with tests, after #76. Related: #67, #73, #76.
 
 ### Unscheduled (second live run, bot-inator, 2026-11-25)
 
-#80 — The sandbox shows `~/.env` exists but refuses to read it, so `load_dotenv()` crashes verify [ ] · Added: 2026-11-25 · Source: user (bot-inator ticket 10, attempt 33 trace)
+#80 — The sandbox shows `~/.env` exists but refuses to read it, so `load_dotenv()` crashes verify [~] live · fixed 2026-11-25, wave 16 · Added: 2026-11-25 · Source: user (bot-inator ticket 10, attempt 33 trace)
 Why: python-dotenv's `load_dotenv()` with no path walks up from the worktree (`~/.foreman-inator/worktrees/...`) to `/Users/<user>/` looking for `.env`. The sandbox profile allows `file-read-metadata` on `/` (`runner/sandbox.py`, ~line 767) but denies the contents of sensitive files, so `~/.env` passes `os.path.isfile` and then `open()` raises `PermissionError`. On bot-inator, `smolagents/remote_executors.py:48` calls it at import time, which crashed collection of all 136 test files: verify failed for every attempt whatever the change, and the writer spent its turns working around it. Any repo whose dependencies call `load_dotenv()` at import (FastAPI, Django and most agent frameworks) hits the same wall.
 DECISIONS (assistant, 2026-11-25): Make the files invisible, not readable. Deny `file-read*` including metadata for `.env`-style files (`.env`, `.env.local`, `.env.*`) in every ancestor directory of the worktree that is outside the worktree, so code in the sandbox sees "no such file" and moves on. The worktree's own `.env` files stay readable. Nothing that was unreadable becomes readable (invariant 7d: secrets never reach the attempt).
 Files: ⚬ EDITED: src/foreman_inator/runner/sandbox.py (profile rules), tests (new, macOS-only like the other sandbox tests).

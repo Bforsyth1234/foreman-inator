@@ -3,7 +3,9 @@
 Commands: ``setup`` (#8), ``config set-key`` (#2), ``run`` and ``status`` and
 ``repo set-verify`` (#14), ``metrics`` and ``approve-spend`` (#21), ``experiment run |
 status | promote`` and ``replay`` (#29), ``repo add | remove | list`` (#56), ``prune``
-(#56), ``repo set-profile`` (#51). Later waves
+(#56), ``repo set-profile`` (#51), ``rules show`` (#42), ``repo set-cloud`` (#49),
+``experiment split start | stop | status`` (#34), ``experiment run --mode seeded``
+(#35), ``sweep`` (#77). Later waves
 add ``@app.command()`` functions here.
 
 The callback below keeps `app` a multi-command group, so adding commands
@@ -330,6 +332,34 @@ def repo_set_install(
     typer.echo(f"Saved. {repo}'s worktrees are prepared with: {command}")
 
 
+@repo_app.command("set-cloud")
+def repo_set_cloud(
+    repo: Annotated[str, typer.Argument(help="owner/name")],
+    setting: Annotated[str, typer.Argument(help="on (default) | off: off is local only")],
+) -> None:
+    """Allow (on) or forbid (off) cloud models for REPO: off keeps its code on this Mac
+    (local writers and reviewers only; experiments leave it out of cloud runs)."""
+    import re
+
+    from foreman_inator import paths
+    from foreman_inator.db.store import Store
+
+    if not re.match(r"^[\w.-]+/[\w.-]+$", repo):
+        raise typer.BadParameter("repo must look like owner/name")
+    value = setting.strip().lower()
+    if value not in ("on", "off"):
+        raise typer.BadParameter("give on or off")
+    with Store(paths.db_path()) as store:
+        store.set_cloud(repo, value == "on")
+    if value == "on":
+        typer.echo(f"Saved. {repo} may use cloud models (within the spend caps).")
+    else:
+        typer.echo(
+            f"Saved. {repo} is local only: its code never goes to a cloud model; a ticket"
+            " that runs out of local rungs is handed to you (flag local_only)."
+        )
+
+
 experiment_app = typer.Typer(
     help="Champion vs challenger: replays (overnight), shadow reviews, promotion."
 )
@@ -366,6 +396,26 @@ def experiment_run(
             show_default=False,
         ),
     ] = None,
+    mode: Annotated[
+        str,
+        typer.Option(
+            "--mode",
+            help="replay, or seeded: reviewers only, merged cases with a planted bug (catch rate).",
+        ),
+    ] = "replay",
+    seed: Annotated[
+        int | None,
+        typer.Option("--seed", help="--mode seeded: the mutation seed.", show_default=False),
+    ] = None,
+    kinds: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--kinds",
+            help="--mode seeded: mutation kinds (repeatable): drop_if_guard,"
+            " neutralise_check, flip_comparison.",
+            show_default=False,
+        ),
+    ] = None,
 ) -> None:
     """Replay the champion against a challenger on past tickets (resumable; Ctrl-C stops).
 
@@ -376,7 +426,14 @@ def experiment_run(
 
     try:
         code = run_command(
-            role=role, challenger=challenger, all_=all_, echo=typer.echo, rules=rules
+            role=role,
+            challenger=challenger,
+            all_=all_,
+            echo=typer.echo,
+            rules=rules,
+            mode=mode,
+            seed=seed,
+            kinds=kinds or None,
         )
     except ExperimentError as exc:
         _fail(exc)
@@ -419,14 +476,16 @@ def experiment_promote(
         bool,
         typer.Option(
             "--replay-only",
-            help="Writers only: promote on the replay alone (no live writer check exists yet).",
+            help="Writers only: promote on the replay alone, without a live check (a"
+            " running `fman experiment split` is the live check otherwise).",
         ),
     ] = False,
 ) -> None:
     """Make a challenger champion if it won on replay and holds live.
 
     SPEC's promotion rule. A challenger that loses either is ended as rejected; a writer
-    can only be promoted on its replay with --replay-only. Exit 0 only when promoted."""
+    holds live through its traffic split (`fman experiment split`), or is promoted on its
+    replay alone with --replay-only. Exit 0 only when promoted."""
     from foreman_inator import config as config_mod
     from foreman_inator import paths
     from foreman_inator.db.store import NotFoundError, Store
@@ -442,6 +501,193 @@ def experiment_promote(
             _fail(exc)
     typer.echo(f"{res.outcome.upper()}: {res.message}")
     raise typer.Exit(0 if res.outcome == "promoted" else 1)
+
+
+split_app = typer.Typer(
+    help="Live traffic split: a share of first attempts to a writer challenger."
+)
+experiment_app.add_typer(split_app, name="split")
+
+
+@split_app.command("start")
+def experiment_split_start(
+    challenger: Annotated[str, typer.Argument(help="Writer variant that won its replay.")],
+    share: Annotated[
+        float, typer.Option("--share", help="Share of first attempts it writes.")
+    ] = 0.15,
+) -> None:
+    """Send a stable share of new tickets' first attempts to CHALLENGER (the champion
+    writes the rest); `fman experiment promote` then judges it live."""
+    from foreman_inator import config as config_mod
+    from foreman_inator import paths
+    from foreman_inator.db.store import NotFoundError, Store
+    from foreman_inator.worker_experiments import ExperimentError, start_split
+
+    db = paths.db_path()
+    if not db.exists():
+        _fail(FileNotFoundError("no database yet: run the worker first"))
+    with Store(db) as store:
+        try:
+            exp = start_split(store, config_mod.load(), challenger, share=share)
+        except (ExperimentError, NotFoundError) as exc:
+            _fail(exc)
+    typer.echo(
+        f"Split #{exp.id} running: {exp.challenger_variant} vs {exp.champion_variant}."
+        " `fman experiment split status` shows it."
+    )
+
+
+@split_app.command("stop")
+def experiment_split_stop(
+    experiment: Annotated[int, typer.Argument(help="The split's experiment id.")],
+) -> None:
+    """End a running split (rejected); its attempts are kept."""
+    from foreman_inator import paths
+    from foreman_inator.db.store import NotFoundError, Store
+    from foreman_inator.worker_experiments import ExperimentError, stop_split
+
+    db = paths.db_path()
+    if not db.exists():
+        _fail(FileNotFoundError("no database yet: run the worker first"))
+    with Store(db) as store:
+        try:
+            exp = stop_split(store, experiment)
+        except (ExperimentError, NotFoundError) as exc:
+            _fail(exc)
+    typer.echo(f"Split #{exp.id} stopped.")
+
+
+@split_app.command("status")
+def experiment_split_status(
+    experiment: Annotated[
+        int | None, typer.Argument(help="Split id (default: running ones).", show_default=False)
+    ] = None,
+) -> None:
+    """The running split(s): share, live accept rate and cost per accepted ticket."""
+    from foreman_inator import config as config_mod
+    from foreman_inator import paths
+    from foreman_inator.db.store import NotFoundError, Store
+    from foreman_inator.worker_experiments import ExperimentError, split_lines
+
+    db = paths.db_path()
+    if not db.exists():
+        typer.echo("No experiments yet (the worker has not created its database).")
+        return
+    try:
+        cfg = config_mod.load()
+    except config_mod.ConfigError as exc:
+        typer.echo(f"(config.toml not readable, using defaults: {exc})", err=True)
+        cfg = config_mod.Config()
+    with Store(db, read_only=True) as store:
+        try:
+            lines = split_lines(store, cfg, experiment)
+        except (ExperimentError, NotFoundError) as exc:
+            _fail(exc)
+    typer.echo("\n".join(lines))
+
+
+rules_app = typer.Typer(help="The rules (AGENTS.md, CLAUDE.md, rules_file) the models get.")
+app.add_typer(rules_app, name="rules")
+
+
+@rules_app.command("show")
+def rules_show_command(
+    repo: Annotated[str, typer.Argument(help="owner/name")],
+    ref: Annotated[
+        str | None,
+        typer.Option(
+            "--ref", help="Commit or branch (default: the base branch).", show_default=False
+        ),
+    ] = None,
+    files: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--file", help="An owned file, for nested rules (repeatable).", show_default=False
+        ),
+    ] = None,
+) -> None:
+    """Print the writer's and the reviewer's rules blocks for REPO exactly as built, with
+    each source's size and any clipping. No model call."""
+    from foreman_inator import config as config_mod
+    from foreman_inator import paths, rules_show
+    from foreman_inator.db.store import Store
+
+    try:
+        cfg = config_mod.load()
+    except config_mod.ConfigError:
+        cfg = config_mod.Config()
+    db = paths.db_path()
+    store = Store(db, read_only=True) if db.exists() else None
+    try:
+        code = rules_show.run(
+            repo, config=cfg, store=store, echo=typer.echo, ref=ref, owned_files=files or ()
+        )
+    finally:
+        if store is not None:
+            store.close()
+    raise typer.Exit(code)
+
+
+@app.command("sweep")
+def sweep_command(
+    repo: Annotated[str, typer.Argument(help="owner/name")],
+    label: Annotated[
+        str | None, typer.Option("--label", help="Only issues with this label.", show_default=False)
+    ] = None,
+    exclude_label: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--exclude-label", help="Skip issues with this label (repeatable).", show_default=False
+        ),
+    ] = None,
+    author: Annotated[
+        str | None, typer.Option("--author", help="Only issues by this user.", show_default=False)
+    ] = None,
+    limit: Annotated[
+        int | None, typer.Option("--limit", help="At most this many issues.", show_default=False)
+    ] = None,
+    include_any_author: Annotated[
+        bool,
+        typer.Option("--include-any-author", help="Also issues by users not on allowed_users."),
+    ] = False,
+    dry_run: Annotated[
+        bool, typer.Option("--dry-run", help="Show the plan; label nothing.")
+    ] = False,
+    yes: Annotated[bool, typer.Option("--yes", help="Label without asking.")] = False,
+) -> None:
+    """Label REPO's open issues for the worker in waves (as you, with the GitHub CLI):
+    a preview with tiers, file overlaps and spend first, then the labels."""
+    from foreman_inator import config as config_mod
+    from foreman_inator import paths, sweep
+    from foreman_inator.db.store import Store
+
+    if limit is not None and limit < 1:
+        raise typer.BadParameter("--limit must be at least 1")
+    cfg = config_mod.load()
+    filters = sweep.Filters(
+        label=label,
+        exclude_label=tuple(exclude_label or ()),
+        author=author,
+        limit=limit,
+        include_any_author=include_any_author,
+    )
+    db = paths.db_path()
+    store = Store(db, read_only=True) if db.exists() else None
+    try:
+        code = sweep.run(
+            repo,
+            config=cfg,
+            store=store,
+            filters=filters,
+            dry_run=dry_run,
+            yes=yes,
+            echo=typer.echo,
+            router=sweep.classifier_router(cfg, repo),
+        )
+    finally:
+        if store is not None:
+            store.close()
+    raise typer.Exit(code)
 
 
 @app.command("replay")

@@ -26,12 +26,13 @@ from foreman_inator.experiments import variants
 from foreman_inator.locks import Locks
 from foreman_inator.plugins import PluginSet
 from foreman_inator.plugins import status_lines as plugin_status_lines
-from foreman_inator.resources.ollama import Unreachable, loaded_models
+from foreman_inator.resources.ollama import STATUS_TIMEOUT_SECONDS, Unreachable, loaded_models
 from foreman_inator.routing import profile as prof
 from foreman_inator.runner import sandbox
 from foreman_inator.spend import FLAG_SPEND_CAP, Spend
 from foreman_inator.tickets.lifecycle import clarify_cursor
 from foreman_inator.worker_policy import FLAG_NO_VERIFY
+from foreman_inator.worker_queue import open_pr_wait_text
 
 _TITLES = {
     "todo": "TODO",
@@ -65,6 +66,7 @@ def _line(
     waits: dict[int, tuple[int, ...]] | None = None,
     store: Store | None = None,
     budget_usd: float | None = None,
+    open_pr_cap: int | None = None,
 ) -> str:
     title = " ".join(t.title.split())
     if len(title) > TITLE_WIDTH:
@@ -89,7 +91,7 @@ def _line(
         held = ", ".join(f"#{b}" for b in blockers)
         line += f"\n         WAITING: on files held by ticket(s) {held}"
         line += _release_hint(blockers, store)
-    for why in _waits(t, attempts, store):
+    for why in _waits(t, attempts, store, open_pr_cap):
         line += f"\n         WAITING: {why}"
     return line
 
@@ -106,8 +108,11 @@ def _release_hint(blockers: Sequence[int], store: Store | None) -> str:
     return f" ({'; '.join(hints)})" if hints else ""
 
 
-def _waits(t: Ticket, attempts: Sequence[Attempt], store: Store | None) -> list[str]:
-    """#44's needs-info wait and #41's CI wait, from the store alone."""
+def _waits(
+    t: Ticket, attempts: Sequence[Attempt], store: Store | None, open_pr_cap: int | None = None
+) -> list[str]:
+    """#44's needs-info wait, #41's CI wait and (with ``open_pr_cap``, the config's
+    ``max_open_prs_per_repo``) #77's open-PR cap wait, from the store alone."""
     if store is None or t.flag_reason:
         return []
     if t.column == "todo" and store.get_cursor(t.repo, clarify_cursor(t.id)) == "asked":
@@ -122,6 +127,10 @@ def _waits(t: Ticket, attempts: Sequence[Attempt], store: Store | None) -> list[
         and not store.list_reviews(attempt_id=last.id, shadow=False)
     ):
         return ["GitHub CI on the PR head"]
+    if open_pr_cap is not None:
+        held = open_pr_wait_text(store, t, open_pr_cap)
+        if held is not None:
+            return [held]
     return []
 
 
@@ -146,6 +155,7 @@ def render_status(
         for w in locks.waiting(repo)
     }
     budget = config.attempt_budget_usd if config is not None else None
+    cap = int(config.max_open_prs_per_repo) if config is not None else None
     by_col: dict[str, list[Ticket]] = {c: [] for c in COLUMNS}
     for t in tickets:
         by_col[t.column].append(t)
@@ -159,7 +169,7 @@ def render_status(
         if len(shown) < len(items):
             header += f", latest {len(shown)}"
         out.append(header)
-        out.extend(_line(t, store.list_attempts(t.id), waits, store, budget) for t in shown)
+        out.extend(_line(t, store.list_attempts(t.id), waits, store, budget, cap) for t in shown)
         if not items:
             out.append("  (none)")
         out.append("")
@@ -177,12 +187,13 @@ def render_status(
         and (
             t.id in waits
             or (t.flag_reason or "").startswith(FLAG_SPEND_CAP)
-            or _waits(t, store.list_attempts(t.id), store)
+            or _waits(t, store.list_attempts(t.id), store, cap)
         )
     )
     out.append(f"{len(tickets)} ticket(s), {flagged} flagged for you, {waiting} waiting.")
     out.extend(_champion_lines(store))
     out.extend(profile_lines(store, sorted({t.repo for t in tickets})))
+    out.extend(local_only_lines(store))
     if config is not None:
         out.append(repos_line(config))
         out.append(Spend(store, config).summary().status_line())
@@ -207,11 +218,12 @@ def local_ollama_host(config: Config) -> str | None:
 
 
 def ollama_line(host: str, *, transport: httpx.BaseTransport | None = None) -> str:
-    """#35: ``Ollama: 2 loaded (21.3 GB): a, b`` or ``Ollama: unreachable (reason)``.
-    Unreachable is never shown as zero models."""
-    got = loaded_models(host, transport=transport)
+    """#35: ``Ollama: 2 loaded (21.3 GB): a, b``, ``Ollama: slow (no reply ... in 5s)``
+    (it took the connection but did not answer in time: busy, not down) or ``Ollama:
+    unreachable (reason)``. Neither is ever shown as zero models."""
+    got = loaded_models(host, transport=transport, timeout=STATUS_TIMEOUT_SECONDS)
     if isinstance(got, Unreachable):
-        return f"Ollama: unreachable ({got.reason})"
+        return f"Ollama: {'slow' if got.slow else 'unreachable'} ({got.reason})"
     gb = sum(m.size for m in got) / 1e9
     line = f"Ollama: {len(got)} loaded ({gb:.1f} GB)"
     if got:
@@ -265,6 +277,17 @@ def profile_lines(store: Store, repos: Sequence[str]) -> list[str]:
     return lines
 
 
+def local_only_lines(store: Store) -> list[str]:
+    """#49: ``Local only (cloud = false): me/secret, me/other`` when any repo is."""
+    try:
+        repos = sorted(store.local_only_repos())
+    except Exception:  # a database from before migration 010
+        return []
+    if not repos:
+        return []
+    return [f"Local only (cloud = false, `fman repo set-cloud`): {', '.join(repos)}"]
+
+
 def set_profile(
     store: Store,
     repo: str,
@@ -298,6 +321,7 @@ def set_verify_command(store: Store, repo: str, command: str | None) -> list[int
 
 __all__ = [
     "local_ollama_host",
+    "local_only_lines",
     "ollama_line",
     "profile_lines",
     "render_status",

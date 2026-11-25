@@ -2,7 +2,8 @@
 
 ``PublishSteps`` is mixed into ``Worker``. ``publish_job_for``: force-push the attempt's
 branch to the PR head (``pr_head_branch``; a ``rebase`` attempt (#43) lands there the same
-way), open or update the draft PR, move to ``testing``, then the next gate in the same
+way), open or update the draft PR (a new PR under the repo's open-PR lock, #77, with the
+cap checked again inside it), move to ``testing``, then the next gate in the same
 job: the CI gate (#41) and the AI review, or the ``review:skip`` hand-over, which waits
 at the same CI gate. Re-running it after a crash is harmless: the push is the same commit
 and the publisher adopts the open PR.
@@ -61,6 +62,8 @@ class PublishSteps:
             return
         if cancel is not None and cancel.is_set():
             return
+        if not self.open_pr_gate(ticket):  # type: ignore[attr-defined]
+            return  # #77: at the open-PR cap; the queue's publish job retries it later
         mirror = self._mirror(ticket.repo)  # type: ignore[attr-defined]
         ordinal = [a.id for a in self.store.list_attempts(ticket.id)].index(att.id) + 1
         try:
@@ -80,7 +83,17 @@ class PublishSteps:
         ctx = Ctx(ticket, event, attempt=att, verify=verify, diff=diff or wt.diff_stats())
         ctx.cancel = cancel
         try:
-            self._run_actions(ctx, plan.actions[:1])  # type: ignore[attr-defined]
+            if ticket.pr_number is None:
+                # #77: the gate above is a cheap early out; this check and the PR's
+                # creation are atomic per repo, so concurrent publishes at cap - 1 open
+                # one PR, not two (the other waits; its publish job retries it later).
+                with self.pr_open_lock(ticket.repo):  # type: ignore[attr-defined]
+                    ctx.ticket = ticket = self.store.get_ticket(ticket.id)
+                    if not self.open_pr_gate(ticket):  # type: ignore[attr-defined]
+                        return
+                    self._run_actions(ctx, plan.actions[:1])  # type: ignore[attr-defined]
+            else:
+                self._run_actions(ctx, plan.actions[:1])  # type: ignore[attr-defined]
         except PublishError as exc:
             self._event(  # type: ignore[attr-defined]
                 ticket.id, lifecycle.HandedToUser(ticket.id, f"{FLAG_PUBLISH_FAILED}: {exc}")

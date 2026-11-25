@@ -39,6 +39,15 @@ model, so no variant is registered and no champion outcome is kept for shadows.
 ``strict`` ignores the ``review:skip`` label (its one-kickback escalation is
 ``profile.limits_for``'s, applied by the policy). ``normal`` is today's stage.
 
+Local only (#49). For a repo set ``cloud = false`` (``Store.repo_allows_cloud``) the full
+review's reviewer must be local: ``champion_reviewer(writer, local_only=True)`` keeps the
+champion's model only when it is local, else picks ``local_reviewer``: the first local
+model of another family than the writer, from ``reviewer_models`` first, then the other
+configured models. None exists → the review is skipped and the ticket handed over like
+``review:skip`` (flag ``review_skipped``, ``local_only_skip_reason``): the PR body's
+hand-over section and the issue comment say why, and the PR is marked ready when its
+checks passed. A ``light`` review calls no model, so it runs unchanged.
+
 Hand-over (``hand_over``), always in this order: the PR body's hand-over section, the
 issue comment saying why (once, by marker), marking the PR ready when the change passed
 its checks, and last the ticket's flag. The flag is the "done" mark: a crash before it
@@ -163,11 +172,20 @@ class ReviewSteps:
             return
         writer = self._endpoint_named(att)
         light = plan.kind == "light"
+        order = "configured"  # #72: no second (possibly cloud) opinion on a light review
         if light:  # #51: no model reads the diff, so no reviewer is picked (7f not in play)
             reviewer, prompt_name = writer, rv.REVIEWER_PROMPT_NAME
         else:
+            local_only = not self.store.repo_allows_cloud(t.repo)
+            if local_only and local_reviewer(self.config, writer) is None:
+                # #49: no local reviewer of another family; the code stays on the Mac.
+                reason = local_only_skip_reason(writer)
+                self.hand_over(t, reason, ready=True, attempt=att)
+                return
+            if not local_only:  # #49: a local-only repo never escalates to a cloud reviewer
+                order = self._reviewer_order()
             try:
-                reviewer, prompt_name = self.champion_reviewer(writer)
+                reviewer, prompt_name = self.champion_reviewer(writer, local_only=local_only)
             except rv.ReviewError as exc:
                 self.hand_over(t, f"{FLAG_NO_REVIEWER}: {exc}", ready=True, attempt=att)
                 return
@@ -182,7 +200,10 @@ class ReviewSteps:
             rv.LIGHT_REVIEWER_MODEL if light else reviewer.name,
         )
         with self._trace(t):  # type: ignore[attr-defined]
-            outcome = self._launch_review(
+            outcome = rv.review_with_escalation(
+                self._launch_review,
+                config=self.config,
+                order=order,
                 issue=rv.IssueText(t.issue_number, t.title, t.request),
                 change=rv.ChangeRef(mirror, att.base_commit or "", head),
                 writer=writer,
@@ -198,7 +219,7 @@ class ReviewSteps:
                 cancel=cancel,
                 depth=plan.depth,
                 rules_file=self._rules_file(t.repo),  # #39: same rules file the writer gets
-            )
+            ).outcome
         if (cancel is not None and cancel.is_set()) or self.stopping:  # type: ignore[attr-defined]
             log.info("ticket %d: AI review cut short; it runs again", t.id)
             return
@@ -265,11 +286,13 @@ class ReviewSteps:
             self._run_actions(ctx, plan.actions)  # type: ignore[attr-defined]
         self._finalized.add(review.id)
 
-    def champion_reviewer(self, writer: Any) -> tuple[Any, str]:
+    def champion_reviewer(self, writer: Any, *, local_only: bool = False) -> tuple[Any, str]:
         """#24: the reviewer champion's model, when it is of another family than the
         writer (7f), else ``pick_reviewer``'s choice; with the champion's prompt (the
         packaged default when there is no champion or its file is gone). Raises
-        ``ReviewError`` when no independent reviewer exists."""
+        ``ReviewError`` when no independent reviewer exists. ``local_only`` (#49): the
+        champion's model counts only when it is local, and the fallback is
+        ``local_reviewer``, never a cloud model."""
         champ = variants.champion(self.store, "reviewer")
         prompt_name = rv.REVIEWER_PROMPT_NAME
         reviewer = None
@@ -280,13 +303,25 @@ class ReviewSteps:
             except (FileNotFoundError, ValueError):
                 log.warning("reviewer champion's prompt %s is missing; using the default",
                             champ.prompt_name)  # fmt: skip
+        if not local_only and self._reviewer_order() == "cheapest":
+            # #72: the cheapest model of another family reads the diff (champion's prompt).
+            return rv.pick_reviewer(self.config, writer, order="cheapest"), prompt_name
+        if champ is not None:
             try:
                 candidate = self.config.model(champ.model)
                 rv.check_independent(candidate, writer)
-                reviewer = candidate
+                if not (local_only and candidate.kind != "local"):
+                    reviewer = candidate
             except (ConfigError, rv.FamilyConflict):
                 reviewer = None
+        if reviewer is None and local_only:
+            reviewer = local_reviewer(self.config, writer)
+            if reviewer is None:
+                raise rv.NoIndependentReviewer(local_only_skip_reason(writer))
         return reviewer or rv.pick_reviewer(self.config, writer), prompt_name
+
+    def _reviewer_order(self) -> str:
+        return str(getattr(self.config, "reviewer_order", rv.DEFAULT_REVIEWER_ORDER))
 
     # ------------------------------------------------------------------ ready + hand-over
 
@@ -455,6 +490,31 @@ def review_off_reason(p: prof.Profile) -> str:
     return f"{FLAG_REVIEW_SKIPPED}: review is off in this repo's profile, {prof.describe(p)}"
 
 
+def local_reviewer(config: Any, writer: Any) -> Any:
+    """#49: a reviewer for a local-only repo: the first model with ``kind == "local"`` and
+    a family other than the writer's (7f), from ``reviewer_models`` in order, then the
+    other configured models in config order. None when there is none."""
+    names = list(getattr(config, "reviewer_models", ()))
+    names += [m.name for m in getattr(config, "models", ()) if m.name not in names]
+    family = str(writer.family).strip().lower()
+    for name in names:
+        try:
+            m = config.model(name)
+        except ConfigError:
+            continue
+        if m.kind == "local" and str(m.family).strip().lower() != family:
+            return m
+    return None
+
+
+def local_only_skip_reason(writer: Any) -> str:
+    """#49: the hand-over reason when a local-only repo has no local reviewer."""
+    return (
+        f"{FLAG_REVIEW_SKIPPED}: AI review skipped: this repo is local only (cloud = false) "
+        f"and no local reviewer of a family other than {writer.family!r} is configured"
+    )
+
+
 _YES_NO = {True: "passed", False: "failed", None: "unknown"}
 
 
@@ -480,4 +540,11 @@ def comment_from_row(review: Review) -> str:
     )
 
 
-__all__ = ["ReviewSteps", "ci_decided", "comment_from_row", "review_off_reason"]
+__all__ = [
+    "ReviewSteps",
+    "ci_decided",
+    "comment_from_row",
+    "local_only_skip_reason",
+    "local_reviewer",
+    "review_off_reason",
+]

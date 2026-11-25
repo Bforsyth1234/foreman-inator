@@ -12,6 +12,7 @@ from foreman_inator.config import Config
 from foreman_inator.db.store import Experiment, Store
 from foreman_inator.experiments import replay_runner as rr
 from foreman_inator.experiments import shadow, variants
+from foreman_inator.experiments import split as split_mod
 from foreman_inator.worker_experiments import ExperimentError, _newest, _role
 
 log = logging.getLogger("foreman_inator.experiments")
@@ -51,6 +52,14 @@ def summary(store: Store, exp: Experiment, config: Config) -> str:
         return _replay_summary(store, exp, config.experiments.min_cases)
     if exp.mode == "shadow" and exp.role == "reviewer":
         return _shadow_summary(store, exp, config.experiments.live_min_sample)
+    if exp.mode == "split" and exp.role == "writer":
+        try:
+            return split_mod.summary(store, exp.id, min_sample=config.experiments.live_min_sample)
+        except Exception as exc:
+            return f"not scored ({type(exc).__name__})"
+    if exp.mode == "seeded":  # #35: the note's first line; the details print it whole
+        lines = (exp.result_note or "").splitlines()
+        return lines[0] if lines else "not finished"
     return exp.result_note or ""
 
 
@@ -66,7 +75,7 @@ def status_lines(store: Store, config: Config, experiment_id: int | None = None)
             + (f", ended {exp.ended_at:%Y-%m-%d %H:%M}" if exp.ended_at else ""),
             f"  {summary(store, exp, config)}",
         ]
-        if exp.mode == "replay" and exp.result_note:
+        if exp.mode in ("replay", "seeded") and exp.result_note:
             lines += ["", *exp.result_note.splitlines()]
         return lines
     lines = [f"Champion {line}" for line in variants.status_lines(store)]
@@ -134,7 +143,8 @@ def promote(
         )
     rep = _newest(store, role, vid, "replay")
     sh = _newest(store, role, vid, "shadow") if role == "reviewer" else None
-    ours = [e for e in (rep, sh) if e is not None]
+    sp = _newest(store, role, vid, "split") if role == "writer" else None  # #34
+    ours = [e for e in (rep, sh, sp) if e is not None]
     if rep is None:
         return PromoteResult(
             "refused",
@@ -160,13 +170,28 @@ def promote(
         )
     replay_part = f"wins replay #{rep.id} ({c.reason}; {c.wins}-{c.losses}-{c.ties})"
     if role == "writer":
-        if not replay_only:
-            return PromoteResult(
-                "refused",
-                f"{vid} {replay_part}, but a writer cannot be checked live yet (traffic split, "
-                "#34, is not built). Pass --replay-only to promote it on the replay alone.",
+        live_part = None
+        why = "it has no traffic split against the current champion"
+        if sp is not None and sp.champion_variant == current.id:
+            _, j = split_mod.write_comparison(
+                store, sp.id, min_sample=config.experiments.live_min_sample
             )
-        live_part = "promoted on replay only (--replay-only; no live writer check yet, #34)"
+            why = f"split #{sp.id}: {'; '.join(j.reasons)}"
+            if j.status == "fails":
+                ids = _end(store, ours, "rejected", f"fails live in {why}")
+                return PromoteResult("rejected", f"Rejected {vid}: it does not hold live ({why}).",
+                                     ids)  # fmt: skip
+            if j.status == "holds":
+                live_part = f"holds live in split #{sp.id}"
+        if live_part is None:
+            if not replay_only:
+                return PromoteResult(
+                    "refused",
+                    f"{vid} {replay_part}, but is not yet shown to hold live ({why}). Run a "
+                    f"traffic split (`fman experiment split start {vid}`), or pass "
+                    "--replay-only to promote it on the replay alone.",
+                )
+            live_part = f"promoted on replay only (--replay-only; {why})"
     else:
         if sh is None:
             return PromoteResult(

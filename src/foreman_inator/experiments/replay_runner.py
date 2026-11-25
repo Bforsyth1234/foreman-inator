@@ -90,6 +90,13 @@ reviewer sides read the repo's ``rules_file``, as the live review does. A review
 result's ``detail`` ends with ``[tag: <tag>]`` when the review tagged a kickback, so
 ``SideTotals.style_tags`` counts ``style`` kickbacks.
 
+Seeded bugs (#35, todo #35), ``run_seeded``: the merged cases of a reviewer set, each with
+one bug planted by ``seeded.seed_case`` (an added if-guard dropped, an added check
+neutralised, a comparison flipped; only patches that pass ``git apply --check`` against
+the base), run through ``_reviewer_side`` on both variants with expected verdict
+``request_changes``; an ``experiments`` row with mode ``seeded``. The note reports the
+catch rate per variant and per mutation kind (see the section comment).
+
 Never: a push, a PR, a GitHub call of any kind (this module takes no GitHub client), or a
 write to ``tickets``/``attempts``/``reviews``/``kickbacks``. Its writes go to
 ``experiments`` (the row and its ``result_note``) and the 005 replay tables only.
@@ -101,6 +108,7 @@ import contextlib
 import hashlib
 import itertools
 import logging
+import re
 import shutil
 import threading
 import time
@@ -126,6 +134,7 @@ from foreman_inator.tickets.prompt import CONVENTIONS_BUDGET, build_writer_promp
 from foreman_inator.worker_setup import setup_failure
 
 from . import replay_sets as rs
+from . import seeded as sd
 
 log = logging.getLogger("foreman_inator.experiments.replay")
 _tracer = otel_trace.get_tracer("foreman_inator.experiments.replay")
@@ -913,15 +922,24 @@ def _drive(
     champion: Variant,
     challenger: Variant,
     cancel: threading.Event,
+    cases: Sequence[rs.StoredCase] | None = None,
 ) -> tuple[str, str | None]:
-    """Every unscored (case, side) in order. Returns the run's (state, stop_reason)."""
+    """Every unscored (case, side) in order. Returns the run's (state, stop_reason).
+    ``cases`` (#35, seeded runs): the cases to run in place of the set's own."""
     store = deps.store
     done = {(r.case_id, r.side) for r in results(store, experiment_id)}
     budget = _Budget(settings.run_budget_usd)
     tap = _tap_for(deps.proxy)
     mirrors: dict[str, RepoMirror] = {}
     try:
-        for case in rs.list_cases(store, set_id):
+        # #49: a local-only repo's cases run only when both sides are local models.
+        cloud = bool(champion.endpoint.is_cloud or challenger.endpoint.is_cloud)
+        if cases is None:
+            cases = rs.list_cases(store, set_id, cloud_models=cloud)
+        else:
+            local = store.local_only_repos() if cloud else frozenset()
+            cases = [c for c in cases if c.repo not in local]
+        for case in cases:
             for side, variant in (("champion", champion), ("challenger", challenger)):
                 if (case.id, side) in done:
                     continue
@@ -1300,6 +1318,297 @@ def _reviewer_side(ctx: _SideCtx) -> CaseResult:
         shutil.rmtree(work, ignore_errors=True)
 
 
+# --------------------------------------------------------------------------- seeded bugs
+#
+# #35 (GH #17): a reviewer run on the merged cases of a reviewer set, each with one bug
+# planted (``seeded.seed_case``), expected verdict ``request_changes``. One
+# ``experiments`` row with mode ``seeded`` (the 001 CHECK already allows it), a
+# ``replay_runs`` row pinned to the source set, and ``replay_results`` keyed by the
+# source case's id (one seeded case per merged case, so UNIQUE(experiment, case, side)
+# holds). The seed is the first line of the result note (``SEEDED_NOTE_HEAD``) and is
+# read back on a resume; the same seed and commits rebuild the same seeded commits.
+# Scoring: request_changes = ``catch``, approve = ``miss``, handed_to_user = ``handed``.
+# Catch rate = catches / scored cases, per side and per mutation kind. Seeded runs never
+# feed promotion (only mode ``replay`` and ``shadow`` do) and measure catches only.
+
+SEEDED_NOTE_HEAD = "seeded run, seed {seed}, set {set_id}."
+_SEEDED_HEAD_RE = re.compile(r"^seeded run, seed (-?\d+), set (\d+)\.")
+
+
+@dataclass(frozen=True, slots=True)
+class KindTotals:
+    kind: str
+    champion_catches: int = 0
+    challenger_catches: int = 0
+    cases: int = 0  # scored on both sides
+
+
+@dataclass(frozen=True, slots=True)
+class SeededComparison:
+    experiment_id: int
+    set_id: int
+    seed: int
+    merged_cases: int  # merged cases of the source set
+    seeded_cases: int  # of them, with a bug planted
+    skipped: tuple[tuple[int, str], ...]  # (case id, reason) for merged cases left out
+    scored_cases: int  # scored on both sides
+    errored_cases: int
+    champion: SideTotals
+    challenger: SideTotals
+    by_kind: tuple[KindTotals, ...]
+    verdict: Verdict
+    reason: str
+    state: str
+    stop_reason: str | None
+
+
+def catch_rate(t: SideTotals) -> float:
+    """Catches over scored seeded cases (0.0 with none scored)."""
+    return t.catches / t.cases if t.cases else 0.0
+
+
+def seeded_seed(store: Store, experiment_id: int) -> int | None:
+    """The seed a seeded run was started with (from its note's first line)."""
+    note = store.get_experiment(experiment_id).result_note or ""
+    m = _SEEDED_HEAD_RE.match(note)
+    return int(m[1]) if m else None
+
+
+def start_seeded(
+    store: Store, *, champion_variant: str, challenger_variant: str, set_id: int, seed: int
+) -> int:
+    """A new ``experiments`` row (mode seeded) pinned to reviewer set ``set_id``."""
+    if champion_variant == challenger_variant:
+        raise ValueError("champion and challenger must be different variants")
+    rset = rs.get_set(store, set_id)
+    if rset.role != "reviewer":
+        raise ValueError(f"set {set_id} holds {rset.role} cases; seeded runs need reviewer cases")
+    now = _ts(store.now())
+    with store.transaction() as conn:
+        exp = store.create_experiment(
+            role="reviewer",
+            champion_variant=champion_variant,
+            challenger_variant=challenger_variant,
+            mode="seeded",
+        )
+        conn.execute(
+            "INSERT INTO replay_runs (experiment_id, set_id, role, state, started_at, updated_at)"
+            " VALUES (?, ?, 'reviewer', 'running', ?, ?)",
+            (exp.id, set_id, now, now),
+        )
+    store.set_experiment_note(exp.id, SEEDED_NOTE_HEAD.format(seed=int(seed), set_id=set_id))
+    return exp.id
+
+
+def find_resumable_seeded(
+    store: Store, *, champion_variant: str, challenger_variant: str, seed: int
+) -> int | None:
+    """The newest unfinished seeded run of this pair with this seed."""
+    rows = store.query(
+        "SELECT e.id FROM experiments e JOIN replay_runs r ON r.experiment_id = e.id"
+        " WHERE e.role = 'reviewer' AND e.mode = 'seeded' AND e.status = 'running'"
+        " AND e.champion_variant = ? AND e.challenger_variant = ? AND r.state != 'finished'"
+        " ORDER BY e.id DESC",
+        (champion_variant, challenger_variant),
+    )
+    for r in rows:
+        if seeded_seed(store, int(r["id"])) == int(seed):
+            return int(r["id"])
+    return None
+
+
+def seeded_verdict(
+    champ: SideTotals, chall: SideTotals, scored: int, min_cases: int
+) -> tuple[Verdict, str]:
+    """Catches first, then cost; seeded cases carry no false-kickback signal."""
+    if scored < max(1, min_cases):
+        return "inconclusive", f"only {scored} case(s) scored on both sides; {min_cases} needed"
+    if chall.catches < champ.catches:
+        return "does_not_win", "it caught fewer of the seeded bugs"
+    if not _le(chall.cost_usd, champ.cost_usd):
+        return "does_not_win", "it costs more"
+    if chall.catches > champ.catches:
+        return "wins", "it caught more of the seeded bugs at no higher cost"
+    if _lt(chall.cost_usd, champ.cost_usd):
+        return "wins", "the same catches at a lower cost"
+    return "does_not_win", "no better than the champion on catches or cost"
+
+
+def compare_seeded(
+    store: Store,
+    experiment_id: int,
+    built: Sequence[Any] = (),
+    *,
+    min_cases: int = 10,
+) -> SeededComparison:
+    """The seeded comparison from the stored rows; ``built`` (``seeded.seeded_cases``)
+    gives each case's mutation kind and the skipped merged cases."""
+    exp = store.get_experiment(experiment_id)
+    run = _run_row(store, experiment_id)
+    kinds = {b.case_id: b.kind for b in built if isinstance(b, sd.SeededCase)}
+    skipped = tuple((b.case_id, b.reason) for b in built if isinstance(b, sd.SeededSkip))
+    by_case: dict[int, dict[str, CaseResult]] = {}
+    for r in results(store, experiment_id):
+        by_case.setdefault(r.case_id, {})[r.side] = r
+    paired: list[tuple[CaseResult, CaseResult]] = []
+    errored = 0
+    for case_id in sorted(by_case):
+        sides = by_case[case_id]
+        if any(x.status == "error" for x in sides.values()):
+            errored += 1
+        elif "champion" in sides and "challenger" in sides:
+            paired.append((sides["champion"], sides["challenger"]))
+    champ = _totals(exp.champion_variant, [a for a, _ in paired])
+    chall = _totals(exp.challenger_variant, [b for _, b in paired])
+    per: dict[str, list[int]] = {}
+    for a, b in paired:
+        k = per.setdefault(kinds.get(a.case_id, "unknown"), [0, 0, 0])
+        k[0] += a.score == "catch"
+        k[1] += b.score == "catch"
+        k[2] += 1
+    by_kind = tuple(KindTotals(k, *per[k]) for k in sorted(per))
+    verdict, reason = seeded_verdict(champ, chall, len(paired), min_cases)
+    seed = seeded_seed(store, experiment_id)
+    return SeededComparison(
+        experiment_id=experiment_id,
+        set_id=int(run["set_id"]),
+        seed=seed if seed is not None else -1,
+        merged_cases=len(kinds) + len(skipped),
+        seeded_cases=len(kinds),
+        skipped=skipped,
+        scored_cases=len(paired),
+        errored_cases=errored,
+        champion=champ,
+        challenger=chall,
+        by_kind=by_kind,
+        verdict=verdict,
+        reason=reason,
+        state=run["state"],
+        stop_reason=run["stop_reason"],
+    )
+
+
+def _pct(n: int, d: int) -> str:
+    return f"{n}/{d} ({100.0 * n / d:.0f}%)" if d else "0/0"
+
+
+def seeded_note(c: SeededComparison) -> str:
+    """The plain-text seeded result written to ``experiments.result_note``."""
+    a, b = c.champion, c.challenger
+    verdict = {"wins": "challenger catches more", "does_not_win": "challenger does not win",
+               "inconclusive": "inconclusive"}[c.verdict]  # fmt: skip
+    lines = [SEEDED_NOTE_HEAD.format(seed=c.seed, set_id=c.set_id)]
+    if c.stop_reason:
+        lines.append(f"{c.stop_reason} (resume to finish the set).")
+    elif c.state == "running":
+        lines.append("running.")
+    lines += [
+        f"{c.seeded_cases} of {c.merged_cases} merged case(s) seeded with a bug"
+        f" ({len(c.skipped)} had no mutation that applies); {c.scored_cases} scored on both"
+        f" sides ({c.errored_cases} could not run). Expected verdict: request_changes.",
+        f"Catch rate: champion {_pct(a.catches, a.cases)}, challenger"
+        f" {_pct(b.catches, b.cases)}; handed to user: champion {a.handed}, challenger"
+        f" {b.handed}.",
+    ]
+    for k in c.by_kind:
+        lines.append(
+            f"  {k.kind}: champion {_pct(k.champion_catches, k.cases)}, challenger"
+            f" {_pct(k.challenger_catches, k.cases)}"
+        )
+    lines += [
+        f"Verdict: {verdict} ({c.reason}). Seeded cases measure catches only; false"
+        " kickbacks come from the reviewer replay.",
+        f"Cost: champion {_money(a.cost_usd)}, challenger {_money(b.cost_usd)}.",
+        f"Time: champion {a.seconds:.1f}s, challenger {b.seconds:.1f}s.",
+        f"Champion {a.variant_id}; challenger {b.variant_id}.",
+    ]
+    return "\n".join(lines)
+
+
+def run_seeded(
+    deps: ReplayDeps,
+    *,
+    champion: ReviewerVariant,
+    challenger: ReviewerVariant,
+    seed: int | None = None,
+    kinds: Sequence[str] | None = None,
+    settings: ReplaySettings | None = None,
+    experiment_id: int | None = None,
+    set_id: int | None = None,
+    cancel: threading.Event | None = None,
+) -> SeededComparison:
+    """Run (or resume) one seeded-bug reviewer comparison (section comment above).
+
+    Without ``experiment_id``: resume the newest unfinished seeded run of this pair and
+    seed, else start one on ``set_id`` or the current reviewer set. ``seed`` defaults to
+    ``seeded.DEFAULT_SEED``; resuming a run with another seed is refused."""
+    settings = settings or ReplaySettings()
+    cancel = cancel or threading.Event()
+    store = deps.store
+    _check_variants("reviewer", champion, challenger)
+    want = sd.KINDS if kinds is None else tuple(kinds)
+    if not want or any(k not in sd.KINDS for k in want):
+        raise ValueError(f"mutation kinds must be among {sd.KINDS}")
+    if experiment_id is not None:
+        stored_seed = seeded_seed(store, experiment_id)
+        if store.get_experiment(experiment_id).mode != "seeded" or stored_seed is None:
+            raise ValueError(f"experiment {experiment_id} is not a seeded run")
+        if seed is not None and int(seed) != stored_seed:
+            raise ValueError(f"experiment {experiment_id} was seeded with {stored_seed}")
+        seed = stored_seed
+    seed = sd.DEFAULT_SEED if seed is None else int(seed)
+    if experiment_id is None:
+        experiment_id = find_resumable_seeded(
+            store,
+            champion_variant=champion.variant_id,
+            challenger_variant=challenger.variant_id,
+            seed=seed,
+        )
+    if experiment_id is None:
+        if set_id is None:
+            set_id = rs.ensure_current_set(
+                store,
+                "reviewer",
+                mirror_for=deps.mirror_for,
+                max_merges=settings.set_size,
+                recordings_dir=deps.recordings_dir,
+            ).id
+        experiment_id = start_seeded(
+            store,
+            champion_variant=champion.variant_id,
+            challenger_variant=challenger.variant_id,
+            set_id=set_id,
+            seed=seed,
+        )
+    exp = store.get_experiment(experiment_id)
+    if (exp.champion_variant, exp.challenger_variant) != (
+        champion.variant_id,
+        challenger.variant_id,
+    ):
+        raise ValueError(f"experiment {experiment_id} compares other variants")
+    run = _run_row(store, experiment_id)
+    run_set = int(run["set_id"])
+    built = sd.seeded_cases(store, run_set, deps.mirror_for, seed=seed, kinds=want)  # type: ignore[arg-type]
+    stored = {
+        c.id: c
+        for c in rs.list_cases(
+            store, run_set, cloud_models=champion.endpoint.is_cloud or challenger.endpoint.is_cloud
+        )
+    }
+    cases = [b.stored(stored[b.case_id]) for b in built if isinstance(b, sd.SeededCase)]
+    for b in built:
+        if isinstance(b, sd.SeededCase):
+            log.info("seeded %d: case %d: %s", experiment_id, b.case_id, b.description)
+    if run["state"] != "finished":
+        _set_state(store, experiment_id, "running", None)
+        state, reason = _drive(deps, settings, experiment_id, run_set, "reviewer", champion,
+                               challenger, cancel, cases=cases)  # fmt: skip
+        _set_state(store, experiment_id, state, reason)
+    c = compare_seeded(store, experiment_id, built, min_cases=settings.min_cases)
+    store.set_experiment_note(experiment_id, seeded_note(c) + _rules_note(challenger))
+    return c
+
+
 __all__ = [
     "SIDES",
     "STOP_CANCELLED",
@@ -1308,24 +1617,34 @@ __all__ = [
     "STOP_SANDBOX",
     "CaseResult",
     "Comparison",
+    "KindTotals",
     "ReplayDeps",
     "ReplaySettings",
     "ReviewerVariant",
     "RulesOverride",
     "RunStatus",
     "SandboxFactory",
+    "SeededComparison",
     "SideTotals",
     "WriterVariant",
+    "catch_rate",
     "compare",
+    "compare_seeded",
     "comparison_note",
     "config_sandbox",
     "find_resumable",
+    "find_resumable_seeded",
     "replay_status",
     "results",
     "review_score",
     "run_replay",
+    "run_seeded",
+    "seeded_note",
+    "seeded_seed",
+    "seeded_verdict",
     "split_rules_id",
     "start_replay",
+    "start_seeded",
     "verdict_for",
     "with_rules",
 ]

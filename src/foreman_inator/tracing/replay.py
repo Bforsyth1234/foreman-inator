@@ -64,7 +64,7 @@ import gzip
 import json
 import re
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import asdict, dataclass, field, fields, replace
+from dataclasses import dataclass, field, fields, replace
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -895,7 +895,7 @@ def rows_to_json(rows: TicketRows) -> dict[str, Any]:
     they are re-read from the trace and recordings by ``rows_from_json``)."""
     return {
         "ticket": _row_dict(rows.ticket),
-        "ladder": [asdict(r) for r in rows.ladder],
+        "ladder": [{"tier": r.tier, "model": r.model} for r in rows.ladder],
         "attempts": [_row_dict(a) for a in rows.attempts],
         "kickbacks": [_row_dict(k) for k in rows.kickbacks],
         "reviews": [_row_dict(r) for r in rows.reviews],

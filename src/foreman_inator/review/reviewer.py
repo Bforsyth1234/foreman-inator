@@ -46,6 +46,18 @@ writer gets them (global, per-repo rules file, root and nested ``AGENTS.md`` /
 its own reviewer. A template without the section (``reviewer-v1``) gathers nothing and its
 messages are byte-for-byte what they were.
 
+Reviewer pick (#72). ``pick_reviewer(config, writer, order=...)``: ``"configured"`` (the
+default) is ``config.reviewer_for``, the first ``reviewer_models`` entry of another
+family, exactly as before. ``"cheapest"`` takes ``reviewer_candidates`` (every cloud model
+plus anything named in ``reviewer_models``) in order of a nominal review's list price
+(``proxy/pricing.py``) and picks the first of another family: local writers and Claude get
+GLM, GLM gets a cheaper third family if one is configured, else Opus. The family rule is
+unchanged and checked again on the result. ``review_with_escalation`` adds, in cheapest
+order only, at most one second review per attempt by today's pick
+(``escalation_reviewer``) when ``low_confidence`` says the first verdict is weak; the
+second reuses checks 1-4 and decides. ``cheapest_shadow_challenger`` names the model to
+shadow today's reviewer with (``experiments/shadow.py``) before switching the default.
+
 Invariant 7f: check 5's input is exactly ``ReviewInput`` (issue title and body, the diff
 bounded with a visible truncation marker, the changed-file list, the checks 1-4
 summaries, and the base commit's conventions: repo input, not the writer's reasoning).
@@ -418,15 +430,193 @@ def check_independent(reviewer: ModelEndpoint, writer: ModelEndpoint) -> None:
         )
 
 
-def pick_reviewer(config: Config, writer: ModelEndpoint) -> ModelEndpoint:
-    """``config.reviewer_for(writer)`` or ``NoIndependentReviewer``."""
-    found = config.reviewer_for(writer)
+#: #72: how ``pick_reviewer`` orders the reviewers. ``"configured"`` (the default, today's
+#: behaviour exactly): the first ``reviewer_models`` entry of another family.
+#: ``"cheapest"``: the cheapest reviewer of another family, by ``proxy/pricing.py``.
+ReviewerOrder = Literal["configured", "cheapest"]
+REVIEWER_ORDERS: tuple[str, ...] = ("configured", "cheapest")
+DEFAULT_REVIEWER_ORDER: ReviewerOrder = "configured"
+#: The nominal review the cost order prices: a full diff and issue budget of input (~1
+#: token per 3 characters, as ``pricing.estimate_tokens``) and the reply's token cap.
+#: Only the ORDER matters, so the exact size is not important.
+NOMINAL_REVIEW_TOKENS_IN = (DIFF_BUDGET + ISSUE_BODY_BUDGET) // 3
+NOMINAL_REVIEW_TOKENS_OUT = MODEL_MAX_TOKENS
+#: ``low_confidence``: an approval below this changed-line coverage (percent), with no
+#: test proven to fail on the base, is low confidence.
+LOW_CONFIDENCE_COVERAGE = 50.0
+
+
+def _check_order(order: str) -> None:
+    if order not in REVIEWER_ORDERS:
+        raise ValueError(f"unknown reviewer order {order!r}; valid: {', '.join(REVIEWER_ORDERS)}")
+
+
+def nominal_review_cost(endpoint: ModelEndpoint) -> float:
+    """USD of one nominal review by ``endpoint`` at its list price (0 for a local model; an
+    unknown cloud model gets ``pricing.CONSERVATIVE_DEFAULT``, so it sorts last)."""
+    return pricing.price_for(endpoint).cost(NOMINAL_REVIEW_TOKENS_IN, NOMINAL_REVIEW_TOKENS_OUT)
+
+
+def reviewer_candidates(config: Config) -> tuple[ModelEndpoint, ...]:
+    """#72: every model the cost order may pick, cheapest first: each cloud model in
+    ``config.models`` plus anything named in ``reviewer_models`` (so a user can add a local
+    reviewer by naming it there). Other local models are not candidates: a free tier 1
+    writer would otherwise win every cost order. Ties keep config order; a model with no
+    known price sorts after a priced one of the same cost."""
+    named = set(config.reviewer_models)
+    pool = [m for m in config.models if m.is_cloud or m.name in named]
+    index = {m.name: i for i, m in enumerate(pool)}
+    return tuple(
+        sorted(
+            pool,
+            key=lambda m: (
+                nominal_review_cost(m),
+                pricing.price_for(m).conservative,
+                index[m.name],
+            ),
+        )
+    )
+
+
+def _independent(reviewer: ModelEndpoint, writer: ModelEndpoint) -> bool:
+    return reviewer.family.strip().lower() != writer.family.strip().lower()
+
+
+def pick_reviewer(
+    config: Config, writer: ModelEndpoint, *, order: str = DEFAULT_REVIEWER_ORDER
+) -> ModelEndpoint:
+    """The reviewer for ``writer``'s change, or ``NoIndependentReviewer``.
+
+    ``order="configured"``: ``config.reviewer_for(writer)``, today's pick. ``"cheapest"``
+    (#72): the first of ``reviewer_candidates`` whose family differs from the writer's.
+    Either way the family rule (7f) is checked again on the result."""
+    _check_order(order)
+    if order == "configured":
+        found = config.reviewer_for(writer)
+        where = "reviewer_models"
+    else:
+        found = next((m for m in reviewer_candidates(config) if _independent(m, writer)), None)
+        where = "the configured models"
     if found is None:
         raise NoIndependentReviewer(
-            f"no reviewer in reviewer_models has a family other than {writer.family!r}"
+            f"no reviewer in {where} has a family other than {writer.family!r}"
         )
     check_independent(found, writer)
     return found
+
+
+def escalation_reviewer(
+    config: Config, writer: ModelEndpoint, first: ModelEndpoint
+) -> ModelEndpoint | None:
+    """#72: who gives the second opinion on a low-confidence review by ``first``: the
+    reviewer today's order picks (``config.reviewer_for``: Opus for every non-Claude writer
+    with the default ``reviewer_models``). None when that is ``first`` itself, or there is
+    none of another family (a Claude writer: GLM reviewed it, and Opus may not)."""
+    target = config.reviewer_for(writer)
+    if target is None or target.name == first.name or not _independent(target, writer):
+        return None
+    return target
+
+
+def low_confidence(
+    outcome: ReviewOutcome, *, coverage_floor: float = LOW_CONFIDENCE_COVERAGE
+) -> str | None:
+    """#72: why ``outcome``'s verdict is low confidence, or None. Only a verdict the model
+    made counts (a hard-finding or check-1 verdict is plain code, the same for every
+    reviewer, and an error is not the model's judgment):
+
+    * the reply was malformed twice (the review was handed to the user for it);
+    * the model needed the correction message to give a parsable verdict;
+    * it approved with no test proven to fail on the base (check 3 not True) and
+      changed-line coverage unknown or below ``coverage_floor``."""
+    if outcome.read_diff == "malformed":
+        return "the reviewer's reply could not be parsed"
+    if outcome.read_diff not in ("approve", "request_changes"):
+        return None
+    if outcome.model_calls > 1:
+        return "the reviewer needed a correction to give a verdict"
+    if outcome.read_diff == "approve" and outcome.tests_nonvacuous is not True:
+        pct = outcome.changed_line_coverage
+        if pct is None:
+            return "approved with no test shown to fail without the change, coverage unknown"
+        if pct < coverage_floor:
+            return (
+                "approved with no test shown to fail without the change, "
+                f"{pct:.0f}% changed-line coverage"
+            )
+    return None
+
+
+@dataclass(frozen=True)
+class EscalatedReview:
+    """``review_with_escalation``'s result. ``outcome`` decides (store and post it);
+    ``first`` is the first review, ``second`` the escalated one (None: no escalation)."""
+
+    outcome: ReviewOutcome
+    first: ReviewOutcome
+    second: ReviewOutcome | None = None
+    reason: str | None = None  # why the first was low confidence (set when escalated)
+
+
+def review_with_escalation(
+    review: Callable[..., ReviewOutcome],
+    *,
+    config: Config,
+    writer: ModelEndpoint,
+    reviewer: ModelEndpoint,
+    order: str = DEFAULT_REVIEWER_ORDER,
+    **kwargs: Any,
+) -> EscalatedReview:
+    """#72: ``review(writer=, reviewer=, store=None, **kwargs)`` (``review_change`` or the
+    worker's sandboxed launcher), then, with ``order="cheapest"`` only, AT MOST ONE second
+    review by ``escalation_reviewer`` when ``low_confidence`` says so. The second review
+    reuses the first's checks 1-4 (``precomputed``), so only the model call repeats; its
+    verdict decides, whatever it is (a failed second review hands over; it never falls
+    back to the low-confidence verdict). The deciding outcome carries both reviews'
+    tokens, cost, model calls and seconds, so the stored row is the attempt's whole review
+    cost, and its comment says why a second reviewer was asked. ``order="configured"``
+    is exactly one ``review`` call, as today.
+
+    ``kwargs`` must not set ``store``: only one non-shadow row may exist per attempt, so
+    the caller records ``outcome`` itself. A set ``cancel`` event skips the second call."""
+    _check_order(order)
+    if kwargs.pop("store", None) is not None:
+        raise ValueError("review_with_escalation stores nothing: pass no store, record outcome")
+    first = review(writer=writer, reviewer=reviewer, store=None, **kwargs)
+    if order != "cheapest":
+        return EscalatedReview(first, first)
+    reason = low_confidence(first)
+    target = escalation_reviewer(config, writer, reviewer) if reason else None
+    cancel = kwargs.get("cancel")
+    if target is None or first.tests is None or (cancel is not None and cancel.is_set()):
+        return EscalatedReview(first, first)
+    kwargs["precomputed"] = (first.tests, first.coverage, first.revert, first.run_app)
+    second = review(writer=writer, reviewer=target, store=None, **kwargs)
+    title = _VERDICT_TITLE.get(first.verdict, first.verdict)
+    line = (
+        f"_Second review by `{_safe(target.name)}`: the first reviewer "
+        f"(`{_safe(first.reviewer_model)}`, {title}) was low confidence: {_safe(reason)}._"
+    )
+    decided = dataclasses.replace(
+        second,
+        tokens_in=first.tokens_in + second.tokens_in,
+        tokens_out=first.tokens_out + second.tokens_out,
+        cost_usd=first.cost_usd + second.cost_usd,
+        model_calls=first.model_calls + second.model_calls,
+        seconds=first.seconds + second.seconds,
+        comment_body=second.comment_body.rstrip("\n") + "\n\n" + line + "\n",
+    )
+    return EscalatedReview(decided, first, second, reason)
+
+
+def cheapest_shadow_challenger(config: Config) -> ModelEndpoint | None:
+    """#72 "measure first": the model to shadow today's reviewer with
+    (``fman experiment run --role reviewer --challenger <name>``): the cheapest
+    ``reviewer_candidates`` entry that is not ``reviewer_models[0]``. The shadow skips,
+    with ``family_conflict``, the PRs whose writer is the challenger's own family, which
+    are exactly the PRs the cost order would not give it. None when there is no other."""
+    champion = config.reviewer_models[0] if config.reviewer_models else None
+    return next((m for m in reviewer_candidates(config) if m.name != champion), None)
 
 
 # --------------------------------------------------------------------------- prompt

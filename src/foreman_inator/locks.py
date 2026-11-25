@@ -88,6 +88,8 @@ DORMANT_FLAGS = frozenset(
         "checks_failed",
         "no_verify_command",
         "attempt_budget",
+        "local_only",  # #49: a local-only repo's ladder ran out of local rungs
+        "split_proposed",  # #50: waiting on the user to create the sub-issues
     }
 )
 

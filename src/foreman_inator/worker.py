@@ -236,6 +236,8 @@ class Worker(
         #: of the clarity check and the router. ``run()`` passes ``ollama_watch_for``;
         #: None (tests) asks nothing and keeps the plain timeout.
         self.ollama_watch = ollama_watch
+        #: #50/#49: a local-only repo's issue is never sent to a cloud splitter.
+        self.split_cloud_allowed = lambda repo: self.store.repo_allows_cloud(repo)
         self._init_background()
         self._ensure_variants()
         self.actions: dict[Action, Callable[[Ctx], None]] = {

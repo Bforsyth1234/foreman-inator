@@ -47,7 +47,8 @@ def ollama(pulled: list[str]):
 
 def test_missing_embedding_model_is_reported_with_the_pull_command():
     checks = deps.check_models(
-        config.Config(), transport=ollama(["inkling-2-mini:latest", "qwen3.8:27b"])
+        config.Config(models=config.local_tier2_models()),
+        transport=ollama(["inkling-2-mini:latest", "qwen3.8:27b"]),
     )
     by = {c.name: c for c in checks}
     emb = by["embedding model: embeddinggemma"]

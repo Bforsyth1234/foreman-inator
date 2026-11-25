@@ -176,6 +176,13 @@ def fmt_kickbacks(k: q.KickbackStats) -> str:
     return out
 
 
+def fmt_after_merge(n: int, of: int) -> str:
+    """``n`` of ``of`` accepted tickets, with the share; "no data" with none accepted."""
+    if not of:
+        return NO_DATA
+    return f"{n} <small>of {of} ({n / of * 100:.0f}%)</small>"
+
+
 def fmt_duration(d: q.Duration) -> str:
     if d.median_seconds is None:
         return NO_DATA
@@ -332,11 +339,14 @@ def _writer_table(rep: q.Report) -> str:
         "<tr><th>Writer model (start)</th><th>First-try accept</th><th>Kickbacks / ticket"
         "</th><th>Escalation rate</th><th>Cost / accepted ticket</th>"
         "<th>Attempt minutes / accepted ticket</th><th>Your reviews / accepted ticket</th>"
-        "<th>Time to accept</th><th>Router hit rate</th><th>AI kickbacks / ticket</th></tr>"
+        "<th>Time to accept</th><th>Router hit rate</th><th>AI kickbacks / ticket</th>"
+        "<th>Accepted on this model</th><th>Accepted, then reverted</th>"
+        "<th>Accepted, then followed up</th></tr>"
     )
 
     def row(r: q.WriterRow, cls: str = "") -> str:
         name = "All models" if r.model is None else e(r.model)
+        pm = r.post_merge
         return (
             f'<tr class="{cls}"><td>{name}</td><td>{fmt_rate(r.first_try_accept_rate)}</td>'
             f"<td>{fmt_kickbacks(r.kickbacks_per_ticket)}</td>"
@@ -346,7 +356,10 @@ def _writer_table(rep: q.Report) -> str:
             f"<td>{fmt_per_accepted(r.user_reviews_per_accepted_ticket)}</td>"
             f"<td>{fmt_duration(r.time_to_accept)}</td>"
             f"<td>{fmt_rate(r.router_hit_rate)}</td>"
-            f"<td>{fmt_mean(r.ai_kickbacks_per_ticket)}</td></tr>"
+            f"<td>{fmt_mean(r.ai_kickbacks_per_ticket)}</td>"
+            f"<td>{pm.accepted}</td>"
+            f"<td>{fmt_after_merge(pm.reverted, pm.accepted)}</td>"
+            f"<td>{fmt_after_merge(pm.followup, pm.accepted)}</td></tr>"
         )
 
     rows = [] if rep.filter.model else [row(rep.overall, "all")]
@@ -412,7 +425,8 @@ def render_report(
         "<h1>foreman-inator metrics</h1>"
         '<p class="lede">Which model should handle which kind of work, and what each '
         "accepted change costs. Dropped tickets are left out; failed exploration attempts "
-        "never count against a model.</p>"
+        "never count against a model. The last three writer columns count tickets by the "
+        "model that wrote the accepted change and what happened after you merged it.</p>"
         + _form(rep.filter, rep.bucket, opts)
         + headline
         + "<h2>Writers</h2>"

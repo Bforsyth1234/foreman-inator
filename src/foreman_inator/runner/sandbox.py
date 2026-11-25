@@ -15,8 +15,11 @@ what this module emits. Observed behaviour this module relies on:
 * ``(deny default)`` blocks everything, even ``execvp`` of the command (exit 71).
 * A rule with a filter (``subpath``, ``literal``, ``regex``, ``remote ip``) beats a rule
   without one, whatever the order; among filtered rules for the same operation the
-  LAST match wins. So the profile is written broad-to-narrow: unfiltered ``file-read*``,
-  then filtered denies, then filtered re-allows, then the final denies and own paths.
+  LAST match wins. A rule naming one operation (``file-read-metadata``) is not
+  overridden by a later filtered rule on a wildcard (``file-read*``): to deny ``stat``
+  where ``file-read-metadata`` is allowed, deny ``file-read-metadata`` itself. So the
+  profile is written broad-to-narrow: unfiltered ``file-read*``, then filtered denies,
+  then filtered re-allows, then the final denies and own paths.
 * A denied file or socket operation fails in the child with ``EPERM`` ("Operation not
   permitted", errno 1); a denied connect is ``EPERM`` too, a denied DNS lookup is
   ``EAI_NONAME`` (errno 8). ``sandbox-exec`` itself exits 71 when it cannot exec or apply.
@@ -45,7 +48,10 @@ What the generated profile allows (``render_profile``):
   dir, the git paths the worktree needs, the policy's extra reads/writes, and xcrun's
   tool-path cache (read only).
 * ``stat`` (file-read-metadata) anywhere, so path lookups work; no file contents, no
-  directory listings outside the allowed paths.
+  directory listings outside the allowed paths. Except ``.env``-style files (``.env``,
+  ``.env.local``, ``.env.*``) directly in a directory above the worktree: not even
+  ``stat``, so python-dotenv's ``load_dotenv()`` (an upward search from the worktree)
+  does not find ``~/.env`` and then crash opening it. The worktree's own are readable.
 * Writes: the worktree, the scratch dir, the policy's extra writes, ``/dev/null`` & co.,
   SwiftPM's atomic-write staging dirs, and in the mirror exactly: this worktree's private
   git dir, the object store, and this worktree's own branch ref and reflog. Never the
@@ -767,6 +773,12 @@ def render_profile(policy: Policy) -> str:
         '(allow file-read-metadata (subpath "/"))',
         *_rule("allow", "file-read*", _subpaths(own_reads)),
         *_rule("allow", "file-read*", _literals(policy.read_files)),
+        ";; .env files above the worktree: no contents and no stat (python-dotenv's",
+        ";; upward search must not find one it cannot open); last, so nothing re-allows.",
+        ";; The metadata deny is its own rule: a (deny file-read*) does not override the",
+        ";; (allow file-read-metadata ...) above (the narrower operation wins; by test).",
+        *_rule("deny", "file-read*", _ancestor_dotenvs(policy.worktree)),
+        *_rule("deny", "file-read-metadata", _ancestor_dotenvs(policy.worktree)),
         ";; writes: the worktree, the scratch dir, this worktree's git paths",
         *_rule("allow", "file-write*", _subpaths(own_writes)),
         *_rule("allow", "file-write*", _literals(policy.git.write_files)),
@@ -784,6 +796,20 @@ _REGEX_SPECIAL = set(".^$*+?()[]{}|\\")
 
 def _re(path: Path | str) -> str:
     return "".join("\\" + c if c in _REGEX_SPECIAL else c for c in str(path))
+
+
+def _ancestor_dotenvs(worktree: Path) -> str:
+    """Filters for the ``.env``-style files (``.env``, ``.env.local``, ``.env.*``) in each
+    directory above ``worktree``, up to ``/``. Each regex is anchored on one ancestor, so
+    files deeper in those directories and the worktree's own ``.env`` files do not match.
+    Denied with ``file-read*`` (metadata too): ``stat`` is otherwise allowed everywhere,
+    so ``load_dotenv()`` with no path, walking up from the worktree, would find
+    ``~/.env`` and then fail to open it (PermissionError at import time)."""
+    out = []
+    for parent in Path(worktree).parents:
+        prefix = "" if str(parent) == "/" else _re(parent)
+        out.append(f'(regex #"^{prefix}/\\.env(\\.[^/]*)?$")')
+    return " ".join(out)
 
 
 def _atomic_writes(policy: Policy) -> list[str]:

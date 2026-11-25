@@ -46,6 +46,12 @@ Readings shared by every metric (SPEC leaves these open; also listed in the item
   ``cost_usd`` (SPEC reviews table: review tokens and cost are "Counted in cost per
   accepted ticket"). Shadow reviews are experiment cost and never count, here or as the
   review of record.
+* **After merge** (#24 / todo 47): ``post_merge_quality`` counts closed tickets by the
+  model of their *accepted* attempt (the model that wrote the merged change, as
+  ``metrics.quality.quality_by_model`` does), not the start model, and how many of them
+  were later reverted or followed up (``post_merge_signals``, found by
+  ``metrics.quality.scan``). A reverted ticket still counts as accepted in every other
+  metric here: the signal is shown next to the accepted count, not subtracted from it.
 * **Local** = accepted on tier 1 or 2 (SPEC "Routing and escalation": tiers 1–2 are
   local, tier 3 is cloud).
 """
@@ -162,6 +168,21 @@ class Duration:
 
     count: int
     median_seconds: float | None
+
+
+@dataclass(frozen=True, slots=True)
+class PostMerge:
+    """Closed tickets accepted on a model, and what happened to them after the merge."""
+
+    accepted: int
+    reverted: int  # "accepted, then reverted"
+    followup: int  # "accepted, then followed up"
+    reverted_rate: Rate = field(init=False)
+    followup_rate: Rate = field(init=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "reverted_rate", Rate(self.reverted, self.accepted))
+        object.__setattr__(self, "followup_rate", Rate(self.followup, self.accepted))
 
 
 @dataclass(frozen=True, slots=True)
@@ -628,6 +649,31 @@ def recent_tickets(
     ]
 
 
+def post_merge_quality(store: Store, filt: MetricsFilter | None = None) -> PostMerge:
+    """Accepted, then reverted / followed up (#24 / todo 47).
+
+    Implemented: closed tickets in the repo/date filter whose *accepted* attempt ran on
+    the filter model (any model when None) = ``accepted``; of those, how many have a
+    ``reverted`` / ``followup`` row in ``post_merge_signals``. Reads the same table as
+    ``metrics.quality.quality_by_model``, with the page's filter.
+    """
+    sql = (
+        "WITH "
+        + _SCOPE_VIS
+        + """
+SELECT COUNT(*) AS accepted,
+    COALESCE(SUM(EXISTS (SELECT 1 FROM post_merge_signals ps
+        WHERE ps.ticket_id = s.id AND ps.kind = 'reverted')), 0) AS reverted,
+    COALESCE(SUM(EXISTS (SELECT 1 FROM post_merge_signals ps
+        WHERE ps.ticket_id = s.id AND ps.kind = 'followup')), 0) AS followup
+FROM scope s JOIN attempts acc ON acc.id = s.accepted_attempt_id
+WHERE s."column" = 'done' AND (:model IS NULL OR acc.model = :model)
+"""
+    )
+    r = store.query(sql, _p(filt))[0]
+    return PostMerge(int(r["accepted"]), int(r["reverted"]), int(r["followup"]))
+
+
 def filter_options(store: Store) -> FilterOptions:
     """Values for the page's filter controls."""
     rows = store.query(
@@ -656,6 +702,7 @@ class WriterRow:
     time_to_accept: Duration
     router_hit_rate: Rate
     ai_kickbacks_per_ticket: Mean
+    post_merge: PostMerge  # by the accepted attempt's model, not the start model
 
 
 @dataclass(frozen=True, slots=True)
@@ -689,6 +736,7 @@ def writer_row(store: Store, filt: MetricsFilter) -> WriterRow:
         time_to_accept=time_to_accept(store, filt),
         router_hit_rate=router_hit_rate(store, filt),
         ai_kickbacks_per_ticket=ai_kickbacks_per_ticket(store, filt),
+        post_merge=post_merge_quality(store, filt),
     )
 
 
@@ -823,6 +871,7 @@ __all__ = [
     "Mean",
     "MetricsFilter",
     "PipelineCost",
+    "PostMerge",
     "Rate",
     "RecentTicket",
     "Report",
@@ -839,6 +888,7 @@ __all__ = [
     "first_try_accept_rate",
     "kickbacks_per_ticket",
     "local_share",
+    "post_merge_quality",
     "recent_tickets",
     "report",
     "reviewer_miss_rate",

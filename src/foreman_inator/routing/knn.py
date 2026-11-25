@@ -13,7 +13,12 @@ The neighbour rule (exact)
    router's pick* (every one of its attempts ran on a tier above ``routed_tier``: a
    profile shift such as #51's ``fast``). Its acceptance says nothing about whether the
    router's tier would have worked, so learning from it would push every start upward.
-   Tickets with ``routed_tier`` NULL (older rows) are kept.
+   Tickets with ``routed_tier`` NULL (older rows) are kept. Also excluded: a ticket
+   **accepted, then reverted** (a ``reverted`` row in ``post_merge_signals``, #24 / todo
+   47, found by ``metrics.quality.scan``): the merge was undone, so its tier did not
+   work and must not be learned. ``backfill`` does not embed such tickets either. A
+   ``followup`` signal (a later ticket touched the same files) does not exclude: the
+   change stayed in, and a follow-up is often new work rather than a fix.
 2. **Threshold.** If the pool holds fewer than ``threshold`` tickets (default 50),
    return None (fall back).
 3. **Nearest.** Rank the pool by cosine similarity to the new ticket, highest first;
@@ -382,6 +387,8 @@ _POOL_FROM = """
       AND t.id != :exclude
       AND (t.routed_tier IS NULL
            OR (SELECT MIN(x.tier) FROM attempts x WHERE x.ticket_id = t.id) <= t.routed_tier)
+      AND NOT EXISTS (SELECT 1 FROM post_merge_signals ps
+                      WHERE ps.ticket_id = t.id AND ps.kind = 'reverted')
 """
 
 
@@ -703,7 +710,10 @@ def _stale(store: Any, model: str) -> list[tuple[int, str, str]]:
         "SELECT t.id AS id, t.title AS title, t.request AS request,"
         " e.model AS model, e.text_sha256 AS digest"
         " FROM tickets t LEFT JOIN ticket_embeddings e ON e.ticket_id = t.id"
-        " WHERE t.accepted_attempt_id IS NOT NULL ORDER BY t.id"
+        " WHERE t.accepted_attempt_id IS NOT NULL"
+        " AND NOT EXISTS (SELECT 1 FROM post_merge_signals ps"
+        "  WHERE ps.ticket_id = t.id AND ps.kind = 'reverted')"
+        " ORDER BY t.id"
     )
     out = []
     for r in rows:

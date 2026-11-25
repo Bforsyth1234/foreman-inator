@@ -17,7 +17,7 @@ flagged (handed over, spend pause, no verify...)   (none)      —
 ``todo``, no ``routed_tier`` or clarify not done   route       no
 last attempt still running                         (none)      —
 ``in_progress`` with a rebase pending (#43)        rebase      no
-``in_progress``, last attempt passed, no outcome   publish     ``may_start``
+``in_progress``, last attempt passed, no outcome   publish     open-PR cap, ``may_start``
 ``testing``, last attempt passed, no review row    review      no (waits at the CI gate)
 ``testing`` otherwise                              (none)      — (waits for you)
 escalation gives a step (#16)                      attempt     ``may_start``, except a
@@ -32,6 +32,14 @@ A ticket whose lock gate fails *waits*: no attempt is counted and nothing is fla
 starts as soon as the holder releases. Per repo at most ``config.max_parallel_per_repo``
 jobs run at once (one per ticket); mirror operations stay serialised per repo
 (``SerialMirror``), whatever the cap.
+
+Open-PR cap (#77): a ticket with no PR yet publishes (opens its draft PR) only while
+its repo has fewer than ``config.max_open_prs_per_repo`` open ``fman/`` PRs (0 = no
+cap). Open PRs are counted from the store: open tickets with a ``pr_number`` (the poller
+moves a merged or closed PR's ticket to done/dropped). At the cap the ticket *waits*
+like at the lock gate: the passed attempt is kept, nothing is counted or flagged, and
+the ``publish`` job is due again once a PR merges or closes. Attempts still run; a
+ticket that already has a PR (a kickback's retry) is never held.
 """
 
 from __future__ import annotations
@@ -42,7 +50,7 @@ import threading
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-from foreman_inator.db.store import Ticket
+from foreman_inator.db.store import Store, Ticket
 from foreman_inator.routing import escalation
 from foreman_inator.runner.worktree import RepoMirror
 
@@ -53,6 +61,42 @@ BACKOFF_START, BACKOFF_MAX = 30.0, 900.0  # a repo whose job raised waits, doubl
 
 JobKind = Literal["route", "attempt", "publish", "review", "finalize", "rebase"]
 _ORDER = {"in_progress": 0, "testing": 1, "todo": 2}
+_OPEN = tuple(_ORDER)
+#: #77: ``Config.max_open_prs_per_repo``'s default, for configs (test fakes) without it.
+DEFAULT_MAX_OPEN_PRS = 5
+
+
+def open_fman_prs(store: Store, repo: str) -> int:
+    """#77: open ``fman/`` PRs of ``repo``: open tickets that have a PR."""
+    row = store.query(
+        "SELECT COUNT(*) AS n FROM tickets WHERE repo = ? AND pr_number IS NOT NULL"
+        f' AND "column" IN ({", ".join("?" for _ in _OPEN)})',
+        (repo, *_OPEN),
+    )[0]
+    return int(row["n"])
+
+
+def open_pr_cap_wait(store: Store, t: Ticket, cap: int) -> tuple[int, int] | None:
+    """#77: ``(open, cap)`` when ``t`` would open a new PR and ``repo`` is at the cap,
+    else None. ``cap`` 0 means no cap; a ticket that already has a PR never waits."""
+    if cap <= 0 or t.pr_number is not None:
+        return None
+    n = open_fman_prs(store, t.repo)
+    return (n, cap) if n >= cap else None
+
+
+def open_pr_wait_text(store: Store, t: Ticket, cap: int) -> str | None:
+    """#77: the `fman status` WAITING text for a passed attempt held at the cap."""
+    if t.column != "in_progress" or t.flag_reason:
+        return None
+    attempts = store.list_attempts(t.id)
+    last = attempts[-1] if attempts else None
+    if last is None or last.ended_at is None or last.outcome is not None:
+        return None
+    if not last.tests_passed:
+        return None
+    wait = open_pr_cap_wait(store, t, cap)
+    return None if wait is None else f"open-PR cap ({wait[0]}/{wait[1]})"
 
 
 @dataclass(frozen=True)
@@ -143,6 +187,10 @@ class QueueSteps:
         self._sweep: set[str] = set()
         self._repo_locks: dict[str, threading.RLock] = {}
         self._waiting: dict[int, tuple[int, ...]] = {}  # ticket -> lock blockers (logging)
+        self._pr_capped: set[int] = set()  # tickets waiting at the open-PR cap (logging)
+        # #77: repo -> lock held across the open-PR gate and the PR's creation, so two
+        # publishes at cap - 1 (max_parallel_per_repo > 1) cannot both open one.
+        self._pr_open_locks: dict[str, threading.Lock] = {}
 
     # ------------------------------------------------------------------ mirrors
 
@@ -191,6 +239,8 @@ class QueueSteps:
             return "rebase"
         if last is not None and last.outcome is None and last.tests_passed:
             if t.column == "in_progress":
+                if not self.open_pr_gate(t):
+                    return None
                 return "publish" if self._lock_gate(t) else None
             if t.column == "testing" and not any(r.attempt_id == last.id for r in reviews):
                 return "review"
@@ -203,6 +253,32 @@ class QueueSteps:
         if isinstance(step, escalation.HandToUser) or self._lock_gate(t):
             return "attempt"
         return None
+
+    def open_pr_gate(self, t: Ticket) -> bool:
+        """May ``t`` open its PR now (#77)? False while its repo is at the open-PR cap."""
+        cap = getattr(self.config, "max_open_prs_per_repo", DEFAULT_MAX_OPEN_PRS)
+        wait = open_pr_cap_wait(self.store, t, cap)
+        if wait is None:
+            if t.id in self._pr_capped:
+                self._pr_capped.discard(t.id)
+                log.info("ticket %d: below the open-PR cap; publishing", t.id)
+            return True
+        if t.id not in self._pr_capped:
+            self._pr_capped.add(t.id)
+            log.info(
+                "ticket %d: passed; waiting to open its PR: %s has %d/%d open PRs "
+                "(max_open_prs_per_repo)",
+                t.id,
+                t.repo,
+                *wait,
+            )
+        return False
+
+    def pr_open_lock(self, repo: str) -> threading.Lock:
+        """#77: the lock a publish holds from its last open-PR gate check until its new PR
+        is saved on the ticket (see ``PublishSteps.publish_job_for``)."""
+        with self._lock:
+            return self._pr_open_locks.setdefault(repo, threading.Lock())
 
     def _lock_gate(self, t: Ticket) -> bool:
         """May ``t`` start (or publish) now? Locks its wanted files if so (#19)."""
@@ -311,4 +387,14 @@ class QueueSteps:
             log.info("%s: leftover review worktrees removed", repo)
 
 
-__all__ = ["BACKOFF_MAX", "BACKOFF_START", "JOIN_TIMEOUT", "Job", "QueueSteps", "SerialMirror"]
+__all__ = [
+    "BACKOFF_MAX",
+    "BACKOFF_START",
+    "JOIN_TIMEOUT",
+    "Job",
+    "QueueSteps",
+    "SerialMirror",
+    "open_fman_prs",
+    "open_pr_cap_wait",
+    "open_pr_wait_text",
+]
