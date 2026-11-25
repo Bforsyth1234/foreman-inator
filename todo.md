@@ -103,7 +103,8 @@ Package root below is `src/foreman_inator/` (written `pkg/`).
 | 15 | C1: todo #52, #64 (GH #29, #41) · C2: todo #62 (GH #39) · C3: todo #66 (GH #43) · C4: todo #48 (GH #25) · C5: todo #47 data (GH #24) · C6: todo #68, #58 status line (GH #45, #35) | C1 `pkg/proxy/server.py`, `pkg/proxy/pricing.py`, `pkg/runner/opencode.py`, `pkg/config.py`, `tests/fakes/anthropic.py` · C2 `pkg/review/reviewer.py`, `pkg/prompts/reviewer-v2.md` · C3 `pkg/experiments/replay_runner.py`, `pkg/worker_experiments.py` · C4 `pkg/tickets/prompt.py`, `pkg/worker_attempt.py` · C5 `pkg/metrics/quality.py`, `pkg/worker_quality.py`, `pkg/github/client.py`, `tests/fakes/github.py`, `pkg/db/store.py`, `009_post_merge.sql` · C6 `pkg/plugins.py`, `pkg/worker_status.py` (+ own tests). Runner at close: recorder cache counts; reviewer gets the repo's `rules_file`; `review_change(conventions=)` for reviewer rules replays; `fman experiment run --rules`; `QualitySteps` + daily scan in the poll; plugin CLI commands, startup lines, Ollama and plugin lines in `fman status`; SPEC Capture wording and Plugins section | [x] built; live checks open for #52, #64 |
 | 16 | D1: todo #65 (GH #42) · D2: #49 (GH #26) · D3: #47 display (GH #24) · D4: #34 split (GH #16) · D5: #35 (GH #17) · D6: #50 (GH #27) · D7: #77, #70 (GH #70, #59) · D8: #72 (GH #61) | D1 `pkg/rules_show.py`, `pkg/tickets/conventions.py` · D2 `pkg/routing/escalation.py`, `pkg/worker_review.py`, `pkg/spend.py`, `pkg/experiments/shadow.py`, `pkg/experiments/replay_sets.py`, `pkg/tracing/failure_label.py`, `pkg/db/store.py`, `010_local_only.sql` · D3 `pkg/metrics/queries.py`, `pkg/metrics/web.py`, `pkg/routing/knn.py` · D4 `pkg/experiments/split.py`, `pkg/worker_attempt.py`, `pkg/worker_experiments.py` · D5 `pkg/experiments/seeded.py`, `pkg/experiments/replay_runner.py` · D6 `pkg/tickets/decompose.py`, `pkg/prompts/split-v1.md`, `pkg/worker_route.py` · D7 `pkg/sweep.py`, `pkg/worker_queue.py`, `pkg/config.py` · D8 `pkg/review/reviewer.py` (+ own tests). Runner at close: `fman rules show`, `fman repo set-cloud`, `fman experiment split …`, `--mode seeded`, `fman sweep`; config `split_large`, `split_timeout_seconds`, `reviewer_order`; local-only limits/embedder/replay cases/status line; dormant `local_only`, `split_proposed`; reviewer pick + escalation in the review stage; Ollama "slow" status | [x] built; live check open for #77; #34 `ab:pair` open |
 | 17 | E1: todo #60 (GH #37) · E2: #67 (GH #44) · E3: #69 (GH #49) · E4: #36 (GH #18) · E5: #37 (GH #19) · E6: #33 (GH #15) · E7: #78 (GH #71) · E8: #79 (GH #73) · E9: #81 (GH #77) | E1 `pkg/resources/snapshot.py`, `pkg/worker_resources.py`, `pkg/metrics/web.py`, `pkg/metrics/trace_view.py` · E2 `pkg/metrics/experiments_ui.py`, `pkg/metrics/forms.py`, `pkg/worker_experiments.py` · E3 `pkg/experiments/propose.py`, `pkg/experiments/replay_sets.py`, `pkg/prompts/proposer-v1.md`, `pkg/db/store.py`, `011_proposed.sql` · E4 `pkg/tracing/fork.py`, `pkg/tracing/replay.py` · E5 `pkg/routing/classifier.py`, `pkg/worker_route.py` · E6 `pkg/github/relay.py`, `pkg/setup/manifest.py`, `docs/relay.md` · E7 `pkg/tickets/images.py`, `pkg/tickets/prompt.py`, `pkg/worker_attempt.py` · E8 `pkg/retry.py`, `pkg/worker_actions.py` · E9 `pkg/worker_status_comment.py`, `pkg/github/client.py`, `tests/fakes/github.py` (+ own tests). Runner at close: `ResourceSteps` + `StatusCommentSteps` on `Worker`, snapshot per poll, status-comment call sites, relay start/nudge/stop, retry mark in `policy_for`; `fman experiment propose | approve-draft | discard-draft`, `fman replay --fork`, `fman retry`, `fman setup --relay-url`; config `classifier_router`, `classifier_min_tickets`, `relay_url`, `relay_secret_ref`, `status_comment`, `status_label`, `status_show_cost`, `[experiments] proposer_*`, `fork_*`, `[[models]] vision`; `/experiments/manage` in `full_app` with the propose section; replay cutoff + stored images; export/anchor fixes; docs + SPEC | [x] built; live check open for #33; #79's button in wave 18 |
-| — | #34 (`ab:pair`), #38, #39 | unscheduled (SPEC milestone 5; #33, #36, #37 built in wave 17) | open |
+| 18 | F1: todo #38 (GH #20) · F2: #39 (GH #21) · F4: #73 (GH #62) · F5: #74 (GH #63) · F6: #76, #79 button (GH #65, #73) · F7: #71, #75 design (GH #60, #64) · #22 in bot-inator | F1 `packaging/homebrew/`, `docs/homebrew.md` · F2 `pkg/setup/manifest.py`, `docs/publishing.md` · F4 `pkg/metrics/settings_ui.py`, `pkg/worker_config_reload.py` · F5 `pkg/metrics/tiers_ui.py` · F6 `pkg/metrics/activity_ui.py` · F7 `pkg/chat.py`, `docs/chat-design.md` (+ own tests). Runner at close: `fman setup --public` → `run_setup` → `register_app` → `CallbackServer(public=)`, share text / publishing.md pointer; `ConfigReloadSteps` on `Worker`, reload at the top of each poll, `watch_config` in `fman run`, restart text names `RESTART_FIELDS`; `/settings`, `/tiers`, `/activity` (Retry via `web.retry_github`) in `full_app` with one shared nav; docs (commands, configuration, setup, how-it-works, README, releasing), SPEC `--public` line; `tests/test_wave18_wiring.py` | [x] built; #38, #39 user steps open; #71/#75 wait on the user's answers; #22 uncommitted in bot-inator |
+| — | #34 (`ab:pair`) | unscheduled (SPEC milestone 5; #33, #36, #37 built in wave 17; #38, #39 code in wave 18) | open |
 | — | #45–#50 | unscheduled (gap review, 2026-11-23) | open |
 | — | #53–#56 | unscheduled (first live run, 2026-11-23); #45 gained live evidence in the same run | open |
 
@@ -227,7 +228,7 @@ editing SPEC.md.
 
 ### Milestone 3 — bot-inator integration (optional)
 
-#22 — Add a foreman-inator item to bot-inator's todo.md [ ]
+#22 — Add a foreman-inator item to bot-inator's todo.md [~] item #154 added to bot-inator's todo.md (uncommitted in that repo) (wave 18)
 Wave: 7 · Agent: A · Added: 2026-11-23 · Source: spec
 Ask: Open issues from bot-inator chat or ideas, "PR ready" cards, approve or request changes from the iPhone remote.
 DECISIONS (spec, 2026-11-23): bot-inator's consent rules apply (an idea becomes an issue only after its idea card); it talks to GitHub directly, not to the worker.
@@ -248,8 +249,8 @@ Deviations:
 #35 — Seeded-bug reviewer test cases [x] · done 2026-11-25, wave 16, see DONE.md
 #36 — Fork from failure: restart a recorded attempt at its failure step with a new prompt or model [x] · done 2026-11-25, wave 17, see DONE.md
 #37 — Classifier router, then a LoRA router only if it beats the classifier on held-out tickets [x] · done 2026-11-25, wave 17, see DONE.md
-#38 — Homebrew tap [ ] · Added: 2026-11-23 · Source: spec
-#39 — Publish the App for others (each user still runs their own worker) [ ] · Added: 2026-11-23 · Source: spec
+#38 — Homebrew tap [~] code/docs done; user steps listed in docs/homebrew.md (wave 18, F1, GH #20) · Added: 2026-11-23 · Source: spec
+#39 — Publish the App for others (each user still runs their own worker) [~] code/docs done; user steps listed in docs/publishing.md (wave 18, F2, GH #21: `fman setup --public`) · Added: 2026-11-23 · Source: spec
 
 ### Unscheduled (gap review, 2026-11-23)
 
@@ -350,7 +351,7 @@ Asked by the user: "do local llms make sense in this app or should the first tie
 
 #70 — Tier 2 default becomes open-weights cloud (GLM); local 27B becomes optional [x] · done 2026-11-25, wave 16, see DONE.md
 
-#71 — Chat feature: interactive coding sessions through the same tiers and spend caps [ ] · Added: 2026-11-25 · Source: user
+#71 — Chat feature: interactive coding sessions through the same tiers and spend caps [~] design written: docs/chat-design.md; open questions for the user; build waves C1–C4 after answers (wave 18, F7, GH #60) · Added: 2026-11-25 · Source: user
 Ask: after "the main goal of this app is to cancel my max plan at 100 a month", the user said Max also covers interactive Claude Code sessions, then: "yeah ill have to add a chat feature later".
 Why: the worker handles only labeled issues. Interactive coding work also runs on Max today, so canceling Max needs a replacement for that too, or that work moves to pay-per-use API calls with no cap.
 Idea (not designed yet): a chat entry point (`fman chat` or similar) that drives OpenCode in a worktree, using the same model ladder, proxy and spend caps as tickets. It starts on a cheap tier, a command moves it up, and its spend shows next to ticket spend in metrics. Decide later: its own spend cap vs. a share of `monthly_usd`, and whether chat sessions feed the router's data.
@@ -363,29 +364,17 @@ Estimate: not estimated; needs a design pass first. Related: #70.
 Asked by the user: "Would it be useful to add a ui to this app? I want users to be able to change models and providers in tiers easily. and the chat feature needs a ui. The user could also change settings as well in it.", then "add all three pages as todos and open matching github issues. also i think a page where the user can see what is being actively worked on by the agents would be helpful". All four pages grow the existing local metrics app (`metrics/web.py`, Starlette, served by `fman metrics`, loopback only) instead of a separate app. A native Mac app is out of scope until this proves out.
 Shared rules for every page that writes: the POST protection designed in #67 (per-process CSRF token in each form, `Origin` / `Host` must be the page's own loopback origin, 403 and no change otherwise); config writes go through `config.load` / `config.save` so validation is the same as the CLI; API keys go straight to the Keychain (same path as `fman config set-key`) and are never rendered back; everything from GitHub or the database stays HTML-escaped. Build the shared POST layer once, in whichever of #67 / #73 lands first.
 
-#73 — Settings page: edit config from the browser [ ] · Added: 2026-11-25 · Source: user
-Why: every setting is changed today by hand-editing `~/.foreman-inator/config.toml` or a CLI command, and a typo is found only when the worker next loads it.
-Idea: `/settings`: spend caps (`daily_usd`, `monthly_usd`, `experiments_monthly_usd`), `writer_timeout_seconds`, `max_parallel_per_repo`, `allowed_users`, watched repos, and per-repo settings (verify command; the #51 profile and #49 `cloud = false` once they exist). Plain HTML form, no JavaScript. On save: validate, write, and show what changed. The running worker picks the change up on its next pass (re-read config when the file's mtime changes) instead of needing a restart; say so on the page.
-Verify: an invalid value (negative cap, unknown repo) is refused with the same message as `config.load` and the file is unchanged; a valid save round-trips through `config.load`; a POST without the token or with a foreign `Origin` is refused with 403; the worker sees a changed cap without restarting. Non-vacuous: skip validation and the negative-cap test writes the file and fails.
-Estimate: about 1 day with tests.
+#73 — Settings page: edit config from the browser [x] · done 2026-11-25, wave 18, see DONE.md
 
-#74 — Tiers page: models and providers per tier [ ] · Added: 2026-11-25 · Source: user
-Why: changing the ladder (for example #70's GLM at tier 2, or #72's reviewer order) means editing `ModelEndpoint` entries by hand: tier, kind, model id, base URL, family, key reference. That is the main setting the user wants to change easily.
-Idea: `/tiers`: one card per tier listing its endpoints in order, with add / remove / reorder; an endpoint form with provider presets (Ollama, GLM, Anthropic, an OpenAI-compatible URL) that fill in base URL, wire format and family; an API key field that writes to the Keychain and shows only "key set". A "test" button sends one tiny request through the proxy and shows the reply or the provider's error text. The reviewer order (`reviewer_models`) is edited on the same page, and the page warns when a tier has no reviewer from another family (invariant 7f) or when a local-only repo (#49) would have no tier left.
-Verify: added, reordered and removed endpoints round-trip through `config.load`; a key entered on the page lands in the Keychain and never appears in the HTML or the config file; the test button reports a refused key as an error, not success; a config whose writers all share the only reviewer's family shows the warning. Non-vacuous: render the key into the form's value and the "never appears in the HTML" test fails.
-Estimate: about 1 day with tests. Related: #70, #72.
+#74 — Tiers page: models and providers per tier [x] · done 2026-11-25, wave 18, see DONE.md
 
-#75 — Chat page: the UI for #71 [ ] · Added: 2026-11-25 · Source: user
+#75 — Chat page: the UI for #71 [~] design written: docs/chat-design.md; open questions for the user; build waves C1–C4 after answers (wave 18, F7, GH #64) · Added: 2026-11-25 · Source: user
 Why: #71's chat feature needs a place to type, and the rest of the UI lives on this local page.
 Idea: `/chat`: pick a repo, start a session in its own worktree, send messages and see streamed replies (the one page that needs JavaScript: a small inline script reading server-sent events, no external scripts). Shows the current tier and model, a "move up a tier" button, and the running cost against the spend cap. Ends with "open as PR" or "discard worktree". Design depends on #71; do not build before #71's design pass.
 Verify: (after #71's design) a session's messages stream in order; moving up a tier switches the model for the next message only; cost shown matches the spend table; a POST without the token is refused.
 Estimate: several days; re-estimate after #71's design. Related: #71.
 
-#76 — Activity page: what the agents are working on right now [ ] · Added: 2026-11-25 · Source: user
-Why: `fman status` (`worker_status.render_status`) shows the queue only in a terminal and only when run. There is no view that stays open and shows live work: which ticket each agent is on, which model, which step, and for how long.
-Idea: `/activity`: read-only, same data as `render_status` (tickets by state, locks, spend approvals, needs-info, CI waits, flags) plus, for each running attempt, the repo and issue link, model and tier, current step (writing, verify, review, CI), elapsed time against `writer_timeout_seconds`, tokens and cost so far, and a link to its trace (`/traces`). Show loaded local models and memory once #58 / #59 exist. Refresh with a `<meta http-equiv="refresh">` every few seconds so the page needs no JavaScript. Optional later: pause or cancel buttons through the shared POST layer.
-Verify: with fake running attempts in a test store, the page lists each with its model, step and elapsed time, and matches `render_status`'s ticket states; a finished attempt leaves the running list; issue titles are escaped. Non-vacuous: drop the escape and the `<script>`-in-title test fails.
-Estimate: about half a day with tests (read-only). Related: #58, #59, #60.
+#76 — Activity page: what the agents are working on right now [x] · done 2026-11-25, wave 18, see DONE.md
 
 ### Unscheduled (bulk sweep, 2026-11-25)
 
@@ -401,7 +390,7 @@ Asked by the user: "if i respond to a comment for needs info does it pick that c
 
 ### Unscheduled (retry from the UI, 2026-11-25)
 
-#79 — Retry button for a flagged or failed ticket [x] · done 2026-11-25, wave 17, see DONE.md
+#79 — Retry button for a flagged or failed ticket [x] · done 2026-11-25, wave 17 (CLI) and wave 18 (button on `/activity`), see DONE.md
 
 ### Unscheduled (second live run, bot-inator, 2026-11-25)
 

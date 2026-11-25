@@ -96,7 +96,9 @@ review, is [docs/setup.md](docs/setup.md).
 - [docs/how-it-works.md](docs/how-it-works.md): the lifecycle, architecture, escalation, spend caps, experiments and what leaves your Mac
 - [docs/configuration.md](docs/configuration.md): every `config.toml` key
 - [docs/commands.md](docs/commands.md): every `fman` command and option
-- [docs/releasing.md](docs/releasing.md): how a release is cut
+- [docs/publishing.md](docs/publishing.md): letting other people use it (their own App, or `fman setup --public`)
+- [docs/releasing.md](docs/releasing.md): how a release is cut; [docs/homebrew.md](docs/homebrew.md): the Homebrew tap (`brew install` once the tap is live)
+- [docs/chat-design.md](docs/chat-design.md): what's next: the chat feature's design (not built yet)
 - [SPEC.md](SPEC.md): the full design; [DONE.md](DONE.md): what was built and where it differs
 
 This is a personal project with no promised support. It is MIT licensed.

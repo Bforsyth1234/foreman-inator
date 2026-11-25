@@ -206,7 +206,7 @@ def repo_add(
     """Add repos to the list the worker polls (config.toml).
 
     Refused when the App's installation cannot see a repo (then nothing is added). The
-    running worker picks the change up when restarted."""
+    running worker picks the change up on its next poll (no restart needed)."""
     from foreman_inator.setup import repo_add_command
 
     raise typer.Exit(repo_add_command(repos, check=not no_check, echo=typer.echo))
@@ -216,8 +216,8 @@ def repo_add(
 def repo_remove(repos: Annotated[list[str], _REPOS_ARG]) -> None:
     """Take repos out of the list the worker polls (config.toml).
 
-    Their tickets stay in the database and nothing on GitHub changes; once restarted, the
-    worker stops polling the repo and starts no work on its tickets."""
+    Their tickets stay in the database and nothing on GitHub changes; from its next poll
+    the running worker stops polling the repo and starts no work on its tickets."""
     from foreman_inator.setup import repo_remove_command
 
     raise typer.Exit(repo_remove_command(repos, echo=typer.echo))

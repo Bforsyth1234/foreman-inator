@@ -151,7 +151,7 @@ def repo_count_warning(cfg: Config) -> str | None:
         f" {per_hour:,} GitHub requests an hour for the issue listings alone (one per repo"
         f" every {cfg.poll_interval_seconds}s; an installation's limit starts at 5,000 an"
         " hour). Check the list with `fman repo list`, take repos out with `fman repo"
-        " remove OWNER/NAME`, then restart the worker"
+        " remove OWNER/NAME` (the running worker picks the change up on its next poll)"
     )
 
 
@@ -223,6 +223,7 @@ def run_worker(*, once: bool = False) -> int:
         traces_dir=paths.traces_dir(),
         ollama_watch=ollama_watch_for(cfg),  # #52
     )
+    worker.watch_config(paths.config_path())  # #73 (GH #62): reload on change
     old = install_signal_handlers(worker)
     try:
         worker.recover()

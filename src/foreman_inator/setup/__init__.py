@@ -31,6 +31,7 @@ import typer
 from foreman_inator import config, paths
 from foreman_inator.github.app_auth import API_URL, AppAuth, GitHubError, Installation
 from foreman_inator.setup import deps, launchd, manifest
+from foreman_inator.worker_config_reload import RESTART_FIELDS
 
 Echo = Callable[[str], None]
 #: Asks the user one question and returns the typed answer (``typer.prompt`` in the CLI).
@@ -50,8 +51,9 @@ _REPO_RE = re.compile(r"^[\w.-]+/[\w.-]+$")
 _MAX_ASKS = 3
 _SHOWN = 10  # repo names printed inline before "... and N more"
 RESTART_TEXT = (
-    "The worker reads config.toml only when it starts. Restart it to pick this up:\n"
-    "  launchctl kickstart -k gui/$(id -u)/com.foreman-inator.worker\n"
+    "The running worker picks this up on its next poll (it re-reads config.toml when it"
+    " changes). Only these fields need a restart: " + ", ".join(RESTART_FIELDS) + ".\n"
+    "To restart: launchctl kickstart -k gui/$(id -u)/com.foreman-inator.worker\n"
     "(If you run `fman run` by hand instead, stop it with Ctrl-C and start it again.)"
 )
 
@@ -75,10 +77,14 @@ def register_app(
     api_url: str = API_URL,
     timeout: float = manifest.CALLBACK_TIMEOUT_SECONDS,
     relay_url: str | None = None,
+    public: bool = False,
 ) -> manifest.AppCredentials:
     """Run the manifest flow in the browser and return the new App's credentials.
-    ``relay_url`` (#15): the App is registered with its webhook pointed there."""
-    with manifest.CallbackServer(org=org, app_name=app_name, relay_url=relay_url) as server:
+    ``relay_url`` (#15): the App is registered with its webhook pointed there.
+    ``public`` (#39, ``--public``): other GitHub accounts may install the App."""
+    with manifest.CallbackServer(
+        org=org, app_name=app_name, relay_url=relay_url, public=public
+    ) as server:
         echo(f"Opening your browser to create the App: {server.start_url}")
         opener(server.start_url)
         code = server.wait_for_code(timeout)
@@ -131,13 +137,16 @@ def run_setup(
     clock: manifest.Clock = time.monotonic,
     sleep: manifest.Sleep = time.sleep,
     relay_url: str | None = None,
+    public: bool = False,
 ) -> SetupResult:
     """``repos``: the repos to work on (``--repo``), replacing the list; None leaves the
     choice to ``choose_repos`` (ask through ``ask`` on a first run, or keep the list).
     ``ask`` None means no terminal: nothing is asked and the list is not widened.
     ``relay_url`` (#15, ``--relay-url``): a new App gets its webhook pointed at the relay,
     and the webhook secret GitHub returns is stored in the Keychain
-    (``relay-webhook-secret``); ``relay_url`` and ``relay_secret_ref`` are saved."""
+    (``relay-webhook-secret``); ``relay_url`` and ``relay_secret_ref`` are saved.
+    ``public`` (#39, ``--public``): a new App is registered public; an existing App's
+    visibility is changed on GitHub (docs/publishing.md)."""
     cfg = config.load()
     on_disk = cfg
     key_path = paths.app_key_path()
@@ -150,6 +159,12 @@ def run_setup(
             cfg = manifest.add_allowed_users(cfg, allowed_users)
         if relay_url and relay_url != cfg.relay_url:
             cfg = _with_relay(cfg, relay_url, "", echo)
+        if public:
+            echo(
+                "--public only applies when setup creates the App. To make this App public,"
+                " change its visibility in the App's settings on GitHub; docs/publishing.md"
+                " explains how."
+            )
     else:
         creds = register_app(
             opener=opener,
@@ -160,6 +175,7 @@ def run_setup(
             api_url=api_url,
             timeout=callback_timeout,
             relay_url=relay_url,
+            public=public,
         )
         paths.write_app_key(creds.pem)
         cfg = manifest.apply_app(cfg, creds, allowed_users)
@@ -169,6 +185,8 @@ def run_setup(
         on_disk = cfg
         result.created_app = True
         echo(f"Created App {creds.slug} (id {creds.app_id}); key saved to {key_path}.")
+        if public:
+            echo(manifest.public_app_text(creds.slug))
     if not cfg.allowed_users:
         echo(
             "Warning: allowed_users is empty, so no label will start work. "
@@ -769,6 +787,13 @@ def setup_command(
             show_default=False,
         ),
     ] = None,
+    public: Annotated[
+        bool,
+        _opt(
+            "--public",
+            help="let other GitHub accounts install your App; the key stays on this Mac",
+        ),
+    ] = False,
 ) -> None:
     """Register your own GitHub App, check dependencies and install the launchd agent.
 
@@ -804,6 +829,7 @@ def setup_command(
             ask=_prompt if interactive else None,
             install_service=not no_service,
             relay_url=relay_url,
+            public=public,
         )
     except (manifest.ManifestFlowError, launchd.ServiceError, config.ConfigError) as exc:
         typer.echo(f"Setup stopped: {exc}", err=True)

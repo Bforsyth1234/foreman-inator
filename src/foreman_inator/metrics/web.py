@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import html
 import ipaddress
+import logging
 import socket
 import sqlite3
 import threading
@@ -50,6 +51,8 @@ from foreman_inator.metrics import queries as q
 from foreman_inator.pr.publisher import format_cost
 from foreman_inator.pr.summary import format_duration
 from foreman_inator.resources import snapshot as res
+
+log = logging.getLogger("foreman_inator.metrics")
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8642
@@ -836,13 +839,27 @@ def full_app(
 ) -> ASGIApp:
     """The page ``fman metrics`` serves: the metrics page, the trace view (#28), the
     failure-step and experiment pages and ``/resources`` (#60, from ``resources_path``,
-    default ``<home>/run/resources.json``), all behind the loopback guard."""
+    default ``<home>/run/resources.json``), ``/settings`` (#73), ``/tiers`` (#74) and
+    ``/activity`` (#76) with its Retry button (#79), all behind the loopback guard and all
+    sharing one nav."""
     from foreman_inator.config import Config
-    from foreman_inator.metrics import experiments_ui, trace_view
+    from foreman_inator.metrics import (
+        activity_ui,
+        experiments_ui,
+        settings_ui,
+        tiers_ui,
+        trace_view,
+    )
     from foreman_inator.routing import escalation, explore
 
     cfg = config if config is not None else Config()
-    nav = (*M4_NAV, experiments_ui.NAV_ENTRY)  # #67: the page that runs experiments
+    nav = (  # #67 experiments, wave 18: settings #73, tiers #74, activity #76
+        *M4_NAV,
+        experiments_ui.NAV_ENTRY,
+        activity_ui.NAV_ENTRY,
+        settings_ui.NAV_ENTRY,
+        tiers_ui.NAV_ENTRY,
+    )
     res_path = resources_path if resources_path is not None else res.default_path()
     ladder = escalation.build_ladder(cfg.models)
     plain = trace_view.store_rows_for(
@@ -881,8 +898,35 @@ def full_app(
         *experiments_ui.routes(
             store_path, load_config=(lambda: cfg) if config is not None else None, nav=nav
         ),
+        *settings_ui.routes(store_path, nav=nav),  # #73: edit config.toml (FormGuard)
+        *tiers_ui.routes(store_path, nav=nav),  # #74: models per tier (FormGuard)
+        *activity_ui.routes(  # #76: what runs now; #79: its Retry button (FormGuard)
+            store_path,
+            load_config=(lambda: cfg) if config is not None else None,
+            nav=nav,
+            resources_path=res_path,
+            traces_dir=traces_dir,
+            api_factory=retry_github,
+        ),
     ]  # fmt: skip
     return create_app(store_path, extra_routes=routes, nav=nav, resources_path=res_path)
+
+
+def retry_github(cfg: Any) -> Any:
+    """The GitHub client ``fman retry`` builds (``/activity``'s Retry, #79): None without
+    App credentials, or when GitHub cannot be reached (only a dropped ticket needs it)."""
+    from foreman_inator import paths
+
+    key_path = paths.app_key_path()
+    if cfg.app_id is None or not cfg.installation_ids or not key_path.exists():
+        return None
+    from foreman_inator.worker_run import build_github
+
+    try:
+        return build_github(cfg, key_path)
+    except Exception as exc:  # noqa: BLE001 - flagged tickets retry without it
+        log.warning("retry: GitHub not reachable: %s", type(exc).__name__)
+        return None
 
 
 def metrics_url(host: str, port: int, **params: str) -> str:

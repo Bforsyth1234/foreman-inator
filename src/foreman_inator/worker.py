@@ -120,6 +120,12 @@ Wave 17 (wired at the wave's close)
   verify, review, PR opened, hand-over and drop (``worker_attempt``, ``worker_actions``,
   ``worker_review``).
 
+Wave 18 (wired at the wave's close)
+-----------------------------------
+* #73 (GH #62) config reload: ``ConfigReloadSteps.maybe_reload_config`` at the top of
+  every ``poll_and_handle``; ``fman run`` calls ``watch_config(paths.config_path())``.
+  ``RESTART_FIELDS`` keep their running values until a restart.
+
 Shutdown: SIGINT/SIGTERM set the stop flag and every running job's cancel event; the
 OpenCode driver aborts its session and kills its process group, verify and the reviewer
 kill their commands, a cut-short attempt is stored as ``superseded``, a cut-short review
@@ -155,6 +161,7 @@ from foreman_inator.tickets.lifecycle import Action, IllegalTransition
 from foreman_inator.worker_actions import ActionHandlers, Ctx, flag_comment
 from foreman_inator.worker_attempt import AttemptSteps
 from foreman_inator.worker_background import BackgroundSteps
+from foreman_inator.worker_config_reload import ConfigReloadSteps
 from foreman_inator.worker_install import InstallSteps
 from foreman_inator.worker_pause import PauseSteps
 from foreman_inator.worker_prune import PruneSteps
@@ -189,6 +196,7 @@ class Worker(
     QualitySteps,
     ResourceSteps,
     StatusCommentSteps,
+    ConfigReloadSteps,
 ):
     def __init__(
         self,
@@ -434,6 +442,7 @@ class Worker(
     # ------------------------------------------------------------------ events
 
     def poll_and_handle(self) -> None:
+        self.maybe_reload_config()  # #73 (GH #62): a changed config.toml applies now
         self._local.pending, ready = [], []
         self._local.ready = ready
         try:

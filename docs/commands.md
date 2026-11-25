@@ -48,6 +48,7 @@ setup asks which ones to work on (or takes `--repo`), and a re-run leaves the
 | `--no-service` | Skip installing the launchd agents. |
 | `--repo <owner/name>` | A repo to work on. Repeatable. Replaces the `repos` list, with no question. |
 | `--relay-url <url>` | A webhook relay (https; http only for localhost) whose deliveries trigger an early poll. A new App gets its webhook pointed there and its webhook secret is stored in the Keychain (`relay-webhook-secret`); for an existing App, see [relay.md](relay.md). |
+| `--public` | Let other GitHub accounts install your App; the key stays on this Mac. Off by default (the App is private). Applies only when setup creates the App: it then prints the install link to share. With an App that already exists, it says to change the visibility on GitHub instead. Read [publishing.md](publishing.md) first. |
 
 ## `fman config set-key`
 
@@ -87,8 +88,17 @@ Serve the metrics page on 127.0.0.1 (Ctrl-C stops it). Pages: `/`,
 `/api/metrics`, `/traces`, `/failures`, `/experiments`, `/resources` (the
 models Ollama holds, memory and local slots, from the snapshot the worker
 writes once per poll) and `/experiments/manage` (start, stop, cancel, propose
-and promote experiments; its buttons are the only writes, each behind a form
-token and a loopback check).
+and promote experiments), `/activity` (what the agents are working on now:
+running attempts with model, step, elapsed time and cost, the `fman status`
+queue, and a **Retry** button on each flagged ticket that does what
+`fman retry <ticket> [--up]` does), `/settings` (edit spend caps, timeouts,
+`allowed_users`, repos and per-repo settings; a save is validated like
+`config.load` and the running worker picks it up on its next poll, except the
+fields listed under [configuration.md](configuration.md)) and `/tiers` (models
+and providers per tier, reviewer order, a Test button per endpoint; API keys go
+to the Keychain and are never shown). Every page lists all the others in its
+nav. Buttons are the only writes, each behind a form token and a loopback
+check.
 
 | Option | Meaning |
 | --- | --- |
@@ -114,8 +124,8 @@ Add repos to the list the worker polls (`repos` in `config.toml`). Each one is
 checked against what the App's installation can see. If any is not visible,
 nothing is added, and the command prints the installation's settings URL to
 grant access there. Without App credentials (before `fman setup`) the check is
-skipped, and the command says so. Restart the worker afterwards: the command
-prints the `launchctl kickstart` line.
+skipped, and the command says so. The running worker picks the change up on
+its next poll; no restart is needed.
 
 | Option | Meaning |
 | --- | --- |
@@ -128,9 +138,9 @@ fman repo remove <owner/name> [<owner/name> ...]
 ```
 
 Take repos out of the list the worker polls. Their tickets stay in the
-database and nothing on GitHub changes. Once restarted, the worker stops
-polling the repo and starts no work on its tickets. The command prints how
-many open tickets each removed repo has, and the restart line. It exits 1 when
+database and nothing on GitHub changes. From its next poll the running worker
+stops polling the repo and starts no work on its tickets. The command prints
+how many open tickets each removed repo has. It exits 1 when
 none of the names was in the list.
 
 ## `fman repo list`

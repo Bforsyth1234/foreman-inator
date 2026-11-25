@@ -30,6 +30,9 @@ pipx install --preinstall "fde-kit @ git+https://github.com/Bforsyth1234/fde-kit
 `uv tool install foreman-inator` and `pipx install foreman-inator` (from PyPI) do not work
 yet. The package is not published, and it could not be installed from PyPI if it were.
 
+A Homebrew tap comes after PyPI: [homebrew.md](homebrew.md) has the formula template and
+the maintainer's steps.
+
 ## The fde-kit problem
 
 `pyproject.toml` lists `fde-kit` as a plain dependency and points uv at GitHub for it in

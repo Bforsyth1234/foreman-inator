@@ -1,8 +1,15 @@
 # Configuration
 
 The worker reads `~/.foreman-inator/config.toml` (or
-`$FOREMAN_INATOR_HOME/config.toml`) once, when it starts; restart it after an
-edit (see [setup.md](setup.md#8-stopping-restarting-and-uninstalling)).
+`$FOREMAN_INATOR_HOME/config.toml`) when it starts and again whenever the file
+changes (checked at the top of each poll). A changed value applies from the
+next poll, whether you edit the file by hand, use `fman repo add` / `remove`,
+or save on the metrics page's `/settings` or `/tiers`. A file that does not
+validate is not applied: the worker keeps its old config and logs the error.
+These fields are read once at start and need a restart
+(see [setup.md](setup.md#8-stopping-restarting-and-uninstalling)); the worker
+logs `<field> changed; restart the worker to apply it`: `app_id`, `app_slug`, `installation_ids`, `models`, `sandbox`, `sandbox_network`, `sandbox_install`, the `embedding_*` keys, `allow_cloud_embedder`, `max_local_inference`, `relay_url` and `relay_secret_ref`
+(`RESTART_FIELDS` in `src/foreman_inator/worker_config_reload.py`).
 `fman setup` writes the file with every key filled in, so you edit values
 rather than add keys. Every key is optional; a missing key takes the default
 below. The source of truth is `src/foreman_inator/config.py`.

@@ -109,6 +109,10 @@ Options (see [commands.md](commands.md#fman-setup)):
 - `--repo <owner/name>`: work on exactly these repos, without a question.
   Repeatable. It replaces the `repos` list in `config.toml`; a repo the App's
   installation cannot see is not added and setup says so.
+- `--public`: create the App as public, so other GitHub accounts can install
+  it and your worker works on their repos. The key stays on your Mac. Off by
+  default; read [publishing.md](publishing.md) first (for most people, each
+  person creating their own App is the better choice).
 
 What happens, in order:
 
@@ -200,16 +204,14 @@ the worker would only get errors polling one it cannot see. If one is not
 visible, nothing is added and the command prints the installation's settings
 URL, where **Repository access** adds the repo (`--no-check` skips the check).
 `fman repo remove` deletes nothing: the repo's tickets stay in the database
-and nothing on GitHub changes. After a restart the worker stops polling that
-repo and starts no work on its tickets. Add the repo back to pick them up
+and nothing on GitHub changes. From its next poll the worker stops polling
+that repo and starts no work on its tickets. Add the repo back to pick them up
 again.
 
-The worker reads `config.toml` only when it starts, so restart it after either
-command (both print this):
-
-```bash
-launchctl kickstart -k gui/$(id -u)/com.foreman-inator.worker
-```
+The running worker re-reads `config.toml` when it changes, so either command
+applies from its next poll without a restart. Only the fields listed in
+[configuration.md](configuration.md) (the App identity, the model ladder, the
+sandbox, the embedder, the relay) need one.
 
 When the list has more than 20 repos, the worker's log starts with a warning
 that gives the count and about how many GitHub requests an hour the issue
@@ -427,7 +429,7 @@ cloud spend line and the sandbox line.
 | `WAITING: GitHub CI on the PR head` | Local checks passed; the worker waits for the PR's CI. | Nothing. With no CI after 2 minutes it continues; still pending after 30 minutes, it continues with a note. A red job sends the change back with the job's log. |
 | `WAITING: needs-info: answer the question on the issue, or remove the label` | The bot asked questions on a vague issue. | Answer in a comment, or remove `needs-info`. |
 | `FLAGGED: <reason>` | The ticket was handed to you. The reason starts with a code, for example `checks_failed`, `kickback_cap`, `ai_kickback_cap`, `kickback_wrong`, `reviewer_handover`, `no_reviewer`, `review_skipped`, `rebase_cap`, `no_verify_command`, `sandbox_unavailable`, `interrupted`, `publish_failed`. The same explanation is on the issue. | Review the PR if there is one. For `no_verify_command`, run `fman repo set-verify`. Otherwise fix the cause and start the ticket over. |
-| `Repos: N in config.toml (fman repo list).` | How many repos the worker polls. Above 20 it adds the hourly GitHub request estimate. | `fman repo remove <owner/name>` for any you do not want worked on, then restart the worker. |
+| `Repos: N in config.toml (fman repo list).` | How many repos the worker polls. Above 20 it adds the hourly GitHub request estimate. | `fman repo remove <owner/name>` for any you do not want worked on (applies on the next poll). |
 | `Sandbox: on (sandbox-exec).` | Model-written code runs sandboxed. | Nothing. |
 | `!!! Sandbox: OFF (sandbox = "off" in config): model-written code runs unsandboxed. !!!` | `sandbox = "off"` is set. | Set it back to `"on"` unless you accept the risk. |
 | `cloud spend: $X of $5.00 today, $Y of $50.00 this month; experiments ...` | Spend against the caps. | Change the caps in `[spend_caps]`. |
@@ -443,12 +445,14 @@ ran for that ticket: the sandbox fails closed. `sandbox = "off"` in
 fman metrics
 ```
 
-serves a read-only page at `http://127.0.0.1:8642` (`--port` to change it):
+serves a local page at `http://127.0.0.1:8642` (`--port` to change it):
 accept rates, kickbacks, escalation, cost per accepted ticket and trend lines,
 per model, filterable by model, repo and dates. It also has `/traces` (step
 through a recorded ticket), `/failures`, `/experiments`, `/resources` (what
-Ollama holds, memory and local slots) and `/experiments/manage` (start,
-propose and promote experiments). See
+Ollama holds, memory and local slots), `/experiments/manage` (start,
+propose and promote experiments), `/activity` (live work, with a Retry button
+on flagged tickets), `/settings` (edit config; saved changes apply on the
+worker's next poll) and `/tiers` (models and providers per tier). See
 [how-it-works.md](how-it-works.md#metrics-and-the-trace-viewer).
 
 ## 8. Stopping, restarting and uninstalling
@@ -460,8 +464,9 @@ launchctl:
 launchctl bootout gui/$(id -u)/com.foreman-inator.worker
 ```
 
-This lasts until your next login. To restart it after editing `config.toml`
-(the worker reads the file only at start):
+This lasts until your next login. To restart it (needed only after changing
+one of the fields [configuration.md](configuration.md) lists as read at
+start):
 
 ```bash
 launchctl kickstart -k gui/$(id -u)/com.foreman-inator.worker
