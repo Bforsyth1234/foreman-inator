@@ -122,7 +122,12 @@ SOURCE = "knn"
 
 
 class EmbedError(Exception):
-    """An embedding call failed; the message says how."""
+    """An embedding call failed; the message says how. ``status`` is the HTTP status when
+    the call got an error answer."""
+
+    def __init__(self, message: str, *, status: int | None = None, code: str | None = None):
+        super().__init__(message)
+        self.status, self.code = status, code
 
 
 # --------------------------------------------------------------------------- endpoint
@@ -247,7 +252,7 @@ def _post(url: str, body: dict[str, Any], timeout: float) -> Any:
     except httpx.HTTPError as exc:
         raise EmbedError(f"proxy unreachable ({type(exc).__name__})") from exc
     if status >= 400:
-        raise EmbedError(f"HTTP {status}")
+        raise EmbedError(f"HTTP {status}", status=status, code=_error_code(bytes(buf)))
     try:
         return json.loads(bytes(buf))
     except ValueError as exc:
@@ -294,8 +299,38 @@ def embed_texts(
         raise EmbedError("no model proxy given")
     body = {"model": embedder.name, "input": list(texts)}
     with proxy.context(label="embed") as ctx:
-        data = _post_with_deadline(ctx.base_url.rstrip("/") + "/embeddings", body, timeout)
+        try:
+            data = _post_with_deadline(ctx.base_url.rstrip("/") + "/embeddings", body, timeout)
+        except EmbedError as exc:
+            if exc.status == 404 and exc.code not in PROXY_404_CODES:
+                raise EmbedError(_not_found(embedder), status=404) from exc
+            raise
     return _parse_embeddings(data, len(texts))
+
+
+#: 404s the proxy itself answers (a dead context, a bad path): not a missing model.
+PROXY_404_CODES = frozenset({"unknown_context", "unknown_endpoint"})
+
+
+def _error_code(data: bytes) -> str | None:
+    """``error.code`` of an OpenAI-style error body, if there is one."""
+    try:
+        err = json.loads(data).get("error")
+    except (ValueError, AttributeError):
+        return None
+    code = err.get("code") if isinstance(err, dict) else None
+    return code if isinstance(code, str) else None
+
+
+def _not_found(embedder: ModelEndpoint) -> str:
+    """#51: a 404 from the embeddings call means the model is not there (Ollama answers
+    404 for a model that is not pulled). Name it and say how to fix it."""
+    if embedder.is_cloud:
+        return f"HTTP 404: embedding model {embedder.model} not found at {embedder.base_url}"
+    return (
+        f"HTTP 404: embedding model {embedder.model} is not pulled in Ollama; "
+        f"run: ollama pull {embedder.model}"
+    )
 
 
 # --------------------------------------------------------------------------- store

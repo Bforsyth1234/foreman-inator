@@ -64,7 +64,11 @@ class FakeGitHub:
         self.requests: list[httpx.Request] = []
         self.installation_polls = 0
         self.installed_after = 2  # the App shows up on the second poll
-        self.pulled = pulled if pulled is not None else ["inkling-2-mini:latest", "qwen3.8:27b"]
+        self.pulled = (
+            pulled
+            if pulled is not None
+            else ["inkling-2-mini:latest", "qwen3.8:27b", "embeddinggemma:latest"]
+        )
         # /installation/repositories pages; three repos picked one by one by default (#56)
         self.pages = [["octocat/one", "octocat/two"], ["octocat/three"]]
         self.selection = "selected"
@@ -416,7 +420,7 @@ def test_ollama_unreachable_is_reported():
         raise httpx.ConnectError("refused", request=request)
 
     checks = deps.check_models(config.Config(), transport=httpx.MockTransport(down))
-    assert len(checks) == 2
+    assert len(checks) == 3  # tier 1, tier 2, the embedding model (#51)
     assert all(not c.ok and "not reachable" in c.detail for c in checks)
     assert checks[0].fix.endswith("ollama pull inkling-2-mini")
 
