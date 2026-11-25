@@ -241,6 +241,9 @@ class RepoSettings:
     # migration 008 (#51): the repo profile; None means "normal".
     writer_mode: WriterMode | None = None
     review_mode: ReviewMode | None = None
+    # migration 010 (#49): False means "local only": the repo's code never goes to a
+    # cloud model. Rows from before 010 (and repos with no row) are True.
+    cloud: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -294,7 +297,7 @@ class Migration:
 # --- Conversions ----------------------------------------------------------------------
 
 _BOOL_FIELDS = frozenset(
-    {"tests_passed", "build_passed", "tests_nonvacuous", "shadow", "ci_passed"}
+    {"tests_passed", "build_passed", "tests_nonvacuous", "shadow", "ci_passed", "cloud"}
 )
 _JSON_TUPLE_FIELDS = frozenset({"owned_files"})
 
@@ -1204,6 +1207,36 @@ class Store:
         settings = self.get_repo_settings(repo)
         assert settings is not None
         return settings
+
+    def set_cloud(self, repo: str, cloud: bool) -> RepoSettings:
+        """Save ``repo``'s cloud setting (#49). False is "local only": the repo's code
+        never goes to a cloud model (escalation, review, spend gate, experiments)."""
+        now = _ts(self.now())
+        with self.transaction() as conn:
+            conn.execute(
+                "INSERT INTO repo_settings (repo, cloud, updated_at) VALUES (?, ?, ?)"
+                " ON CONFLICT (repo) DO UPDATE SET cloud = excluded.cloud,"
+                " updated_at = excluded.updated_at",
+                (repo, int(bool(cloud)), now),
+            )
+        settings = self.get_repo_settings(repo)
+        assert settings is not None
+        return settings
+
+    def repo_allows_cloud(self, repo: str | None) -> bool:
+        """False only when ``repo`` is set local only (#49). A repo with no settings row,
+        or None (no repo known), allows cloud: the default (invariant 7c's caps apply)."""
+        if not repo:
+            return True
+        settings = self.get_repo_settings(repo)
+        return True if settings is None else bool(settings.cloud)
+
+    def local_only_repos(self) -> frozenset[str]:
+        """Every repo set local only (#49)."""
+        if not self._has_column("repo_settings", "cloud"):
+            return frozenset()
+        rows = self.query("SELECT repo FROM repo_settings WHERE cloud = 0")
+        return frozenset(r["repo"] for r in rows)
 
     def mark_verify_prompted(self, repo: str) -> bool:
         """Record the one-time "no verify command" flag. True only on the first call."""

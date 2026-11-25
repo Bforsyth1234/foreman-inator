@@ -48,7 +48,9 @@ showed it); whether any test file was edited; the review's check results.
 
 Invariant 7c: the call goes only through the model proxy (``proxy.context(label=
 "failure_label")``) to a local model (``default_classifier(config)`` unless ``labeler`` is
-given); a cloud labeler is refused unless ``allow_cloud=True``. The writer's own text is in
+given); a cloud labeler is refused unless ``allow_cloud=True``, and always (``allow_cloud``
+or not) for a ticket whose repo is set local only (#49, ``cloud = false``; read with
+``store.repo_allows_cloud`` when the store has it). The writer's own text is in
 the recording and is shown here: this is analysis after the fact, not the reviewer, so
 invariant 7f is not in play. All recorded and GitHub text is fenced and defused.
 
@@ -791,6 +793,13 @@ def label_kickback(
     return result
 
 
+def _repo_allows_cloud(store: Any, ticket: Any) -> bool:
+    """#49: False when the ticket's repo is set local only. A store stand-in without the
+    setting allows cloud (the ``allow_cloud`` gate still applies)."""
+    check = getattr(store, "repo_allows_cloud", None)
+    return True if check is None else bool(check(getattr(ticket, "repo", None)))
+
+
 def _store(store: Any, kickback: Any, label: str, index: int | None, force: bool) -> bool:
     """Write unless someone labeled the row meanwhile (and we are not forcing)."""
     if not force and store.get_kickback(kickback.id).failure_step is not None:
@@ -848,6 +857,13 @@ def _label(
     clf = labeler or default_classifier(models)
     if clf is None:
         return none("no local model configured to label with", summary=summary)
+    if clf.is_cloud and not _repo_allows_cloud(store, ticket):
+        return none(
+            f"labeler {clf.name} is a cloud model and {ticket.repo} is local only "
+            "(cloud = false); its code stays on the Mac (#49)",
+            labeler=clf.name,
+            summary=summary,
+        )
     if clf.is_cloud and not allow_cloud:
         return none(
             f"labeler {clf.name} is a cloud model; traces stay on the Mac (7c)",
