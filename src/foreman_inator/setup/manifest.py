@@ -9,9 +9,13 @@ Shapes relied on (rule 12, read 2026-11-23):
   https://docs.github.com/en/apps/sharing-github-apps/registering-a-github-app-from-a-manifest
 - Manifest keys: ``name``, ``url`` (required), ``hook_attributes``, ``redirect_url``,
   ``callback_urls``, ``setup_url``, ``description``, ``public``, ``default_events``,
-  ``default_permissions``, ``request_oauth_on_install``, ``setup_on_update``. We send no
-  ``hook_attributes`` and no ``default_events``: the worker polls, and an App may be
-  registered with webhooks off and no webhook URL.
+  ``default_permissions``, ``request_oauth_on_install``, ``setup_on_update``. By default we
+  send no ``hook_attributes`` and no ``default_events``: the worker polls, and an App may be
+  registered with webhooks off and no webhook URL. Only when the user configured a webhook
+  relay (todo #33, ``relay_url``) does the manifest gain ``hook_attributes`` (``url``: where
+  GitHub POSTs, ``active``: deliver, default true) and ``default_events`` (read 2026-11-25).
+  GitHub creates the webhook secret itself and returns it as ``webhook_secret`` from the
+  conversion; the manifest cannot set one.
   https://docs.github.com/en/apps/creating-github-apps/registering-a-github-app/using-webhooks-with-github-apps
 - ``POST /app-manifests/{code}/conversions`` (no auth) -> 201 with ``id``, ``slug``,
   ``owner`` (``login``, ``type``), ``html_url``, ``client_id``, ``client_secret``,
@@ -53,12 +57,18 @@ from foreman_inator.github.app_auth import (
     default_headers,
     raise_for_status,
 )
+from foreman_inator.github.relay import check_relay_url
 
 GITHUB_URL = "https://github.com"
 HOMEPAGE_URL = "https://github.com/Bforsyth1234/foreman-inator"
 APP_DESCRIPTION = (
     "Personal foreman-inator worker: turns labeled issues into draft PRs written by "
     "local and cloud models. Runs on the owner's Mac; polls, no webhook."
+)
+APP_DESCRIPTION_RELAY = (
+    "Personal foreman-inator worker: turns labeled issues into draft PRs written by "
+    "local and cloud models. Runs on the owner's Mac; polls, and the owner's webhook "
+    "relay triggers an early poll."
 )
 
 # SPEC "Architecture and GitHub mapping": exactly these, nothing more. ``checks`` and
@@ -82,6 +92,19 @@ ADDED_PERMISSIONS: dict[str, tuple[str, str]] = {
 }
 _LEVEL = {"read": 1, "write": 2}
 
+#: Events a relay-enabled App subscribes to (todo #33): what the poller reacts to (labels,
+#: edits, comments, PR state and reviews). Each is covered by PERMISSIONS: ``issues`` and
+#: ``issue_comment`` need Issues, the ``pull_request*`` events need Pull requests
+#: (https://docs.github.com/en/webhooks/webhook-events-and-payloads, read 2026-11-25).
+#: A delivery only nudges an early poll (github/relay.py); it never decides anything.
+RELAY_EVENTS: tuple[str, ...] = (
+    "issues",
+    "issue_comment",
+    "pull_request",
+    "pull_request_review",
+    "pull_request_review_comment",
+)
+
 CALLBACK_PATH = "/callback"
 START_PATH = "/start"
 MAX_APP_NAME = 34  # GitHub's limit on App names
@@ -103,12 +126,17 @@ def default_app_name() -> str:
     return f"foreman-inator-{secrets.token_hex(3)}"
 
 
-def build_manifest(redirect_url: str, name: str | None = None) -> dict[str, Any]:
-    """The manifest GitHub registers: private App, SPEC permissions, no webhook."""
+def build_manifest(
+    redirect_url: str, name: str | None = None, *, relay_url: str | None = None
+) -> dict[str, Any]:
+    """The manifest GitHub registers: private App, SPEC permissions, no webhook.
+
+    With ``relay_url`` (the user's own webhook relay, todo #33) GitHub delivers webhooks
+    there: ``hook_attributes`` and ``default_events`` are added, nothing else changes."""
     name = name or default_app_name()
     if len(name) > MAX_APP_NAME:
         raise ValueError(f"App name {name!r} is longer than {MAX_APP_NAME} characters")
-    return {
+    built: dict[str, Any] = {
         "name": name,
         "url": HOMEPAGE_URL,
         "description": APP_DESCRIPTION,
@@ -116,6 +144,11 @@ def build_manifest(redirect_url: str, name: str | None = None) -> dict[str, Any]
         "public": False,
         "default_permissions": dict(PERMISSIONS),
     }
+    if relay_url:
+        built["description"] = APP_DESCRIPTION_RELAY
+        built["hook_attributes"] = {"url": check_relay_url(relay_url), "active": True}
+        built["default_events"] = list(RELAY_EVENTS)
+    return built
 
 
 def new_app_url(state: str, org: str | None = None) -> str:
@@ -172,14 +205,20 @@ class _LoopbackHTTPServer(ThreadingHTTPServer):
 class CallbackServer:
     """One-shot server on 127.0.0.1: serves the start page, then waits for ``?code=``."""
 
-    def __init__(self, *, org: str | None = None, app_name: str | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        org: str | None = None,
+        app_name: str | None = None,
+        relay_url: str | None = None,
+    ) -> None:
         self.state = secrets.token_urlsafe(24)
         self._code: str | None = None
         self._event = threading.Event()
         self._server = _LoopbackHTTPServer(("127.0.0.1", 0), self._handler())
         host, port = self._server.server_address[:2]
         self.base_url = f"http://127.0.0.1:{port}"
-        self.manifest = build_manifest(self.base_url + CALLBACK_PATH, app_name)
+        self.manifest = build_manifest(self.base_url + CALLBACK_PATH, app_name, relay_url=relay_url)
         self.action = new_app_url(self.state, org)
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
 
@@ -240,7 +279,10 @@ class CallbackServer:
 
 @dataclass(frozen=True)
 class AppCredentials:
-    """What setup keeps from the conversion response (client/webhook secrets are dropped)."""
+    """What setup keeps from the conversion response (the client secret is dropped).
+
+    ``webhook_secret`` is kept so setup can store it in the Keychain for the relay
+    (todo #33); it is never printed (see ``__repr__``) and is "" when GitHub sent none."""
 
     app_id: int
     slug: str
@@ -249,6 +291,7 @@ class AppCredentials:
     owner_type: str  # "User" or "Organization"
     html_url: str
     permissions: dict[str, str]
+    webhook_secret: str = ""
 
     def __repr__(self) -> str:  # never print the key
         return (
@@ -279,6 +322,7 @@ def convert_code(
         owner_type=str(owner.get("type") or ""),
         html_url=str(data.get("html_url") or ""),
         permissions={str(k): str(v) for k, v in (data.get("permissions") or {}).items()},
+        webhook_secret=str(data.get("webhook_secret") or ""),
     )
 
 
@@ -480,6 +524,7 @@ def apply_installations(
 __all__ = [
     "ADDED_PERMISSIONS",
     "PERMISSIONS",
+    "RELAY_EVENTS",
     "AppCredentials",
     "CallbackServer",
     "InstallationDetails",
