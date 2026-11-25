@@ -17,6 +17,15 @@ Shapes relied on (rule 12, read 2026-11-23):
   GitHub creates the webhook secret itself and returns it as ``webhook_secret`` from the
   conversion; the manifest cannot set one.
   https://docs.github.com/en/apps/creating-github-apps/registering-a-github-app/using-webhooks-with-github-apps
+- ``public`` (boolean, read 2026-11-25): ``true`` when the App "is available to the public",
+  ``false`` when "it is only accessible to the owner of the app"; the docs give no
+  default, so the manifest always sends it. A private App "can only be installed on the
+  account that owns the app"; a public one can be installed by "any user on GitHub".
+  "Public apps cannot be made private if they're installed on other accounts." Default
+  here stays ``False``; ``public=True`` only when the user asks (todo #39, docs/publishing.md).
+  https://docs.github.com/en/apps/sharing-github-apps/registering-a-github-app-from-a-manifest
+  https://docs.github.com/en/apps/creating-github-apps/registering-a-github-app/making-a-github-app-public-or-private
+  https://docs.github.com/en/apps/maintaining-github-apps/modifying-a-github-app-registration
 - ``POST /app-manifests/{code}/conversions`` (no auth) -> 201 with ``id``, ``slug``,
   ``owner`` (``login``, ``type``), ``html_url``, ``client_id``, ``client_secret``,
   ``webhook_secret``, ``pem``, ``permissions``.
@@ -127,12 +136,23 @@ def default_app_name() -> str:
 
 
 def build_manifest(
-    redirect_url: str, name: str | None = None, *, relay_url: str | None = None
+    redirect_url: str,
+    name: str | None = None,
+    *,
+    relay_url: str | None = None,
+    public: bool = False,
 ) -> dict[str, Any]:
     """The manifest GitHub registers: private App, SPEC permissions, no webhook.
 
     With ``relay_url`` (the user's own webhook relay, todo #33) GitHub delivers webhooks
-    there: ``hook_attributes`` and ``default_events`` are added, nothing else changes."""
+    there: ``hook_attributes`` and ``default_events`` are added, nothing else changes.
+
+    ``public=True`` (todo #39, ``fman setup --public``) lets other GitHub accounts install
+    this App so its owner's worker can work on their repos. It never shares the App's
+    key: the key stays in the owner's ``~/.foreman-inator`` (7d). Only an explicit
+    ``True`` makes it public; any other value is a mistake, not a yes."""
+    if not isinstance(public, bool):
+        raise TypeError(f"public must be True or False, not {public!r}")
     name = name or default_app_name()
     if len(name) > MAX_APP_NAME:
         raise ValueError(f"App name {name!r} is longer than {MAX_APP_NAME} characters")
@@ -141,7 +161,7 @@ def build_manifest(
         "url": HOMEPAGE_URL,
         "description": APP_DESCRIPTION,
         "redirect_url": redirect_url,
-        "public": False,
+        "public": public,
         "default_permissions": dict(PERMISSIONS),
     }
     if relay_url:
@@ -168,6 +188,7 @@ def install_url(slug: str) -> str:
 
 def start_page(manifest: dict[str, Any], action: str) -> str:
     """A page that POSTs the manifest to GitHub on load (a browser can't be opened to a POST)."""
+    kind = "public" if manifest.get("public") is True else "private"
     value = html.escape(json.dumps(manifest), quote=True)
     target = html.escape(action, quote=True)
     return (
@@ -176,7 +197,7 @@ def start_page(manifest: dict[str, Any], action: str) -> str:
         "<body onload='document.forms[0].submit()'>"
         f"<form method='post' action='{target}'>"
         f"<input type='hidden' name='manifest' value='{value}'>"
-        "<p>Sending you to GitHub to create your private foreman-inator App...</p>"
+        f"<p>Sending you to GitHub to create your {kind} foreman-inator App...</p>"
         "<button type='submit'>Continue to GitHub</button>"
         "</form></body></html>"
     )
@@ -211,6 +232,7 @@ class CallbackServer:
         org: str | None = None,
         app_name: str | None = None,
         relay_url: str | None = None,
+        public: bool = False,
     ) -> None:
         self.state = secrets.token_urlsafe(24)
         self._code: str | None = None
@@ -218,7 +240,9 @@ class CallbackServer:
         self._server = _LoopbackHTTPServer(("127.0.0.1", 0), self._handler())
         host, port = self._server.server_address[:2]
         self.base_url = f"http://127.0.0.1:{port}"
-        self.manifest = build_manifest(self.base_url + CALLBACK_PATH, app_name, relay_url=relay_url)
+        self.manifest = build_manifest(
+            self.base_url + CALLBACK_PATH, app_name, relay_url=relay_url, public=public
+        )
         self.action = new_app_url(self.state, org)
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
 
@@ -362,6 +386,28 @@ def installation_repos(auth: AppAuth, installation_id: int) -> list[str]:
         if not batch or len(repos) >= int(data.get("total_count", len(repos))):
             return repos
         page += 1
+
+
+def public_app_text(slug: str) -> str:
+    """What ``fman setup --public`` prints once a public App exists (todo #39).
+
+    The install link is the App's public page form (``/apps/<slug>/installations/new``,
+    https://docs.github.com/en/apps/sharing-github-apps/sharing-your-github-app, read
+    2026-11-25). Nothing here names or prints the key."""
+    link = install_url(slug)
+    return "\n".join(
+        [
+            "Your App is public: any GitHub account can install it.",
+            f"  Install link to share: {link}",
+            "  Installs run through YOUR worker and YOUR App key. Never send the key"
+            " (the .pem in ~/.foreman-inator) to anyone; someone who wants their own"
+            " worker runs `fman setup` and creates their own App (docs/publishing.md).",
+            "  Each new installation must be added with `fman setup` and its repos chosen"
+            " by you; only labels from `allowed_users` start work.",
+            "  GitHub will not make the App private again while it is installed on another"
+            " account.",
+        ]
+    )
 
 
 def missing_permissions(granted: dict[str, str]) -> dict[str, str]:
@@ -543,6 +589,7 @@ __all__ = [
     "missing_permissions",
     "new_app_url",
     "permissions_upgrade_text",
+    "public_app_text",
     "repository_access_text",
     "start_page",
     "wait_for_installations",
