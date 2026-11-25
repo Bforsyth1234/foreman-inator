@@ -25,9 +25,35 @@ URL scheme (the prefix carries the context; OpenAI paths follow ``/v1``):
                              row. Still traced and still fail-closed.
 
 Endpoints under each prefix: ``POST chat/completions`` (streaming and not),
-``POST completions``, ``POST embeddings``, ``GET models`` (answered locally from config).
-The request's ``model`` is the config model *name* (or its upstream id); the proxy
-rewrites it to the endpoint's upstream id before forwarding.
+``POST completions``, ``POST embeddings``, ``POST messages`` (Anthropic Messages, below),
+``GET models`` (answered locally from config). The request's ``model`` is the config
+model *name* (or its upstream id); the proxy rewrites it to the endpoint's upstream id
+before forwarding.
+
+Anthropic Messages route (#52, prompt caching): ``POST <prefix>/v1/messages`` is a
+passthrough, not a translation. The request body goes to ``<base_url>/messages``
+byte-for-byte (re-serialized only when ``model`` names the config entry rather than the
+upstream id), and the response bytes (SSE or JSON) come back unchanged. Upstream headers:
+``x-api-key`` (the Keychain key; never ``Authorization``), the client's
+``anthropic-version`` (default ``2023-06-01``) and ``anthropic-beta``; every other client
+header, its own ``x-api-key`` included, is dropped. The fail-closed checks, the spend
+preflight and actual, the local slot and the recording all run exactly as for
+``chat/completions``; the refused-parameter resend does not (the body is not touched).
+Errors the proxy itself returns on this route are Anthropic-shaped
+(``{"type": "error", "error": {"type", "message", "code"}}``). Usage is read from
+``message_start`` and the cumulative ``message_delta`` events (or the body's ``usage``):
+``tokens_in`` = ``input_tokens`` + ``cache_creation_input_tokens`` +
+``cache_read_input_tokens`` (Anthropic's ``input_tokens`` excludes cached tokens), and the
+read and write counts (writes split by TTL from ``cache_creation``) are priced at the
+cache rates. On ``chat/completions`` the proxy reads
+``usage.prompt_tokens_details.cached_tokens`` (Z.ai GLM's implicit cache) and prices
+those at the cached rate; ``prompt_tokens`` already includes them. The spend estimate
+stays at the full input price. Docs read 2026-11-25:
+https://platform.claude.com/docs/en/build-with-claude/prompt-caching (usage fields,
+``total = cache_read + cache_creation + input``),
+https://platform.claude.com/docs/en/build-with-claude/streaming (event flow;
+"The token counts shown in the usage field of the message_delta event are cumulative"),
+https://platform.claude.com/docs/en/about-claude/pricing, https://docs.z.ai/guides/capabilities/cache.
 
 Fail closed (invariant 7c): an unknown model, a cloud model whose key cannot be resolved,
 a cloud endpoint not on https, or a ``local`` endpoint not on loopback is refused with an
@@ -142,7 +168,10 @@ Bucket = Literal["live", "experiments"]
 Phase = Literal["estimate", "actual"]
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_MAX_OUT = 4096
-UPSTREAM_PATHS = {"chat/completions", "completions", "embeddings"}
+MESSAGES_PATH = "messages"  # #52: the Anthropic Messages passthrough
+UPSTREAM_PATHS = {"chat/completions", "completions", "embeddings", MESSAGES_PATH}
+ANTHROPIC_VERSION = "2023-06-01"  # sent when the client gives none (what @ai-sdk sends)
+ANTHROPIC_PASS_HEADERS = ("anthropic-version", "anthropic-beta")
 DEFAULT_MAX_LOCAL_INFERENCE = 1  # config `max_local_inference`: one local GPU
 LOCK_POLL_S = 0.05  # cross-process slots: how often a queued call retries the lock files
 DISCONNECT_POLL_S = 0.25  # while queued for a local slot, how often to check the client
@@ -342,6 +371,8 @@ class CallUsage:
     usage_estimated: bool
     price_conservative: bool
     status_code: int
+    cache_read_tokens: int = 0  # #52: input tokens read from the prompt cache
+    cache_write_tokens: int = 0  # #52: input tokens written to it (both TTLs)
 
 
 KeyResolver = Callable[[ModelEndpoint], str | None]
@@ -357,8 +388,20 @@ class _Refused(Exception):
         self.status, self.code, self.message, self.type = status, code, message, type_
 
 
-def error_response(status: int, code: str, message: str, type_: str = "invalid_request_error"):
-    """An OpenAI-style error body."""
+def error_response(
+    status: int,
+    code: str,
+    message: str,
+    type_: str = "invalid_request_error",
+    *,
+    anthropic: bool = False,
+):
+    """An OpenAI-style error body, or an Anthropic-style one for the Messages route."""
+    if anthropic:
+        return JSONResponse(
+            {"type": "error", "error": {"type": type_, "message": message, "code": code}},
+            status_code=status,
+        )
     return JSONResponse(
         {"error": {"message": message, "type": type_, "param": None, "code": code}},
         status_code=status,
@@ -556,6 +599,26 @@ class _Tee:
                 }
         self.done = True
 
+    def counts(self) -> dict[str, int | None]:
+        """Token counts from the upstream's usage: ``tokens_in`` (all input, cached
+        included), ``tokens_out`` (None when not reported) and the cache counts."""
+        usage = self.usage or {}
+        details = usage.get("prompt_tokens_details")
+        cached = details.get("cached_tokens") if isinstance(details, dict) else None
+        return {
+            "tokens_in": _int_or_none(usage.get("prompt_tokens")),
+            "tokens_out": _int_or_none(usage.get("completion_tokens")),
+            "cache_read": _int_or_none(cached) or 0,
+            "cache_write_5m": 0,
+            "cache_write_1h": 0,
+        }
+
+    def stop_reason(self) -> str:
+        """The recorded (fde-kit, Anthropic-style) stop reason of a finished call."""
+        return {"tool_calls": "tool_use", "length": "max_tokens"}.get(
+            self.finish_reason or "", "end_turn"
+        )
+
     def calls(self) -> list[dict[str, Any]]:
         out = []
         for _, tc in sorted(self.tool_calls.items()):
@@ -565,6 +628,117 @@ class _Tee:
                 args = {"_raw": tc["args"]}
             out.append({"id": tc["id"], "name": tc["name"] or "?", "input": args})
         return out
+
+
+def _with_model(body: dict[str, Any], model: str) -> bytes:
+    """``body`` with ``model`` replaced, re-serialized (the only Messages body change)."""
+    return json.dumps({**body, "model": model}, separators=(",", ":")).encode()
+
+
+def _int_or_none(value: Any) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+class _AnthropicTee(_Tee):
+    """The same recorded view, parsed from Anthropic Messages events or a Messages body.
+
+    Streaming: ``message_start`` carries ``message.usage`` (input and cache counts);
+    each ``message_delta`` carries ``delta.stop_reason`` and a cumulative ``usage``, which
+    replaces the keys it names; ``content_block_start`` / ``content_block_delta``
+    (``text_delta``, ``input_json_delta``) build text and tool calls by block index;
+    ``message_stop`` ends the message; an ``error`` event is kept as ``stream_error``."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.stream_error: str | None = None
+        #: Whether ``usage.output_tokens`` is final: a whole body, or a streamed
+        #: ``message_delta`` was seen. ``message_start`` reports only the first token
+        #: or so, so a stream cut before its ``message_delta`` must not trust it.
+        self.usage_final = False
+
+    def _data(self, data: bytes) -> None:
+        try:
+            obj = json.loads(data)
+        except ValueError:
+            return
+        if not isinstance(obj, dict):
+            return
+        kind = obj.get("type")
+        if kind == "message_start":
+            msg = obj.get("message") or {}
+            if isinstance(msg.get("usage"), dict):
+                self.usage = dict(msg["usage"])
+        elif kind == "content_block_start":
+            self._block(obj.get("index", len(self.tool_calls)), obj.get("content_block") or {})
+        elif kind == "content_block_delta":
+            delta = obj.get("delta") or {}
+            if delta.get("type") == "text_delta" and isinstance(delta.get("text"), str):
+                self.text.append(delta["text"])
+            elif delta.get("type") == "input_json_delta":
+                slot = self.tool_calls.get(obj.get("index"))
+                if slot is not None and isinstance(delta.get("partial_json"), str):
+                    slot["args"] += delta["partial_json"]
+        elif kind == "message_delta":
+            delta = obj.get("delta") or {}
+            if delta.get("stop_reason"):
+                self.finish_reason = delta["stop_reason"]
+            if isinstance(obj.get("usage"), dict):
+                self.usage = {**(self.usage or {}), **obj["usage"]}
+                self.usage_final = True
+        elif kind == "message_stop":
+            self.done = True
+        elif kind == "error":
+            self.stream_error = upstream_error_message(obj) or "stream error"
+
+    def _block(self, index: Any, block: dict[str, Any]) -> None:
+        if block.get("type") == "text" and isinstance(block.get("text"), str):
+            if block["text"]:
+                self.text.append(block["text"])
+        elif block.get("type") in ("tool_use", "server_tool_use"):
+            given = block.get("input")
+            self.tool_calls[index] = {
+                "id": block.get("id") or "",
+                "name": block.get("name") or "",
+                "args": json.dumps(given) if isinstance(given, dict) and given else "",
+            }
+
+    def parse_body(self, body: bytes) -> None:
+        self.raw_len = len(body)
+        try:
+            obj = json.loads(body)
+        except ValueError:
+            return
+        if not isinstance(obj, dict):
+            return
+        if isinstance(obj.get("usage"), dict):
+            self.usage = obj["usage"]
+            self.usage_final = True
+        self.finish_reason = obj.get("stop_reason") or self.finish_reason
+        for i, block in enumerate(obj.get("content") or []):
+            if isinstance(block, dict):
+                self._block(i, block)
+        self.done = True
+
+    def counts(self) -> dict[str, int | None]:
+        usage = self.usage or {}
+        plain = _int_or_none(usage.get("input_tokens"))
+        read = _int_or_none(usage.get("cache_read_input_tokens")) or 0
+        write = _int_or_none(usage.get("cache_creation_input_tokens")) or 0
+        split = usage.get("cache_creation")
+        w1h = 0
+        if isinstance(split, dict):
+            w1h = min(_int_or_none(split.get("ephemeral_1h_input_tokens")) or 0, write)
+        tokens_in = None if plain is None and not (read or write) else (plain or 0) + read + write
+        return {
+            "tokens_in": tokens_in,
+            "tokens_out": _int_or_none(usage.get("output_tokens")),
+            "cache_read": read,
+            "cache_write_5m": write - w1h,
+            "cache_write_1h": w1h,
+        }
+
+    def stop_reason(self) -> str:
+        return self.finish_reason or "end_turn"  # already Anthropic's (fde-kit's) names
 
 
 # --------------------------------------------------------------------------- the proxy
@@ -852,6 +1026,7 @@ class ModelProxy:
     async def _handle(self, request: Request):
         t0_ns = time.time_ns()
         rest = request.path_params.get("rest", "").strip("/")
+        anthropic = rest == MESSAGES_PATH
         try:
             ctx = self._resolve_context(request)
             if rest == "models" and request.method == "GET":
@@ -871,12 +1046,23 @@ class ModelProxy:
             estimate = self._estimate(ep, raw, body, rest)
             self._preflight(ep, estimate, ctx)
         except _Refused as r:
-            return error_response(r.status, r.code, r.message, r.type)
+            return error_response(r.status, r.code, r.message, r.type, anthropic=anthropic)
 
         headers = {"content-type": "application/json", "accept-encoding": "identity"}
         if stream:
             headers["accept"] = "text/event-stream"
-        if key:
+        passthrough: bytes | None = None
+        if anthropic:
+            # #52: x-api-key, never a bearer token; only the version and beta headers of
+            # the client's own go along (its x-api-key is the placeholder "fman-proxy").
+            for name in ANTHROPIC_PASS_HEADERS:
+                if value := request.headers.get(name):
+                    headers[name] = value
+            headers.setdefault("anthropic-version", ANTHROPIC_VERSION)
+            if key:
+                headers["x-api-key"] = key
+            passthrough = raw if body.get("model") == ep.model else _with_model(body, ep.model)
+        elif key:
             headers["authorization"] = f"Bearer {key}"
         url = ep.base_url.rstrip("/") + "/" + rest
         call = _Call(self, ctx, ep, rest, body, t0_ns)
@@ -890,11 +1076,17 @@ class ModelProxy:
             if not got:
                 call.finish(status=499, error="incomplete: client left while queued (local)")
                 return error_response(
-                    499, "client_disconnected", "client left while queued", "api_error"
+                    499,
+                    "client_disconnected",
+                    "client left while queued",
+                    "api_error",
+                    anthropic=anthropic,
                 )
             call.release = self._slots.release
         try:
-            response = await self._forward(call, ep, url, headers, body, stream, key)
+            response = await self._forward(
+                call, ep, url, headers, body, stream, key, passthrough=passthrough
+            )
         except BaseException:
             call.release_slot()
             raise
@@ -911,18 +1103,26 @@ class ModelProxy:
         body: dict[str, Any],
         stream: bool,
         key: str | None,
+        *,
+        passthrough: bytes | None = None,
     ) -> Response | _TeeStream:
+        """Send the call upstream. ``passthrough``: the exact bytes to send (the Messages
+        route); then nothing in the body is changed and no refused parameter is resent."""
         client = self._upstream()
-        dropped = [p for p in sorted(self.refused_params(ep)) if p in body]
+        anthropic = passthrough is not None
+        dropped = [] if anthropic else [p for p in sorted(self.refused_params(ep)) if p in body]
         resends = 0
         while True:
             upstream_body = {k: v for k, v in body.items() if k not in dropped}
             upstream_body["model"] = ep.model
-            if stream and "stream_options" not in upstream_body:
+            if stream and "stream_options" not in upstream_body and not anthropic:
                 upstream_body["stream_options"] = {"include_usage": True}
             call.dropped, call.resends = tuple(dropped), resends
             out_headers = {"content-type": "application/json"}
-            req = client.build_request("POST", url, json=upstream_body, headers=headers)
+            if passthrough is not None:
+                req = client.build_request("POST", url, content=passthrough, headers=headers)
+            else:
+                req = client.build_request("POST", url, json=upstream_body, headers=headers)
             try:
                 resp = await client.send(req, stream=True)
             except httpx.HTTPError as exc:
@@ -934,6 +1134,7 @@ class ModelProxy:
                         f"could not reach the upstream for model {ep.name!r} "
                         f"({type(exc).__name__})",
                         "api_error",
+                        anthropic=anthropic,
                     ),
                     dropped,
                 )
@@ -948,11 +1149,17 @@ class ModelProxy:
                 await resp.aclose()
                 call.finish(status=502, error=f"upstream read failed: {type(exc).__name__}")
                 return self._with_dropped(
-                    error_response(502, "upstream_read_failed", "upstream failed", "api_error"),
+                    error_response(
+                        502,
+                        "upstream_read_failed",
+                        "upstream failed",
+                        "api_error",
+                        anthropic=anthropic,
+                    ),
                     dropped,
                 )
             await resp.aclose()
-            if resp.status_code == 400 and resends < MAX_RESENDS:
+            if resp.status_code == 400 and resends < MAX_RESENDS and not anthropic:
                 param = self._refusal(ep, data, upstream_body, dropped)
                 if param is not None:
                     dropped.append(param)
@@ -1126,7 +1333,7 @@ class _Call:
             body,
             t0_ns,
         )
-        self.tee = _Tee()
+        self.tee: _Tee = _AnthropicTee() if rest == MESSAGES_PATH else _Tee()
         self._finished = False
         self.dropped: tuple[str, ...] = ()  # parameters left out of the upstream request
         self.resends = 0  # extra upstream tries after a refused parameter
@@ -1146,6 +1353,8 @@ class _Call:
     def _prompt_view(self) -> Any:
         if self.rest == "embeddings":
             return self.body.get("input")
+        if self.rest == MESSAGES_PATH and "system" in self.body:
+            return {"system": self.body["system"], "messages": self.body.get("messages")}
         if "messages" in self.body:
             return self.body["messages"]
         return self.body.get("prompt")
@@ -1166,20 +1375,39 @@ class _Call:
         latency_ms = (end_ns - self.t0_ns) / 1e6 - (self.queue_wait_s or 0.0) * 1000
         tee = self.tee
         text = "".join(tee.text)
-        usage = tee.usage or {}
+        counts = tee.counts()
         estimated = False
-        tokens_in = usage.get("prompt_tokens")
-        tokens_out = usage.get("completion_tokens", 0 if self.rest == "embeddings" else None)
+        tokens_in = counts["tokens_in"]
+        tokens_out = counts["tokens_out"]
+        if tokens_out is None and self.rest == "embeddings":
+            tokens_out = 0
+        cache = {
+            "cache_read": counts["cache_read"] or 0,
+            "cache_write_5m": counts["cache_write_5m"] or 0,
+            "cache_write_1h": counts["cache_write_1h"] or 0,
+        }
+        if error is None and isinstance(tee, _AnthropicTee) and tee.stream_error:
+            error = "upstream stream error: " + " ".join(scrub_secrets(tee.stream_error).split())
         if not isinstance(tokens_in, int):
             tokens_in = pricing.estimate_tokens(json.dumps(self._prompt_view(), default=str))
             estimated = True
+            cache = dict.fromkeys(cache, 0)  # an estimate has no cache split: plain input
         if not isinstance(tokens_out, int):
             tokens_out = pricing.estimate_tokens(text) if text else 0
             estimated = True
+        elif isinstance(tee, _AnthropicTee) and not tee.usage_final:
+            # A stream cut before its message_delta: message_start's output_tokens is
+            # only the first token, so charge at least what was streamed (as the
+            # OpenAI route does when its stream ends without a usage chunk).
+            guess = pricing.estimate_tokens(text) if text else 0
+            if guess > tokens_out:
+                tokens_out, estimated = guess, True
         if status >= 400 and tee.usage is None:
             tokens_in = tokens_out = 0  # refused upstream: nothing billed
+        cache_read = cache["cache_read"]
+        cache_write = cache["cache_write_5m"] + cache["cache_write_1h"]
         price = pricing.price_for(self.ep)
-        cost = price.cost(tokens_in, tokens_out)
+        cost = price.cost(tokens_in, tokens_out, **cache)
         ctx = self.ctx
 
         def emit() -> None:
@@ -1204,6 +1432,10 @@ class _Call:
                     "llm.queue_wait_s": (
                         round(self.queue_wait_s, 3) if self.queue_wait_s is not None else None
                     ),
+                    # #52 (OpenInference names); left off when the call used no cache
+                    "llm.token_count.prompt_details.cache_read": cache_read or None,
+                    "llm.token_count.prompt_details.cache_write": cache_write or None,
+                    "llm.wire": "anthropic" if self.rest == MESSAGES_PATH else None,
                 },
             )
 
@@ -1223,9 +1455,7 @@ class _Call:
                 elif error:
                     stop = "error"
                 else:
-                    stop = {"tool_calls": "tool_use", "length": "max_tokens"}.get(
-                        tee.finish_reason or "", "end_turn"
-                    )
+                    stop = tee.stop_reason()
                 raw_content = None
                 if self.error_text:  # the provider's refusal, kept out of the model's text
                     raw_content = [{"type": "error", "text": self.error_text}]
@@ -1242,6 +1472,7 @@ class _Call:
                         latency_ms=latency_ms,
                         cost_usd=cost,
                         prompt_version=ctx.prompt_version,
+                        **_recorder_cache_kwargs(rec, cache_read, cache_write),
                     )
                 except Exception as exc:
                     log.warning("proxy: recorder row failed: %s", type(exc).__name__)
@@ -1268,6 +1499,8 @@ class _Call:
             usage_estimated=estimated,
             price_conservative=price.conservative,
             status_code=status,
+            cache_read_tokens=cache_read,
+            cache_write_tokens=cache_write,
         )
         if self.proxy.on_usage is not None:
             try:
@@ -1278,6 +1511,22 @@ class _Call:
             self.proxy.spend_hook(self.ep, cost, ctx, phase="actual")
         except Exception as exc:
             log.warning("proxy: spend hook (actual) failed: %s", type(exc).__name__)
+
+
+def _recorder_cache_kwargs(rec: Any, cache_read: int, cache_write: int) -> dict[str, int]:
+    """The cache counts for ``Recorder.llm``, if it takes them (#52 wiring: the recorder
+    gains ``cache_read_tokens`` / ``cache_write_tokens``); nothing otherwise, so a
+    recorder without them still gets its row."""
+    import inspect
+
+    try:
+        params = inspect.signature(rec.llm).parameters
+    except (TypeError, ValueError):
+        return {}
+    wanted = {"cache_read_tokens": cache_read, "cache_write_tokens": cache_write}
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return wanted
+    return {k: v for k, v in wanted.items() if k in params}
 
 
 class _TeeStream:

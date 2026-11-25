@@ -100,9 +100,9 @@ Package root below is `src/foreman_inator/` (written `pkg/`).
 | 10 | A: #30 · B: #31 · C: #32 | A `pkg/export.py` · B `pyproject.toml` (metadata, entry points), `.github/workflows/release.yml`, `docs/releasing.md` · C `README.md`, `docs/setup.md`, `docs/how-it-works.md`, `docs/demo.gif` (+ own tests). Runner at close: `cli.py` (`export`) | [x] built; live checks open for #31, #32 |
 | 13 | A1: GH #50, #55 · A2: GH #51 · A3: GH #57 · A4: GH #58 · A5: GH #56 · A6: todo #58 (GH #35) | A1 `pkg/worker_status.py`, `pkg/locks.py` · A2 `pkg/setup/deps.py`, `pkg/routing/knn.py`, `pkg/worker_background.py` · A3 `pkg/runner/install.py`, `pkg/worker_install.py` · A4 `pkg/spend.py`, `pkg/worker_attempt.py`, `pkg/routing/escalation.py`, `pkg/pr/summary.py`, `pkg/db/store.py`, `007_attempt_budget.sql` · A5 `pkg/prune.py`, `pkg/worker_prune.py`, `pkg/tracing/recorder.py`, `docs/setup.md`, `docs/how-it-works.md` · A6 `pkg/resources/` (+ own tests). Runner at close: config keys `attempt_budget_usd`, `attempt_max_input_tokens_cloud/_local`, `retention_days`, `install_refill_cache`; `PruneSteps` + daily prune in the poll; `fman prune`; budget in status/summary/export | [x] built |
 | 14 | B1: GH #52 · B2: todo #57 (GH #34) · B3: todo #59 (GH #36) · B4: todo #51 (GH #28) · B5: todo #46 (GH #23) · B6: todo #61, #63 (GH #38, #40) | B1 `pkg/tickets/clarify.py`, `pkg/routing/rules.py` · B2 `pkg/proxy/server.py`, `pkg/runner/opencode.py` · B3 `pkg/resources/memory.py`, `pkg/worker_attempt.py` · B4 `pkg/routing/profile.py`, `pkg/routing/escalation.py`, `pkg/review/reviewer.py`, `pkg/spend.py`, `pkg/worker_review.py`, `pkg/worker_route.py`, `pkg/worker_status.py`, `pkg/db/store.py`, `008_profiles.sql` · B5 `pkg/metrics/queries.py`, `pkg/metrics/web.py` · B6 `pkg/tickets/conventions.py`, `pkg/tickets/prompt.py`, `pkg/paths.py` (+ own tests). GH #52 (cold-load allowance for the clarity check and router) has no todo id. Runner at close: config `cold_load_timeout_seconds`, `max_local_inference`, `[rules_file]`; `OllamaWatch` on the worker; shared `LocalSlots` + driver `extra_time`; profile limits/start tier in the policy, `writer_gate`, review-off hand-over, `fman repo set-profile`, PR profile line; `conventions.gather` in the attempt | [x] built; live check open for #51 |
+| 15 | C1: todo #52, #64 (GH #29, #41) · C2: todo #62 (GH #39) · C3: todo #66 (GH #43) · C4: todo #48 (GH #25) · C5: todo #47 data (GH #24) · C6: todo #68, #58 status line (GH #45, #35) | C1 `pkg/proxy/server.py`, `pkg/proxy/pricing.py`, `pkg/runner/opencode.py`, `pkg/config.py`, `tests/fakes/anthropic.py` · C2 `pkg/review/reviewer.py`, `pkg/prompts/reviewer-v2.md` · C3 `pkg/experiments/replay_runner.py`, `pkg/worker_experiments.py` · C4 `pkg/tickets/prompt.py`, `pkg/worker_attempt.py` · C5 `pkg/metrics/quality.py`, `pkg/worker_quality.py`, `pkg/github/client.py`, `tests/fakes/github.py`, `pkg/db/store.py`, `009_post_merge.sql` · C6 `pkg/plugins.py`, `pkg/worker_status.py` (+ own tests). Runner at close: recorder cache counts; reviewer gets the repo's `rules_file`; `review_change(conventions=)` for reviewer rules replays; `fman experiment run --rules`; `QualitySteps` + daily scan in the poll; plugin CLI commands, startup lines, Ollama and plugin lines in `fman status`; SPEC Capture wording and Plugins section | [x] built; live checks open for #52, #64 |
 | — | #33–#39 | unscheduled (SPEC milestone 5) | open |
 | — | #45–#50 | unscheduled (gap review, 2026-11-23) | open |
-| — | #52 | unscheduled (user request, 2026-11-23); after 6b, can share a wave with #51 (disjoint files) | open |
 | — | #53–#56 | unscheduled (first live run, 2026-11-23); #45 gained live evidence in the same run | open |
 
 ### Runner decisions on open questions (assistant defaults, 2026-11-23)
@@ -139,6 +139,8 @@ Open (need the user; full steps in each item's DONE.md entry):
 One combined step list for wave 6b is in DONE.md's #40, #41 and #44 entries.
 - #29 milestone 4: one overnight replay of a prompt change (a new prompt file), then read the comparison. Steps in DONE.md.
 - #31 packaging: decide how fde-kit reaches strangers (it is not on PyPI, so `uv tool install foreman-inator` cannot work yet; the release workflow's publish jobs are switched off). Then TestPyPI, then PyPI. Steps in `docs/releasing.md`.
+- #52 prompt caching: one real Claude writer attempt on a toy repo (from the second model call on, `cache_read_input_tokens` above zero in the trace; cost below the uncached figure), and one GLM attempt on the Coding Plan endpoint (note whether `cached_tokens` is ever above zero).
+- #64 OpenCode instruction files: in one real attempt on a repo with an `AGENTS.md`, the first `llm.call` carries the file's text once (from our prompt), not twice.
 - #32 docs: follow `docs/setup.md` on a second Mac account from scratch; record `docs/demo.gif` from a real run.
 
 ## Completed items (archived to DONE.md)
@@ -259,13 +261,12 @@ Live evidence (2026-11-23, first live run, `Bforsyth1234/fman-playground`, ticke
 
 #46 — Metrics: attempt minutes and review count next to dollars [x] · done 2026-11-25, wave 14, see DONE.md · Added: 2026-11-23 · Source: assistant (gap review)
 
-#47 — Post-merge quality signal [ ] · Added: 2026-11-23 · Source: assistant (gap review)
+#47 — Post-merge quality signal [~] data layer done, display in wave 16 · Added: 2026-11-23 · Source: assistant (gap review)
 Why: a merge counts as success forever. A merged change that is reverted, or fixed by a follow-up ticket a few days later, still counts as accepted for its model and still trains the router.
 Idea: detect a revert of the merge commit, and a later ticket touching the same files within N days; record it against the accepted attempt and show "accepted, then reverted" per model.
+Built (wave 15, C5): migration 009 `post_merge_signals(ticket_id, kind IN ('reverted','followup'), at, detail)`; `metrics/quality.scan` over tickets merged in the last 14 days (a revert commit naming the merge sha, or GitHub's `Revert "<title>"` with the PR number; a follow-up = a later accepted ticket with overlapping owned files within 7 days); `PullRequest.merge_commit_sha`, `GitHubAPI.list_commits`; `QualitySteps.maybe_scan_quality()` once a day in the poll loop after recover. Tests: `tests/test_post_merge_quality.py`, `tests/test_wave15_wiring.py`. Still to do (wave 16, D3): "accepted, then reverted" and follow-up counts per model on the metrics page; kNN leaves reverted tickets out.
 
-#48 — Issue comments as context for the attempt [ ] · Added: 2026-11-23 · Source: assistant (gap review)
-Why: `list_issue_comments` is called only by `pr/summary.py`. Details the user adds in a comment after filing never reach the writer (an edit to the issue body does, through `IssueEdited`).
-Idea: comments from allowed users go into the prompt after the issue body, defused and clipped like it. Overlaps #44's Q&A block; build after #44.
+#48 — Issue comments as context for the attempt [x] · done 2026-11-25, wave 15, see DONE.md · Added: 2026-11-23 · Source: assistant (gap review)
 
 #49 — Per-repo "local only" setting [ ] · Added: 2026-11-23 · Source: assistant (gap review)
 Why: config has one global model list and no per-repo settings, so any repo's code can go to a cloud tier on escalation or AI review (invariant 7c limits cloud by tier and spend, not by repo).
@@ -279,43 +280,7 @@ Idea: for `large`, a tier 3 model proposes sub-issues in a comment; the user app
 
 #51 — Repo profiles: per-repo `writer` and `review` settings [~] live · done 2026-11-25, wave 14, see DONE.md · Added: 2026-11-23 · Source: user
 
-#52 — Prompt caching: native Anthropic route in the proxy, cached-token accounting for Claude and GLM [ ]
-Wave: _ (after 6b; can share a wave with #51) · Agent: _ · Added: 2026-11-23 · Source: user
-Ask: "how could we add prompt caching?", then "add it as a todo item. Also look into z.ai caching capabilities".
-Why: the driver gives OpenCode one `@ai-sdk/openai-compatible` provider (`runner/opencode.py` `build_config`) and the proxy forwards Claude calls to Anthropic's OpenAI-compatible endpoint, which has no prompt caching (#9's rule 12 note). A writer attempt re-sends its whole history on every turn at full input price, so a few cloud attempts can use up the $5 daily cap. `proxy/pricing.py` says itself that cache prices are not used, and the proxy reads only `prompt_tokens` and `completion_tokens`, so GLM's cache discount is not counted either.
-DECISIONS (assistant, 2026-11-23; the user chose the passthrough approach by asking for this item and can overturn the rest):
-1. Passthrough, not translation. The proxy gains a `messages` route under the same prefixes (`/a/<attempt_id>/v1/messages`, `/x/...`, `/c/...`) that forwards the request body unchanged to `<base_url>/messages` and streams the response bytes back unchanged. No OpenAI-to-Anthropic conversion is written.
-2. OpenCode places the cache markers; the proxy adds none. Checked in the installed OpenCode 1.18.7 binary (2026-11-23): it marks the first two system messages and the last two messages with `cacheControl: {type: "ephemeral"}` when the provider package is `@ai-sdk/anthropic` or the model id contains `claude`. If the live check shows no cache reads, the fallback is the proxy adding a top-level `cache_control: {"type": "ephemeral"}` to the forwarded body (the one allowed body change).
-3. `ModelEndpoint` gains `wire = "openai" | "anthropic"`, default `"openai"`. The default Claude endpoint is `"anthropic"`. `build_config` uses `@ai-sdk/anthropic` for an `"anthropic"` endpoint and stays as it is for the rest.
-4. The proxy sets `x-api-key` upstream and forwards the client's `anthropic-version` and `anthropic-beta` headers; every other client auth header is dropped. The fail-closed rules of #9 apply to the new route unchanged (unknown model 404, no key 403, https only, key never in spans, recordings, logs or error bodies; invariant 7c).
-5. Usage: read `input_tokens`, `output_tokens`, `cache_creation_input_tokens`, `cache_read_input_tokens` (and the `cache_creation` split by TTL) from `message_start` and `message_delta` when streaming, and from the body when not. Anthropic's `input_tokens` excludes cached tokens, so `tokens_in` stored on the attempt is the sum of all three input kinds. Cache read and write counts go on the `llm.call` span and on `CallUsage`. No schema change.
-6. Pricing: `Price` gains a cache read rate and cache write multipliers. Claude writes are 1.25× input (5-minute) and 2× (1-hour). Claude reads per million: Sonnet 5.5 $0.10, Opus 5.5 $0.20, Fable 5.2 $0.20 (from the Claude API reference dated 2026-11-03; confirm on the pricing page, rule 12). A model with no cache rate is priced as today.
-7. GLM needs no request change: Z.ai caching is implicit. The proxy reads `usage.prompt_tokens_details.cached_tokens` on the existing `chat/completions` path and prices those tokens at the cached rate (GLM-5.3 and GLM-5.2 $0.26, GLM-5.3-Flash $0.03 per million). `prompt_tokens` is treated as including the cached tokens: the docs do not say so outright, but compute the hit rate as `cached_tokens / prompt_tokens`. Cached-input storage is "Limited-time Free" and is priced at 0 with the date in a comment. GLM stays priced at the pay-as-you-go list price on the Coding Plan (#9's deviation).
-8. The spend preflight estimate stays at the full input price (it must not under-reserve); only the settled actual cost uses cache rates.
-9. The reviewer and the router keep the `chat/completions` path. Each makes one call, so caching gains nothing there.
-10. Recordings: the new route's tee builds the same recorded view (text, tool calls, usage, finish reason) as the OpenAI tee, so fde-kit replay reads both.
-SPEC change needed: Tracing "Capture" says "a thin OpenAI-compatible proxy"; it becomes OpenAI-compatible plus an Anthropic Messages route for Claude models.
-Rule 12 (read 2026-11-23):
-⚬ Z.ai: docs.z.ai/guides/capabilities/cache (implicit, no request field; match is "identical or highly similar" content, exact-prefix not stated; no minimum size or TTL given), docs.z.ai/guides/overview/pricing (the rates in decision 7), docs.z.ai/devpack/overview and /devpack/faq (Coding Plan credits = (input × 6.9 + cached input × 1.7 + output × 24) / 10,000 for GLM-5.3; whether caching applies on `api/coding/paas/v4` is not stated). The cache guide says hits are "usually 50% of standard price" while the pricing table gives about 19%; the table is used.
-⚬ OpenCode: 1.18.7 binary inspected, see decision 2. opencode.ai/docs/providers now shows a `package` / `settings` provider schema next to the `npm` / `options` one this driver writes, and `setup/deps.py` prints an `opencode-v2` install command: check which schema the installed version takes before changing `build_config`.
-⚬ Still to read by the building agent: platform.claude.com prompt caching and pricing pages, the Messages streaming event list, and where `@ai-sdk/anthropic` sends requests relative to `baseURL` (expected `{baseURL}/messages`, not confirmed).
-Files:
-⚬ OWNED: `tests/test_proxy_anthropic.py`, `tests/fakes/anthropic.py` (a scriptable Messages-format upstream)
-⚬ EDITED (additive, earlier waves): `src/foreman_inator/proxy/server.py` (route, headers, Anthropic tee, `cached_tokens` on the OpenAI tee), `src/foreman_inator/proxy/pricing.py` (cache rates), `src/foreman_inator/runner/opencode.py` (`build_config`), `src/foreman_inator/config.py` (`wire`, the default Claude endpoint), `tests/test_proxy.py`, `tests/test_config.py`
-⚬ Do NOT touch: `spend.py`, `db/store.py`, the migrations, `review/reviewer.py`, `worker.py`.
-Scheduling: `runner/opencode.py` and `config.py` are being edited by #40 in wave 6b, so this runs after 6b. Its files are disjoint from #51's.
-Approach: add `"messages"` to the upstream paths behind a wire check (a `messages` call to an `"openai"` endpoint, or a `chat/completions` writer call that should have been native, is still served; only the path decides the upstream format). Factor the tee into one interface with two parsers. `Price.cost(tokens_in, tokens_out)` keeps its signature and gains optional cache arguments. Fallback if `@ai-sdk/anthropic` cannot be pointed at the proxy: keep the OpenAI-compatible provider and build the translation for requests only as far as the writer needs (text, tools, tool results, streaming), which is a larger item and should be re-planned first.
-Verify:
-⚬ A `messages` request through the proxy reaches the fake upstream byte-for-byte with `x-api-key` set, and the streamed response reaches the client byte-for-byte.
-⚬ A streamed response with 1,000 uncached, 9,000 cache-read and 2,000 cache-write input tokens stores `tokens_in` = 12,000 and a cost equal to the hand-computed figure for Sonnet 5.5, Opus 5.5 and Fable 5.2.
-⚬ A GLM response with `prompt_tokens` 1,200 and `cached_tokens` 800 costs 400 × input + 800 × cached rate; with no `prompt_tokens_details` the cost is unchanged from today.
-⚬ The `llm.call` span and the recording row carry the cache counts; the API key appears in neither.
-⚬ A keyless Claude endpoint is refused with 403 on the new route and nothing is sent upstream; a spend-cap refusal returns 429 on the new route.
-⚬ `build_config` gives `@ai-sdk/anthropic` for a `wire = "anthropic"` endpoint and is unchanged for local and GLM endpoints (snapshot).
-⚬ pytest + ruff gate (rule 8).
-⚬ Non-vacuous: price cache reads at the full input rate and the cost test fails; drop `cache_read_input_tokens` from the sum and the `tokens_in` test fails; send `Authorization: Bearer` instead of `x-api-key` and the header test fails.
-Live (user): one real Claude writer attempt on a toy repo: from the second model call on, `cache_read_input_tokens` is above zero in the trace, and the attempt's cost is below the same token count at the uncached rate. One real GLM attempt on the Coding Plan endpoint: note whether `cached_tokens` is ever above zero, since the docs do not say caching applies there.
-Deviations:
+#52 — Prompt caching: native Anthropic route in the proxy, cached-token accounting for Claude and GLM [~] live · done 2026-11-25, wave 15, see DONE.md · Added: 2026-11-23 · Source: user
 
 ### Unscheduled (first live run, 2026-11-23)
 
@@ -343,7 +308,7 @@ Asked by the user: "should we add the ability for the app to track gpu / memory 
 
 #57 — Global cap on concurrent local-model inference [x] · done 2026-11-25, wave 14, see DONE.md · Added: 2026-11-23 · Source: user
 
-#58 — Poll Ollama for loaded models [x] · done 2026-11-25, wave 13, see DONE.md · Added: 2026-11-23 · Source: user
+#58 — Poll Ollama for loaded models [x] · done 2026-11-25, waves 13 and 15 (status line), see DONE.md · Added: 2026-11-23 · Source: user
 
 #59 — Record memory state on each attempt [x] · done 2026-11-25, wave 14, see DONE.md · Added: 2026-11-23 · Source: user
 
@@ -357,23 +322,17 @@ Asked by the user: "what about agent md files? do we need to tell the agents to 
 
 #61 — Global rules file for every repo [x] · done 2026-11-25, wave 14, see DONE.md · Added: 2026-11-23 · Source: user
 
-#62 — The reviewer sees the repo's conventions [ ] · Added: 2026-11-23 · Source: assistant (gap review)
-Why: `reviewer-v1.md` defines the `style` tag as "ignores the repository's conventions", but `review/` never calls `read_conventions`, so the reviewer judges style with no conventions to compare against. Style kickbacks are guesses.
-Idea: pass the same conventions text (repo + #61 global) into the reviewer prompt, same budget and `defuse`. Invariant f is unaffected: conventions are repo input, not the writer's reasoning. Needs a reviewer prompt bump (`reviewer-v2`) so replays can compare it to v1. Estimate: about 45 minutes.
+#62 — The reviewer sees the repo's conventions [x] · done 2026-11-25, wave 15, see DONE.md · Added: 2026-11-23 · Source: assistant (gap review)
 
 #63 — Read both AGENTS.md and CLAUDE.md, not the first one found [x] · done 2026-11-25, wave 14, see DONE.md · Added: 2026-11-23 · Source: assistant (gap review)
 
-#64 — Check whether OpenCode loads AGENTS.md on its own [ ] · Added: 2026-11-23 · Source: assistant (gap review)
-Why: OpenCode reads `AGENTS.md` from the project dir by default (not confirmed for 1.18.7). If it does, the writer gets the file twice: once from OpenCode, once from our prompt (clipped). That doubles its token cost and makes replays depend on OpenCode's behaviour too.
-Idea: read the current OpenCode docs (rule 12) and check one live attempt's first `llm.call` for the file text. If it is there, turn it off in `build_config` (or the instructions setting) so our prompt is the only source. Estimate: about 15 minutes plus the live check.
+#64 — Check whether OpenCode loads AGENTS.md on its own [~] live · done 2026-11-25, wave 15, see DONE.md · Added: 2026-11-23 · Source: assistant (gap review)
 
 #65 — `fman rules show`: preview the rules an agent will get [ ] · Added: 2026-11-23 · Source: user (asked how to test rules)
 Why: there is no way to see what a rules file turns into before a real ticket runs: which files were found, which order, and whether the budget clipped them.
 Idea: `fman rules show <repo>` prints the assembled conventions block for the writer and the reviewer exactly as the prompt builder renders it, with each source file, its character count and a clear "CLIPPED at N chars" line. No model call. Estimate: about 30 minutes. Depends on #61–#63.
 
-#66 — Replay a rules change before it goes live [ ] · Added: 2026-11-23 · Source: user (asked how to test rules)
-Why: a rules edit changes every future attempt, and there is no way to measure whether it helped. Replays already compare champion vs challenger, but `replay_runner` reads `AGENTS.md` from the worktree at the case's base commit, so both sides always get the same rules.
-Idea: a conventions override on the challenger side (`fman experiment run --rules <file>`), keeping model and prompt fixed, so the comparison isolates the rules. Writer side: pass rate, cost, tokens. Reviewer side: catch / false-kickback rates, `style` tag rate in particular. Record the override's text hash on the experiment. Estimate: about 2 hours. Depends on #61.
+#66 — Replay a rules change before it goes live [x] · done 2026-11-25, wave 15, see DONE.md · Added: 2026-11-23 · Source: user (asked how to test rules)
 
 ### Unscheduled (experiments GUI, 2026-11-23)
 
@@ -390,13 +349,7 @@ Estimate: about 2–3 hours with tests.
 
 Asked by the user: "add the plugin hooks as a todo". Nothing in this repo loads plugins today (no entry-point lookup anywhere in `src/`).
 
-#68 — Plugin hooks, so a separately installed package can extend the worker [ ] · Added: 2026-11-23 · Source: user
-Why: some features do not belong in every install (the metrics page on the network with a login, per-person numbers and spend caps, several boxes on one queue). They need named places to attach to, or each one ends up as a fork of this repo.
-Idea: a small loader (`plugins.py`) reads Python entry points in one group (`foreman_inator.plugins`) at startup and hands each plugin a registry. A hook is a narrow interface whose default is today's behaviour. Add hooks one at a time, each when a real feature needs it; first candidates: who may view the metrics page and which host it binds to (`metrics/web.py`, loopback today), how the spend caps are split (`spend.py`, one shared cap today), extra migrations, extra CLI commands. The dependency runs one way: this repo never imports a plugin and runs unchanged without one. Build the loader together with the first hook, not ahead of it.
-Safety: a plugin is code running inside the worker with its keys. Load only installed packages (never a path from config or from a repo), list every loaded plugin and its version in `fman status` and at startup, and log and skip a plugin that fails to load (never fatal). No hook can relax an invariant (7a–7g): hooks take and return data; they do not replace the merge, allowed-users, sandbox or reviewer-independence checks. Hooks become a public API once a plugin depends on them, so version them, and a plugin states which versions it works with.
-Verify: with no plugin installed every existing test passes unchanged; a fake plugin registered in a test is loaded, listed in status and its hook is called; a plugin that raises on load is skipped and the worker still starts; each hook's default gives today's behaviour. Non-vacuous: make the loader ignore the entry-point group and the fake-plugin test fails.
-SPEC change needed: a short "Plugins" section naming the group, the hooks and the one-way dependency.
-Estimate: about half a day with the first hook and tests.
+#68 — Plugin hooks, so a separately installed package can extend the worker [x] · done 2026-11-25, wave 15, see DONE.md · Added: 2026-11-23 · Source: user
 
 ### Unscheduled (LLM-proposed experiments, 2026-11-24)
 

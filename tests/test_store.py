@@ -175,6 +175,16 @@ EXTRA_COLUMNS: dict[str, list[str]] = {
         "detail",
         "created_at",
     ],
+    # migration 009 (#24)
+    "post_merge_signals": [
+        "id",
+        "ticket_id",
+        "attempt_id",
+        "kind",
+        "at",
+        "detail",
+        "recorded_at",
+    ],
 }
 
 # Enum values copied from SPEC.md "Data model".

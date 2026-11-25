@@ -263,13 +263,16 @@ def shadow_review(
     cancel: Event | None = None,
     clock: Callable[[], float] = time.monotonic,
     precomputed: tuple[Any, Any, Any, Any] | None = None,
+    rules_file: Any = None,
 ) -> ShadowResult:
     """Review ``change`` with the challenger, store the row as ``shadow=1``, post nothing.
     Never raises ``Exception``; see the module docstring for every rule.
 
     ``precomputed`` (#29): the champion's results of checks 1-4 on this same change,
     passed through to ``review_change`` so the challenger only reads the diff (check 5);
-    checks 1-4 are plain code, the same for every reviewer."""
+    checks 1-4 are plain code, the same for every reviewer. ``rules_file``: the repo's
+    configured rules file, the one the live review reads, so the challenger is judged
+    with production's rules."""
     t0 = clock()
     repo: str | None = None
     try:
@@ -315,6 +318,8 @@ def shadow_review(
             kw["python"] = python
         if precomputed is not None:
             kw["precomputed"] = precomputed
+        if rules_file is not None:
+            kw["rules_file"] = rules_file
         try:
             outcome = launch(**kw)
         except rv.FamilyConflict as exc:

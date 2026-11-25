@@ -189,8 +189,12 @@ class Recorder:
         latency_ms: float | None = None,
         cost_usd: float | None = None,
         prompt_version: str | None = None,
+        cache_read_tokens: int = 0,
+        cache_write_tokens: int = 0,
     ) -> dict[str, Any] | None:
         """One model response, as the proxy saw it. `tool_calls` items: {id, name, input}.
+        `cache_read_tokens` / `cache_write_tokens` (#52): input tokens read from / written
+        to the provider's prompt cache (Anthropic route; 0 elsewhere).
         Returns the row written (its `output_file` is set when `text` was spilled to a
         file), or None if the recorder is already closed."""
         calls = [
@@ -214,7 +218,7 @@ class Recorder:
                     "stop_reason": stop_reason,
                     "tool_calls": calls,
                     "raw_content": raw_content,
-                    "usage": {"input_tokens": tokens_in, "output_tokens": tokens_out},
+                    "usage": _usage(tokens_in, tokens_out, cache_read_tokens, cache_write_tokens),
                     "model": model,
                     "request": request,
                     "latency_ms": latency_ms,
@@ -390,3 +394,13 @@ def prune(
                 with contextlib.suppress(OSError):
                     os.rmdir(tdir)  # only if now empty
     return deleted
+
+
+def _usage(tokens_in: int, tokens_out: int, cache_read: int, cache_write: int) -> dict[str, int]:
+    """An ``llm`` row's ``usage``; the #52 cache counts only when non-zero."""
+    usage = {"input_tokens": tokens_in, "output_tokens": tokens_out}
+    if cache_read:
+        usage["cache_read_tokens"] = cache_read
+    if cache_write:
+        usage["cache_write_tokens"] = cache_write
+    return usage

@@ -175,6 +175,7 @@ def run_worker(*, once: bool = False) -> int:
     """``fman run``: build the real collaborators and work until stopped. Exit code."""
     from foreman_inator import config as config_mod
     from foreman_inator import paths
+    from foreman_inator import plugins as plugins_mod
     from foreman_inator.runner.worktree import GitIdentity
     from foreman_inator.worker import ollama_watch_for
 
@@ -183,6 +184,8 @@ def run_worker(*, once: bool = False) -> int:
     too_many = repo_count_warning(cfg)
     if too_many:
         log.warning(too_many)
+    for line in plugins_mod.startup_lines(plugins_mod.load_plugins()):  # #45
+        log.info("%s", line)
     key_path = paths.app_key_path()
     if cfg.app_id is None or not cfg.installation_ids or not key_path.exists():
         log.error("no GitHub App configured or installed: run `fman setup` first")

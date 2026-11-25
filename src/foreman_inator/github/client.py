@@ -52,6 +52,19 @@ Added in wave 6b (rule 12, read 2026-11-23, same API version):
   https://docs.github.com/en/rest/authentication/permissions-required-for-github-apps
   A 403 that is not a rate limit is raised as ``MissingPermission`` (catchable: an App
   created before #41 lacks Checks/Actions read).
+
+Added in wave 15 (#24 / todo 47, rule 12, read 2026-11-25):
+- merge commit: ``GET /repos/{o}/{r}/pulls/{n}`` ``merge_commit_sha``. After a merge it is
+  the merge commit; after a squash, "the SHA of the squashed commit on the base branch";
+  after a rebase, "the commit that the base branch was updated to". Before merging it is the
+  test merge commit, so it is read only when ``merged``. The schema does not say whether it
+  is nullable; a missing or null value is kept as "".
+  https://docs.github.com/en/rest/pulls/pulls#get-a-pull-request
+- commits: ``GET /repos/{o}/{r}/commits`` with ``sha`` ("SHA or branch to start listing
+  commits from", default the default branch) and ``since`` (ISO 8601
+  ``YYYY-MM-DDTHH:MM:SSZ``); ``per_page`` max 100. Items have ``sha``, ``commit.message``,
+  ``commit.committer.date`` and ``parents[].sha``. Pagination follows the ``Link`` header
+  as for every other list here. https://docs.github.com/en/rest/commits/commits#list-commits
 """
 
 from __future__ import annotations
@@ -156,6 +169,18 @@ class PullRequest:
     head_sha: str = ""  # the PR head commit (``head.sha``); CI runs on it (#41)
     #: #43: True | False (conflicts with its base) | None (GitHub is still computing it)
     mergeable: bool | None = None
+    #: #24: the commit the merge put on the base branch ("" until merged; see module doc)
+    merge_commit_sha: str = ""
+
+
+@dataclass(frozen=True)
+class Commit:
+    """One commit from the list-commits endpoint (#24)."""
+
+    sha: str
+    message: str
+    committed_at: datetime | None
+    parents: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -255,6 +280,9 @@ class GitHubAPI(Protocol):
     ) -> list[ReviewComment]: ...
 
     def list_check_runs(self, repo: str, sha: str) -> list[CheckRun]: ...
+    def list_commits(
+        self, repo: str, *, sha: str | None = None, since: datetime | None = None
+    ) -> list[Commit]: ...
     def get_job_log_tail(
         self, repo: str, job_id: int, *, max_chars: int = LOG_TAIL_CHARS
     ) -> str: ...
@@ -377,6 +405,18 @@ def pr_from_json(d: dict[str, Any]) -> PullRequest:
         html_url=d.get("html_url") or "",
         head_sha=(d.get("head") or {}).get("sha") or "",
         mergeable=d.get("mergeable") if isinstance(d.get("mergeable"), bool) else None,
+        merge_commit_sha=(d.get("merge_commit_sha") or "") if merged_at is not None else "",
+    )
+
+
+def commit_from_json(d: dict[str, Any]) -> Commit:
+    inner = d.get("commit") or {}
+    committer = inner.get("committer") or {}
+    return Commit(
+        sha=d["sha"],
+        message=inner.get("message") or "",
+        committed_at=_ts(committer.get("date")),
+        parents=tuple(p["sha"] for p in d.get("parents") or () if p.get("sha")),
     )
 
 
@@ -751,6 +791,21 @@ class GitHubClient:
         except GitHubError as exc:
             raise _as_missing("checks", exc) from None
         return out
+
+    # -- commits (#24)
+
+    def list_commits(
+        self, repo: str, *, sha: str | None = None, since: datetime | None = None
+    ) -> list[Commit]:
+        """Commits reachable from ``sha`` (a branch or commit; default branch if None),
+        newest first, only those after ``since`` when given."""
+        o, r = _split(repo)
+        params: dict[str, Any] = {}
+        if sha is not None:
+            params["sha"] = sha
+        if since is not None:
+            params["since"] = _utc_iso(since)
+        return [commit_from_json(d) for d in self._paginate(f"/repos/{o}/{r}/commits", params)]
 
     def get_job_log_tail(self, repo: str, job_id: int, *, max_chars: int = LOG_TAIL_CHARS) -> str:
         """The end of an Actions job's log. GitHub answers with a 302 to a short-lived

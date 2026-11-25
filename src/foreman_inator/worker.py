@@ -145,6 +145,7 @@ from foreman_inator.worker_install import InstallSteps
 from foreman_inator.worker_pause import PauseSteps
 from foreman_inator.worker_prune import PruneSteps
 from foreman_inator.worker_publish import PublishSteps
+from foreman_inator.worker_quality import QualitySteps
 from foreman_inator.worker_queue import JOIN_TIMEOUT, Job, QueueSteps
 from foreman_inator.worker_rebase import RebaseSteps
 from foreman_inator.worker_review import ReviewSteps
@@ -169,6 +170,7 @@ class Worker(
     SandboxSteps,
     BackgroundSteps,
     PruneSteps,
+    QualitySteps,
 ):
     def __init__(
         self,
@@ -385,6 +387,7 @@ class Worker(
         self.queue_backfill()  # #23: at most one small embedding batch per poll, in the back
         if self._recovered:  # #56: after recover(), so a dead process's attempts are ended
             self.maybe_prune()
+            self.maybe_scan_quality()  # #24: daily post-merge revert / follow-up scan
 
     def after_commit(self, ticket: Ticket, name: str, fn: Callable[[], Any]) -> None:
         """Run ``fn`` once the poll event's transaction has committed (now, outside one).

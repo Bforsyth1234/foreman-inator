@@ -37,6 +37,7 @@ from foreman_inator.github import (
 from foreman_inator.github.client import (
     LOG_TAIL_CHARS,
     CheckRun,
+    Commit,
     MissingPermission,
     ReviewComment,
     log_tail,
@@ -92,6 +93,7 @@ class _Item:
     reviews: list[Review] = field(default_factory=list)
     review_comments: dict[int, list[ReviewComment]] = field(default_factory=dict)
     mergeable: bool | None = None  # #43: None until set_conflict_state (GitHub "computing")
+    merge_commit_sha: str = ""  # #24: set by merge_pr
 
 
 @dataclass
@@ -104,6 +106,9 @@ class _Repo:
     #: sha -> check runs on that commit, in creation order (#41)
     checks: dict[str, list[CheckRun]] = field(default_factory=dict)
     job_logs: dict[int, str] = field(default_factory=dict)
+    #: branch -> commits on it, oldest first (#24: only those added by merge_pr or
+    #: add_base_commit; list_commits returns them newest first)
+    commits: dict[str, list[Commit]] = field(default_factory=dict)
 
 
 class FakeGitHub:
@@ -302,8 +307,13 @@ class FakeGitHub:
         self._event(pr, "merged", by)
         self._close(pr, by, "completed")
         r = self.repos[repo]
+        sha = _sha(f"merge-{repo}-{number}")
+        pr.merge_commit_sha = sha
+        r.commits.setdefault(pr.base, []).append(
+            Commit(sha, f"{pr.title} (#{number})\n\n{pr.body}", now)
+        )
         if pr.base == r.default_branch:
-            r.branches[pr.base] = _sha(f"merge-{repo}-{number}")
+            r.branches[pr.base] = sha
             for n in _CLOSING.findall(pr.body):
                 linked = r.items.get(int(n))
                 if linked is not None and not linked.is_pr and linked.state == "open":
@@ -349,6 +359,23 @@ class FakeGitHub:
             if item.is_pr and item.base == branch:
                 item.mergeable = None  # GitHub recomputes after the base moves
         return r.branches[branch]
+
+    def add_base_commit(
+        self,
+        repo: str,
+        message: str,
+        *,
+        branch: str | None = None,
+        at: datetime | None = None,
+        sha: str | None = None,
+    ) -> Commit:
+        """Someone pushes a commit (e.g. a revert) to ``branch`` (default branch)."""
+        r = self._repo(repo)
+        branch = branch or r.default_branch
+        c = Commit(sha or _sha(f"{repo}-{branch}-commit-{self._id()}"), message, at or self.clock())
+        r.commits.setdefault(branch, []).append(c)
+        r.branches[branch] = c.sha
+        return c
 
     def human_branch(self, repo: str, branch: str, sha: str | None = None) -> str:
         """A branch someone else created (the worker must not touch it)."""
@@ -533,6 +560,18 @@ class FakeGitHub:
         self._require("checks", "list_check_runs")
         return list(self._repo(repo).checks.get(sha, []))
 
+    def list_commits(
+        self, repo: str, *, sha: str | None = None, since: datetime | None = None
+    ) -> list[Commit]:
+        self._call("list_commits", repo=repo, sha=sha, since=since)
+        r = self._repo(repo)
+        rows = r.commits.get(sha or r.default_branch, [])
+        return [
+            c
+            for c in reversed(rows)
+            if since is None or (c.committed_at is not None and c.committed_at > since)
+        ]
+
     def get_job_log_tail(self, repo: str, job_id: int, *, max_chars: int = LOG_TAIL_CHARS) -> str:
         self._call("get_job_log_tail", repo=repo, job_id=job_id, max_chars=max_chars)
         self._require("actions", "get_job_log_tail")
@@ -664,6 +703,7 @@ class FakeGitHub:
             html_url=f"https://github.com/{repo}/pull/{item.number}",
             head_sha=self.repos[repo].branches.get(item.head, ""),
             mergeable=item.mergeable,
+            merge_commit_sha=item.merge_commit_sha,
         )
 
 

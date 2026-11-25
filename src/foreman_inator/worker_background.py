@@ -358,6 +358,7 @@ class BackgroundSteps:
                 recordings_dir=self.recordings_dir,
                 timeout=float(self.config.experiments.shadow_timeout_s),
                 cancel=self.shadow_lane.cancel,
+                rules_file=self._rules_file(t.repo),  # type: ignore[attr-defined]
                 **extra,
             )
         log.info(

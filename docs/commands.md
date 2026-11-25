@@ -63,7 +63,9 @@ for you; do not run a second one beside it.
 ## `fman status`
 
 Tickets by column with their current attempt, flags, waits and PR numbers,
-then the repo count, spend and sandbox lines. Read-only; works with the worker stopped.
+then the repo count, spend and sandbox lines, the Ollama line (`Ollama: N loaded
+(X GB)` or `Ollama: unreachable (...)`, when a model is local) and one line per
+installed plugin (or `Plugins: none`). Read-only; works with the worker stopped.
 What each line means: [setup.md](setup.md#6-reading-fman-status).
 
 | Option | Meaning |
@@ -174,8 +176,10 @@ starts shadow-reviewing live PRs. Nothing is promoted.
 | `--role <role>` | `writer` or `reviewer`. |
 | `--challenger <variant>` | `MODEL/PROMPT@HASH8`, `MODEL/PROMPT` (the prompt file as it is now) or `MODEL`. |
 | `--all` | Resume every unfinished replay (what the nightly agent runs). |
+| `--rules <file>` | Replay this rules file in place of the repo's rules, on the challenger side only (same model and prompt on both sides, so the run compares the rules). `--challenger` may then be omitted. The file's hash is part of the challenger's id (`...+rules@HASH8`). A reviewer replay shows rules only with a `reviewer-v2` prompt. |
 
 Example: `fman experiment run --role writer --challenger inkling-2-mini/writer-v2`.
+Rules: `fman experiment run --role writer --rules ~/notes/new-AGENTS.md`.
 
 ## `fman experiment status`
 

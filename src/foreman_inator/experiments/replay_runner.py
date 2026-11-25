@@ -75,6 +75,21 @@ Unattended (overnight):
   ``sandbox.ensure_available`` is checked first; if the sandbox cannot run, the run stops
   (``stopped: sandbox unavailable``) and nothing runs unsandboxed.
 
+Rules override (#43, todo #66), ``fman experiment run --rules <file>``: a
+``RulesOverride`` on the challenger (``with_rules``) replaces the gathered conventions
+(global rules, rules_file, AGENTS.md/CLAUDE.md, nested files) on the challenger side
+only; the champion keeps the production rules, and model and prompt stay the same on
+both sides, so the comparison isolates the rules. The override text's hash is part of
+the challenger's variant id (``<model>/<prompt>@<hash8>+rules@<rules hash8>``) and its
+full sha256 is in the experiment's result note, so a later edit of the file is a new
+variant and never changes an old result. The reviewer side passes the override as
+``review_change``'s ``conventions`` argument; it reaches the model only through a
+template with a ``conventions`` section (``reviewer-v2``), so a reviewer rules replay
+whose challenger prompt has none is refused up front (``check_reviewer_rules``). Both
+reviewer sides read the repo's ``rules_file``, as the live review does. A reviewer
+result's ``detail`` ends with ``[tag: <tag>]`` when the review tagged a kickback, so
+``SideTotals.style_tags`` counts ``style`` kickbacks.
+
 Never: a push, a PR, a GitHub call of any kind (this module takes no GitHub client), or a
 write to ``tickets``/``attempts``/``reviews``/``kickbacks``. Its writes go to
 ``experiments`` (the row and its ``result_note``) and the 005 replay tables only.
@@ -83,6 +98,7 @@ write to ``tickets``/``attempts``/``reviews``/``kickbacks``. Its writes go to
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import itertools
 import logging
 import shutil
@@ -106,7 +122,7 @@ from foreman_inator.runner import sandbox
 from foreman_inator.runner import verify as verify_mod
 from foreman_inator.runner.worktree import RepoMirror, Worktree, WorktreeError
 from foreman_inator.tickets import conventions as conventions_mod
-from foreman_inator.tickets.prompt import build_writer_prompt
+from foreman_inator.tickets.prompt import CONVENTIONS_BUDGET, build_writer_prompt, clip_head
 from foreman_inator.worker_setup import setup_failure
 
 from . import replay_sets as rs
@@ -125,6 +141,23 @@ STOP_SANDBOX = "stopped: sandbox unavailable"
 STOP_CANCELLED = "cancelled"
 
 WRITER_FAIL_STATUSES = ("failed", "no_change", "agent_failed", "timed_out")
+RULES_SUFFIX = "+rules@"  # challenger variant id: <model>/<prompt>@<hash8>+rules@<hash8>
+RULES_HASH_LEN = 8
+TAG_MARK = "[tag: {tag}]"  # appended to a reviewer result's detail when the review tagged
+#: Why a reviewer rules replay with a prompt lacking a ``conventions`` section is refused.
+NO_CONVENTIONS_SECTION = (
+    "reviewer rules replays need a prompt with a conventions section, such as reviewer-v2;"
+    " {prompt} has none, so the override would reach no model and the replay would compare"
+    " nothing. Pass --challenger <model>/reviewer-v2"
+)
+
+
+def check_reviewer_rules(prompt_name: str) -> None:
+    """#43: refuse a reviewer rules override whose prompt never shows the conventions."""
+    if not rv.wants_conventions(rv.load_reviewer_template(prompt_name)):
+        raise ValueError(NO_CONVENTIONS_SECTION.format(prompt=prompt_name))
+
+
 _EPS = 1e-9
 
 
@@ -143,6 +176,55 @@ class ReplaySettings:
     min_cases: int = 10  # cases scored on both sides before a verdict
 
 
+@dataclass(frozen=True, slots=True)
+class RulesOverride:
+    """A rules file replayed on the challenger side in place of the gathered conventions
+    (#43). ``text`` is the file's content when the run started; ``name`` is shown as the
+    source's path in the prompt."""
+
+    text: str
+    name: str = "AGENTS.md"
+
+    @property
+    def sha256(self) -> str:
+        return hashlib.sha256(self.text.encode("utf-8")).hexdigest()
+
+    @property
+    def hash8(self) -> str:
+        return self.sha256[:RULES_HASH_LEN]
+
+    @classmethod
+    def from_path(cls, path: str | Path) -> RulesOverride:
+        p = Path(path).expanduser()
+        return cls(p.read_text(encoding="utf-8"), p.name)
+
+    def conventions(self, budget: int = CONVENTIONS_BUDGET) -> conventions_mod.Conventions:
+        """The override as the only rules source, clipped to the shared budget."""
+        text = self.text.replace("\r\n", "\n").strip()
+        if not text:
+            return conventions_mod.Conventions(budget=budget)
+        shown = clip_head(text, budget)
+        clipped = shown != text
+        src = conventions_mod.Source(
+            kind="repo",
+            path=self.name,
+            label=f"Repository file {self.name}.",
+            text=shown,
+            chars=len(text),
+            clipped=clipped,
+        )
+        clips = (conventions_mod.Clip("repo", self.name, len(text), len(shown)),) if clipped else ()
+        if clipped:
+            log.warning("rules override %s clipped to %d characters", self.name, budget)
+        return conventions_mod.Conventions(sources=(src,), clips=clips, budget=budget)
+
+
+def split_rules_id(variant_id: str) -> tuple[str, str | None]:
+    """``(base variant id, rules hash8 or None)`` for a possibly ``+rules@`` id."""
+    base, sep, h = variant_id.partition(RULES_SUFFIX)
+    return (base, h) if sep else (variant_id, None)
+
+
 @dataclass(frozen=True)
 class WriterVariant:
     """A writer variant as the replay needs it: the id (#24's format), the model, and the
@@ -151,6 +233,7 @@ class WriterVariant:
     variant_id: str
     endpoint: ModelEndpoint
     template: PromptRef
+    rules: RulesOverride | None = None  # #43: challenger-side conventions override
 
 
 @dataclass(frozen=True)
@@ -160,9 +243,19 @@ class ReviewerVariant:
     variant_id: str
     endpoint: ModelEndpoint
     prompt_name: str = rv.REVIEWER_PROMPT_NAME
+    rules: RulesOverride | None = None  # #43: challenger-side conventions override
 
 
 Variant = WriterVariant | ReviewerVariant
+
+
+def with_rules(variant: Variant, rules: RulesOverride) -> Variant:
+    """``variant`` (same model, same prompt) with a rules override; its id gains
+    ``+rules@<hash8>`` so a different rules text is a different variant."""
+    from dataclasses import replace
+
+    base, _ = split_rules_id(variant.variant_id)
+    return replace(variant, variant_id=f"{base}{RULES_SUFFIX}{rules.hash8}", rules=rules)
 
 
 class SandboxFactory(Protocol):
@@ -257,6 +350,7 @@ class SideTotals:
     seconds: float = 0.0
     tokens_in: int = 0
     tokens_out: int = 0
+    style_tags: int = 0  # reviewer: kickbacks tagged ``style`` (#43)
 
     @property
     def correct(self) -> int:
@@ -557,6 +651,7 @@ def _totals(variant_id: str, rows: Sequence[CaseResult]) -> SideTotals:
         seconds=round(sum(r.seconds for r in rows), 3),
         tokens_in=sum(r.tokens_in for r in rows),
         tokens_out=sum(r.tokens_out for r in rows),
+        style_tags=n(lambda r: (r.detail or "").endswith(TAG_MARK.format(tag="style"))),
     )
 
 
@@ -674,12 +769,20 @@ def comparison_note(c: Comparison) -> str:
             f"Cost: champion {_money(a.cost_usd)} ({_money(a.cost_per_pass)} per pass),"
             f" challenger {_money(b.cost_usd)} ({_money(b.cost_per_pass)} per pass)."
         )
+        lines.append(
+            f"Tokens in/out: champion {a.tokens_in}/{a.tokens_out}, challenger"
+            f" {b.tokens_in}/{b.tokens_out}."
+        )
     else:
         lines.append(
             f"Catches: champion {a.catches}, challenger {b.catches}; false kickbacks:"
             f" champion {a.false_kickbacks}, challenger {b.false_kickbacks}; misses:"
             f" champion {a.misses}, challenger {b.misses}; handed to user: champion"
             f" {a.handed}, challenger {b.handed}."
+        )
+        lines.append(
+            f"Style-tagged kickbacks: champion {a.style_tags}/{a.cases}, challenger"
+            f" {b.style_tags}/{b.cases}."
         )
         lines.append(f"Cost: champion {_money(a.cost_usd)}, challenger {_money(b.cost_usd)}.")
     lines.append(f"Time: champion {a.seconds:.1f}s, challenger {b.seconds:.1f}s.")
@@ -772,8 +875,17 @@ def run_replay(
                                champion, challenger, cancel)  # fmt: skip
         _set_state(store, experiment_id, state, reason)
     c = compare(store, experiment_id, min_cases=settings.min_cases)
-    store.set_experiment_note(experiment_id, comparison_note(c))
+    store.set_experiment_note(experiment_id, comparison_note(c) + _rules_note(challenger))
     return c
+
+
+def _rules_note(challenger: Variant) -> str:
+    if challenger.rules is None:
+        return ""
+    return (
+        f"\nRules override {challenger.rules.name} sha256 {challenger.rules.sha256}: challenger"
+        " only, in place of the gathered rules; same model and prompt on both sides."
+    )
 
 
 def _check_variants(role: Role, champion: Variant, challenger: Variant) -> None:
@@ -783,6 +895,13 @@ def _check_variants(role: Role, champion: Variant, challenger: Variant) -> None:
             raise TypeError(f"a {role} replay needs {kind.__name__}s")
     if champion.variant_id == challenger.variant_id:
         raise ValueError("champion and challenger must be different variants")
+    if champion.rules is not None:
+        raise ValueError("a rules override goes on the challenger only")
+    if challenger.rules is not None:
+        if not challenger.variant_id.endswith(f"{RULES_SUFFIX}{challenger.rules.hash8}"):
+            raise ValueError("the challenger's id must name its rules hash (with_rules)")
+        if role == "reviewer":
+            check_reviewer_rules(challenger.prompt_name)  # type: ignore[union-attr]
 
 
 def _drive(
@@ -816,8 +935,11 @@ def _drive(
                     and not deps.spend.allow(0.0001, "experiments")
                 ):
                     return "stopped", STOP_EXPERIMENTS_BUDGET
+                # #43: the override is the challenger's alone; the champion always sees
+                # the production rules.
+                rules = challenger.rules if side == "challenger" else None
                 ctx = _SideCtx(deps, settings, experiment_id, case, side, variant, cancel, tap,
-                               budget, mirrors)  # fmt: skip
+                               budget, mirrors, rules=rules)  # fmt: skip
                 try:
                     with _tracer.start_as_current_span(
                         "replay.case",
@@ -826,6 +948,7 @@ def _drive(
                             "replay.case_id": case.id,
                             "replay.side": side,
                             "replay.variant_id": variant.variant_id,
+                            "replay.rules_sha256": rules.sha256 if rules else "",
                         },
                     ):
                         result = _writer_side(ctx) if role == "writer" else _reviewer_side(ctx)
@@ -862,6 +985,7 @@ class _SideCtx:
     budget: _Budget
     mirrors: dict[str, RepoMirror]
     policies: list[sandbox.Policy] = field(default_factory=list)
+    rules: RulesOverride | None = None  # #43: replaces the gathered rules on this side
     conventions_sha256: str | None = None  # writer side: hash of the rules in its prompt
 
     @property
@@ -1015,8 +1139,13 @@ def _writer_side(ctx: _SideCtx) -> CaseResult:
         now = deps.store.now()
         # The production prompt's rules (#38, #40): global rules, the repo's rules_file,
         # AGENTS.md + CLAUDE.md and nested files, as ``Worker._run_attempt`` gathers them.
-        conv = conventions_mod.gather(
-            wt.path, wc.owned_files, rules_file=_rules_file(deps.config, wc.repo)
+        # #43: a challenger rules override replaces them, model and prompt unchanged.
+        conv = (
+            ctx.rules.conventions()
+            if ctx.rules is not None
+            else conventions_mod.gather(
+                wt.path, wc.owned_files, rules_file=_rules_file(deps.config, wc.repo)
+            )
         )
         ctx.conventions_sha256 = conv.sha256  # determinism: which rules it saw (logged)
         prompt = build_writer_prompt(
@@ -1126,6 +1255,10 @@ def _reviewer_side(ctx: _SideCtx) -> CaseResult:
     aid = _synthetic_id()
     try:
         policy = ctx.policy(work, "review", writer=False)
+        extra: dict[str, Any] = {}
+        if ctx.rules is not None:  # #43 (_check_variants: the prompt shows conventions)
+            extra["conventions"] = ctx.rules.conventions()
+            ctx.conventions_sha256 = extra["conventions"].sha256
         with ctx.tap.watch(ctx.budget, attempt_id=aid) as meter, sandbox.active(policy):
             outcome = rv.review_change(
                 issue=rv.IssueText(rc.issue_number, rc.title, rc.request),
@@ -1141,15 +1274,21 @@ def _reviewer_side(ctx: _SideCtx) -> CaseResult:
                 timeout=settings.review_timeout_s,
                 check_timeout=min(settings.review_timeout_s, settings.verify_timeout_s),
                 cancel=ctx.cancel,
+                rules_file=_rules_file(deps.config, rc.repo),  # production's, as live
+                **extra,
             )
         if meter.refused:
             raise _Stop(meter.refused)
         if ctx.cancel.is_set():
             raise _Stop(STOP_CANCELLED)
+        note = outcome.note or ""
+        if getattr(outcome, "tag", None):
+            # kept at the end: CaseResult keeps the last 2000 characters of detail
+            note = f"{note[-1900:]}\n{TAG_MARK.format(tag=outcome.tag)}".lstrip("\n")
         return ctx.result(
             "scored",
             t0,
-            detail=outcome.note,
+            detail=note,
             verdict=outcome.verdict,
             score=review_score(rc.truth, outcome.verdict),
             tokens_in=outcome.tokens_in,
@@ -1172,6 +1311,7 @@ __all__ = [
     "ReplayDeps",
     "ReplaySettings",
     "ReviewerVariant",
+    "RulesOverride",
     "RunStatus",
     "SandboxFactory",
     "SideTotals",
@@ -1184,6 +1324,8 @@ __all__ = [
     "results",
     "review_score",
     "run_replay",
+    "split_rules_id",
     "start_replay",
     "verdict_for",
+    "with_rules",
 ]

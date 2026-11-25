@@ -493,7 +493,7 @@ def test_pricing_local_free_known_cloud_and_conservative_default():
     assert unknown is CONSERVATIVE_DEFAULT and unknown.conservative
     assert unknown.input_per_mtok >= max(p.input_per_mtok for p in pricing.PRICES.values())
     for p in pricing.PRICES.values():
-        assert p.source.startswith("https://") and p.as_of == "2026-11-23"
+        assert p.source.startswith("https://") and p.as_of == "2026-11-25"
     haiku = pricing.PRICES["claude-haiku-5-5"]
     assert haiku.cost(200_000, 0) == pytest.approx(0.1)  # long-prompt rate
 
