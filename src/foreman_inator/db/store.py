@@ -44,6 +44,11 @@ RanApp = Literal["yes", "no", "not_runnable"]
 Role = Literal["writer", "reviewer"]
 ExperimentMode = Literal["replay", "seeded", "shadow", "split", "pair"]
 ExperimentStatus = Literal["running", "promoted", "rejected"]
+#: experiments.origin (#69, migration 011): who wrote the challenger.
+ExperimentOrigin = Literal["human", "llm"]
+EXPERIMENT_ORIGINS: tuple[str, ...] = ("human", "llm")
+#: prompt_drafts.status (#69, migration 011).
+DraftStatus = Literal["draft", "approved", "discarded"]
 SpendBucket = Literal["live", "experiments"]
 #: attempts.end_reason (#58, migration 007): why an attempt ended, beyond its outcome.
 EndReason = Literal["budget", "timeout"]
@@ -210,6 +215,35 @@ class Experiment:
     started_at: datetime
     ended_at: datetime | None
     result_note: str | None
+    # migration 011 (#69): "llm" when the challenger is an approved prompt draft; then
+    # cutoff_at is the draft's cutoff (its replay uses only tickets created after it).
+    origin: ExperimentOrigin = "human"
+    cutoff_at: datetime | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PromptDraft:
+    """#69 (migration 011): a challenger prompt drafted by the proposer, waiting for the
+    user. ``patterns`` is the JSON list of kickback patterns it targets."""
+
+    id: int
+    role: Role
+    prompt_name: str
+    prompt_hash: str
+    prompt_text: str
+    rationale: str
+    patterns: str
+    base_variant: str
+    model: str
+    proposer_model: str
+    cutoff_at: datetime
+    path: str
+    est_cost_usd: float
+    cost_usd: float
+    status: DraftStatus
+    created_at: datetime
+    decided_at: datetime | None
+    experiment_id: int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1016,20 +1050,159 @@ class Store:
         challenger_variant: str,
         mode: ExperimentMode,
         traffic_share: float | None = None,
+        origin: ExperimentOrigin | None = None,
+        cutoff_at: datetime | None = None,
     ) -> Experiment:
-        experiment_id = self._insert(
-            "experiments",
+        """A running experiment. ``origin`` None (#69): "llm" with the draft's cutoff when
+        the challenger is an approved prompt draft (``approved_draft_for``), else "human".
+        So every experiment of a proposed challenger (its replay, its shadow, a split),
+        however it is started, carries the cutoff."""
+        values: dict[str, Any] = {
+            "role": role,
+            "champion_variant": champion_variant,
+            "challenger_variant": challenger_variant,
+            "mode": mode,
+            "traffic_share": traffic_share,
+            "status": "running",
+            "started_at": self.now(),
+        }
+        if self._has_column("experiments", "origin"):
+            with self.transaction():
+                if origin is None:
+                    draft = self.approved_draft_for(role, challenger_variant)
+                    origin = "llm" if draft is not None else "human"
+                    if draft is not None and cutoff_at is None:
+                        cutoff_at = draft.cutoff_at
+                values["origin"] = origin
+                values["cutoff_at"] = cutoff_at
+                experiment_id = self._insert("experiments", values)
+        else:
+            experiment_id = self._insert("experiments", values)
+        return self.get_experiment(experiment_id)
+
+    def running_llm_experiments(self, role: Role) -> list[Experiment]:
+        """#69: running experiments of ``role`` whose challenger an LLM drafted."""
+        if not self._has_column("experiments", "origin"):
+            return []
+        rows = self.query(
+            "SELECT * FROM experiments WHERE role = ? AND status = 'running' AND origin = 'llm'"
+            " ORDER BY id",
+            (role,),
+        )
+        return [_row_to(Experiment, r) for r in rows]
+
+    # -- prompt drafts (#69) --
+
+    def create_prompt_draft(
+        self,
+        *,
+        role: Role,
+        prompt_name: str,
+        prompt_hash: str,
+        prompt_text: str,
+        rationale: str,
+        patterns: str,
+        base_variant: str,
+        model: str,
+        proposer_model: str,
+        cutoff_at: datetime,
+        path: str,
+        est_cost_usd: float = 0.0,
+        cost_usd: float = 0.0,
+    ) -> PromptDraft:
+        draft_id = self._insert(
+            "prompt_drafts",
             {
                 "role": role,
-                "champion_variant": champion_variant,
-                "challenger_variant": challenger_variant,
-                "mode": mode,
-                "traffic_share": traffic_share,
-                "status": "running",
-                "started_at": self.now(),
+                "prompt_name": prompt_name,
+                "prompt_hash": prompt_hash,
+                "prompt_text": prompt_text,
+                "rationale": rationale,
+                "patterns": patterns,
+                "base_variant": base_variant,
+                "model": model,
+                "proposer_model": proposer_model,
+                "cutoff_at": cutoff_at,
+                "path": path,
+                "est_cost_usd": float(est_cost_usd),
+                "cost_usd": float(cost_usd),
+                "status": "draft",
+                "created_at": self.now(),
             },
         )
-        return self.get_experiment(experiment_id)
+        return self.get_prompt_draft(draft_id)
+
+    def get_prompt_draft(self, draft_id: int) -> PromptDraft:
+        row = self._one("SELECT * FROM prompt_drafts WHERE id = ?", (int(draft_id),))
+        if row is None:
+            raise NotFoundError(f"no prompt draft {draft_id}")
+        return _row_to(PromptDraft, row)
+
+    def list_prompt_drafts(
+        self, *, role: Role | None = None, status: DraftStatus | None = None
+    ) -> list[PromptDraft]:
+        where, params = [], []
+        if role is not None:
+            where.append("role = ?")
+            params.append(role)
+        if status is not None:
+            where.append("status = ?")
+            params.append(status)
+        sql = "SELECT * FROM prompt_drafts"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        return [_row_to(PromptDraft, r) for r in self.query(sql + " ORDER BY id", params)]
+
+    def decide_prompt_draft(
+        self,
+        draft_id: int,
+        status: Literal["approved", "discarded"],
+        *,
+        prompt_text: str | None = None,
+        prompt_hash: str | None = None,
+    ) -> PromptDraft:
+        """Approve or discard an open draft (only an open one). ``prompt_text`` /
+        ``prompt_hash``: the text as approved (the user may edit the draft file first)."""
+        values: dict[str, Any] = {"status": status, "decided_at": _ts(self.now())}
+        if prompt_text is not None:
+            values["prompt_text"] = prompt_text
+        if prompt_hash is not None:
+            values["prompt_hash"] = prompt_hash
+        sets = ", ".join(f"{k} = ?" for k in values)
+        with self.transaction() as conn:
+            cur = conn.execute(
+                f"UPDATE prompt_drafts SET {sets} WHERE id = ? AND status = 'draft'",
+                (*values.values(), int(draft_id)),
+            )
+            if cur.rowcount != 1:
+                draft = self.get_prompt_draft(draft_id)  # NotFoundError if missing
+                raise StoreError(f"prompt draft {draft_id} is already {draft.status}")
+        return self.get_prompt_draft(draft_id)
+
+    def set_prompt_draft_experiment(self, draft_id: int, experiment_id: int) -> PromptDraft:
+        with self.transaction() as conn:
+            conn.execute(
+                "UPDATE prompt_drafts SET experiment_id = ? WHERE id = ?",
+                (int(experiment_id), int(draft_id)),
+            )
+        return self.get_prompt_draft(draft_id)
+
+    def approved_draft_for(self, role: str, variant_id: str) -> PromptDraft | None:
+        """The approved draft whose prompt variant ``variant_id`` runs
+        (``<model>/<prompt>@<hash8>``, a ``+rules@...`` suffix ignored), or None."""
+        if not self._has_table("prompt_drafts"):
+            return None
+        base = variant_id.split("+", 1)[0]
+        _model, _, prompt = base.rpartition("/")
+        name, _, hash8 = prompt.partition("@")
+        if not name or not hash8:
+            return None
+        row = self._one(
+            "SELECT * FROM prompt_drafts WHERE role = ? AND status = 'approved'"
+            " AND prompt_name = ? AND substr(prompt_hash, 1, ?) = ? ORDER BY id DESC LIMIT 1",
+            (role, name, len(hash8), hash8),
+        )
+        return _row_to(PromptDraft, row) if row else None
 
     def get_experiment(self, experiment_id: int) -> Experiment:
         row = self._one("SELECT * FROM experiments WHERE id = ?", (experiment_id,))

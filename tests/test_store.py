@@ -139,7 +139,15 @@ EXTRA_COLUMNS: dict[str, list[str]] = {
     # migration 004 (#23)
     "ticket_embeddings": ["ticket_id", "model", "dims", "vector", "text_sha256", "created_at"],
     # migration 005 (#25)
-    "replay_sets": ["id", "role", "built_at", "max_merges", "case_count", "skipped_count"],
+    "replay_sets": [
+        "id",
+        "role",
+        "built_at",
+        "max_merges",
+        "case_count",
+        "skipped_count",
+        "cutoff_at",  # migration 011 (#69)
+    ],  # fmt: skip
     "replay_cases": [
         "id",
         "set_id",
@@ -187,6 +195,28 @@ EXTRA_COLUMNS: dict[str, list[str]] = {
         "detail",
         "recorded_at",
     ],
+    # migration 011 (#69)
+    "experiments": ["origin", "cutoff_at"],
+    "prompt_drafts": [
+        "id",
+        "role",
+        "prompt_name",
+        "prompt_hash",
+        "prompt_text",
+        "rationale",
+        "patterns",
+        "base_variant",
+        "model",
+        "proposer_model",
+        "cutoff_at",
+        "path",
+        "est_cost_usd",
+        "cost_usd",
+        "status",
+        "created_at",
+        "decided_at",
+        "experiment_id",
+    ],  # fmt: skip
 }
 
 # Enum values copied from SPEC.md "Data model".
