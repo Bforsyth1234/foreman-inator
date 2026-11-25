@@ -254,6 +254,12 @@ def test_route_is_not_queued_behind_a_long_writer_stream(fake, proxy):
         t.join(10)
     assert (r.tier, r.source) == (1, "classifier"), r.reason
     assert elapsed < 1.5
+    # The server releases the slot after the client read the last byte; on a busy CI
+    # runner that can land a moment later, so wait for it instead of asserting at once.
+    for _ in range(500):
+        if proxy.local_slots()[0] == 0:
+            break
+        time.sleep(0.01)
     assert proxy.local_slots() == (0, 1)
 
 
