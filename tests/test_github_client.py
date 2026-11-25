@@ -432,6 +432,8 @@ VOLATILE = {
     "started_at",
     "completed_at",
     "review_id",
+    # wave 15 (#24): the merge commit's sha (the 2026-11-23 recording predates the field)
+    "merge_commit_sha",
 }
 
 
