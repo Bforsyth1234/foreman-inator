@@ -40,6 +40,13 @@ run can be pinned to the exact cases it compared on. The store already is the on
 the worker's durable state lives; files under a directory would need their own atomic
 writes, listing and cleanup.
 
+Local only (#49). A repo set ``cloud = false`` keeps its code on the Mac, and a replay
+sends a case's issue, diff and tests to the variants' models. Its cases are still built
+and stored (a local challenger may replay them), but ``list_cases`` leaves them out
+unless the caller says every model of the run is local (``cloud_models=False``). The
+setting is read when the cases are listed, not when the set was built, so a repo set
+local only after its set was built is left out at once. The default fails closed.
+
 Public API: ``build_replay_set``, ``ensure_current_set`` (the monthly rebuild),
 ``latest_set``, ``rebuild_due``, ``list_sets``, ``get_set``, ``list_cases``,
 ``get_case``.
@@ -609,11 +616,20 @@ def _case_from(row: Any) -> StoredCase:
     )
 
 
-def list_cases(store: Store, set_id: int, *, include_skipped: bool = False) -> list[StoredCase]:
+def list_cases(
+    store: Store, set_id: int, *, include_skipped: bool = False, cloud_models: bool = True
+) -> list[StoredCase]:
+    """The set's cases, oldest first. ``cloud_models`` (#49): may a model of this run be a
+    cloud model? True (the default) leaves out the cases of local-only repos; pass False
+    only when every model the cases go to is local."""
     sql = "SELECT * FROM replay_cases WHERE set_id = ?"
     if not include_skipped:
         sql += " AND status = 'ok'"
-    return [_case_from(r) for r in store.query(sql + " ORDER BY id", (int(set_id),))]
+    cases = [_case_from(r) for r in store.query(sql + " ORDER BY id", (int(set_id),))]
+    if not cloud_models:
+        return cases
+    local = store.local_only_repos()
+    return [c for c in cases if c.repo not in local]
 
 
 def get_case(store: Store, case_id: int) -> StoredCase:

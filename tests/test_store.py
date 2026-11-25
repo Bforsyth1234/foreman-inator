@@ -118,6 +118,8 @@ EXTRA_COLUMNS: dict[str, list[str]] = {
         # migration 008 (#51)
         "writer_mode",
         "review_mode",
+        # migration 010 (#49)
+        "cloud",
     ],
     "champion_history": ["id", "role", "variant_id", "set_at", "note"],
     "poll_cursors": ["repo", "name", "value", "updated_at"],

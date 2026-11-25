@@ -35,7 +35,9 @@ The shadow review (``shadow_review``)
       experiment started: a new variant needs a new experiment), ``prompt_missing``,
       ``challenger_is_champion``, ``no_model_step`` (the champion's verdict came from
       checks 1-4 alone, which are the same code for every reviewer, so a challenger
-      would reach the same verdict without a model call; nothing to compare), ``error``.
+      would reach the same verdict without a model call; nothing to compare),
+      ``local_only`` (#49: the ticket's repo is set ``cloud = false`` and the challenger
+      is a cloud model, so the repo's code is not sent to it), ``error``.
       Skips are recorded once per (variant, attempt) in ``poll_cursors`` under
       ``shadow-skip:<variant>:a<attempt>`` (value ``"<code>: <detail>"``), so the shadow
       is never retried in a loop (7e) and scoring can report why an attempt has only the
@@ -284,6 +286,7 @@ def shadow_review(
             return _result(done, attempt_id, challenger_variant, experiment_id, clock() - t0)
         _preconditions(
             store,
+            repo=repo,
             attempt_id=attempt_id,
             writer=writer,
             challenger=challenger,
@@ -381,6 +384,7 @@ def _shadow_row(store: Store, attempt_id: int, variant: str) -> Review | None:
 def _preconditions(
     store: Store,
     *,
+    repo: str | None = None,
     attempt_id: int,
     writer: ModelEndpoint,
     challenger: ModelEndpoint,
@@ -394,6 +398,11 @@ def _preconditions(
         raise _Skip("champion_not_stored", "the champion's verdict is not stored yet")
     if counted[0].variant_id == variant:
         raise _Skip("challenger_is_champion", f"{variant} gave the counted review")
+    if challenger.kind != "local" and not store.repo_allows_cloud(repo):
+        raise _Skip(
+            "local_only",
+            f"{repo} is local only (cloud = false); {challenger.name} is a cloud model",
+        )
     try:
         rv.check_independent(challenger, writer)
     except rv.FamilyConflict as exc:

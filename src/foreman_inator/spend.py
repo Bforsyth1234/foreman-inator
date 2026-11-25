@@ -66,6 +66,14 @@ Rules as implemented:
   tokens pass the limit by at most one call's input. ``None`` turns a limit off, and is
   the constructor's default (so a bare ``Spend`` keeps the old behaviour); the worker
   passes the config's values, whose defaults are the ``DEFAULT_ATTEMPT_*`` constants.
+* **Local only** (#49). A repo set ``cloud = false`` (``repo_settings.cloud = 0``,
+  ``Store.set_cloud``) never sends its code to a cloud model. Escalation already stops at
+  its last local tier and review picks a local reviewer; as defence in depth (invariant
+  7c), every cloud call the proxy attributes to one of that repo's tickets (through its
+  attempt, or its review's attempt), in either bucket, is refused here before it is sent
+  (cap ``local_only``). No approval can lift it (``needs_approval`` is False) and no
+  ledger row is written; ``refusal_for_attempt`` remembers it for the logs. The setting
+  is read from the store on every call, so a change takes effect at once.
 """
 
 from __future__ import annotations
@@ -85,7 +93,9 @@ from foreman_inator.db.store import NotFoundError, SpendApproval, SpendEntry, St
 log = logging.getLogger(__name__)
 
 Bucket = Literal["live", "experiments"]
-CapName = Literal["daily", "monthly", "experiments_monthly", "approval", "attempt", "thrifty"]
+CapName = Literal[
+    "daily", "monthly", "experiments_monthly", "approval", "attempt", "thrifty", "local_only"
+]
 BUCKETS: tuple[Bucket, ...] = ("live", "experiments")
 
 #: Flag reason for a ticket paused at the cap (``store.flag_ticket(id, f"{FLAG_SPEND_CAP}: ...")``).
@@ -97,6 +107,8 @@ FLAG_ATTEMPT_BUDGET = "attempt_budget"
 #: #51: the flag reason of a ticket paused by the ``thrifty`` writer mode (a spend_cap
 #: pause, so the status and resume paths treat it like one).
 FLAG_THRIFTY = f"{FLAG_SPEND_CAP}: thrifty profile"
+#: #49: a cloud call refused because the ticket's repo is local only (``cloud = false``).
+FLAG_LOCAL_ONLY = "local_only"
 #: Per-attempt limits (#58), defined in ``config`` (whose keys default to them) and
 #: re-exported here. The live run that prompted #58 spent $4.78 and 3.34M input tokens
 #: in one tier 3 attempt.
@@ -139,7 +151,11 @@ class Refusal:
         """True for live spend tied to a ticket: the worker pauses it and asks the user.
         Experiment refusals never ask (replays just stop); nor does an attempt budget
         stop (the attempt ends and escalation hands the ticket over)."""
-        return self.bucket == "live" and self.ticket_id is not None and self.cap != "attempt"
+        return (
+            self.bucket == "live"
+            and self.ticket_id is not None
+            and self.cap not in ("attempt", "local_only")
+        )
 
     @property
     def detail(self) -> str:
@@ -154,6 +170,11 @@ class Refusal:
             return f"{FLAG_ATTEMPT_BUDGET}: {self.detail}"
         if self.cap == "thrifty":
             return f"{FLAG_THRIFTY}: a cloud writer attempt waits for approval"
+        if self.cap == "local_only":
+            return (
+                f"{FLAG_LOCAL_ONLY}: the repo is local only (cloud = false); refused a call "
+                f"to cloud model {self.model or '?'}"
+            )
         return f"{FLAG_SPEND_CAP}: {self.cap} cap ${self.cap_usd:.2f} reached"
 
 
@@ -430,6 +451,18 @@ class Spend:
         with self._lock:
             now = self.now()
             who = self._who(ctx)
+            if not self._repo_allows_cloud(who):
+                refusal = _with_who(
+                    Refusal(bucket, "local_only", 0.0, 0.0, 0.0, estimate, None, now),  # type: ignore[arg-type]
+                    who,
+                    ep.name,
+                )
+                if who.attempt_id is not None:
+                    self._refusals_by_attempt[who.attempt_id] = refusal
+                log.warning(
+                    "spend: refused %s call: ticket %s's repo is local only", ep.name, who.ticket_id
+                )
+                return False
             reserved = self._reserved(bucket, now)
             stop = self._attempt_check(ep, estimate, ctx, bucket, who, now)
             if stop is not None:
@@ -450,6 +483,17 @@ class Spend:
             res = _Reservation(estimate, now, who.attempt_id if granted else None)
             self._state.reservations.setdefault(key, deque()).append(res)
             return True
+
+    def _repo_allows_cloud(self, who: _Who) -> bool:
+        """#49: False when the call's ticket belongs to a repo set local only. A call the
+        proxy cannot attribute to a ticket is not a repo's code, so the caps alone apply."""
+        if who.ticket_id is None:
+            return True
+        try:
+            repo = self.store.get_ticket(who.ticket_id).repo
+        except NotFoundError:
+            return True
+        return self.store.repo_allows_cloud(repo)
 
     def _local_estimate(self, ep: ModelEndpoint, ctx) -> bool:
         """A local call: only the attempt's input-token limit can refuse it (#58)."""
@@ -746,6 +790,7 @@ __all__ = [
     "DEFAULT_ATTEMPT_MAX_INPUT_TOKENS_LOCAL",
     "DEFAULT_RESERVATION_TTL",
     "FLAG_ATTEMPT_BUDGET",
+    "FLAG_LOCAL_ONLY",
     "FLAG_SPEND_CAP",
     "FLAG_THRIFTY",
     "Refusal",

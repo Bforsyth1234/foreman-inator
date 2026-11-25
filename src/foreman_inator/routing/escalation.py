@@ -71,6 +71,16 @@ and passes it as ``History.start_tier`` (``routed_tier`` stays the router's own 
 #23's kNN router learns from). The per-attempt budget hand-over (#58) comes before every
 count, so it holds for every profile.
 
+**Local only** (#49). A repo set ``cloud = false`` passes ``Limits(cloud=False)``
+(``with_cloud``): the decision runs on the ladder's *local* rungs only (``Rung.cloud``
+False; a rung of unknown kind counts as cloud, so a hand-built ladder fails closed).
+"Move up" from the last local rung hands over with flag ``local_only`` (the reason keeps
+the trigger's own flag after it, e.g. ``local_only: checks_failed: ...``) instead of
+escalating to a cloud tier; a routed tier that only has cloud models starts on the last
+local rung; no local rung at all hands over at once. Every other rule and count is the
+profile's, so the bound is ``attempt_bound(local rungs, limits)``, at most the full
+ladder's (7e). The spend gate refuses that repo's cloud calls as well (``spend.py``).
+
 Return types subclass v1's ``worker_policy.Retry`` / ``HandToUser``, so code that checks
 ``isinstance(step, worker_policy.Retry)`` keeps working; they add the model to run
 (``model``) and, for a hand-over, whether to mark the PR ready (``mark_ready``).
@@ -80,7 +90,7 @@ from __future__ import annotations
 
 import functools
 from collections.abc import Callable, Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from typing import Protocol
 
 from foreman_inator import worker_policy as v1
@@ -108,6 +118,8 @@ FLAG_EXPLORE_FAILED = "explore_failed"
 FLAG_NO_MODEL = "no_model"
 #: #58: the last attempt reached its per-attempt budget (``spend.FLAG_ATTEMPT_BUDGET``).
 FLAG_ATTEMPT_BUDGET = "attempt_budget"
+#: #49: a local-only repo (``cloud = false``) reached its last local rung.
+FLAG_LOCAL_ONLY = "local_only"
 
 
 @dataclass(frozen=True)
@@ -117,7 +129,10 @@ class Limits:
     ``start_shift``, ``explore_rate`` and ``cloud_approval`` are not read by ``next_step``:
     the worker applies them when it routes (``profile.shift_start``, the explore draw) and
     before a cloud writer attempt (``Spend.writer_gate``). ``explore_rate`` None means the
-    config's ``explore_rate`` (the ``normal`` writer mode, unchanged)."""
+    config's ``explore_rate`` (the ``normal`` writer mode, unchanged).
+
+    ``cloud`` (#49) is the repo's setting, not the profile's: False keeps the ladder to
+    its local rungs (see the module docstring). Build it with ``with_cloud``."""
 
     max_check_attempts: int = MAX_CHECK_ATTEMPTS
     max_user_kickbacks: int = MAX_USER_KICKBACKS
@@ -125,6 +140,7 @@ class Limits:
     start_shift: int = 0
     explore_rate: float | None = None
     cloud_approval: bool = False
+    cloud: bool = True
 
     def __post_init__(self) -> None:
         for name in ("max_check_attempts", "max_user_kickbacks", "max_ai_kickbacks"):
@@ -152,6 +168,14 @@ def _limits(limits: Limits | None) -> Limits:
     return Limits(MAX_CHECK_ATTEMPTS, MAX_USER_KICKBACKS, MAX_AI_KICKBACKS)
 
 
+def with_cloud(limits: Limits | None, cloud: bool) -> Limits | None:
+    """``limits`` for a repo whose cloud setting is ``cloud`` (#49): unchanged (None stays
+    None, today's rules) when cloud is allowed; else the same counts with ``cloud=False``."""
+    if cloud:
+        return limits
+    return replace(_limits(limits), cloud=False)
+
+
 def attempt_bound(rungs: int, limits: Limits | None = None) -> int:
     """Most attempts a ticket can get on a ladder of ``rungs`` rungs before the user."""
     return rungs * _limits(limits).attempts_per_rung + MAX_INTERRUPTED
@@ -170,6 +194,14 @@ class Rung:
 
     tier: int
     model: str
+    #: #49: does this rung's model leave the Mac? ``build_ladder`` sets it from the
+    #: endpoint's ``kind``; None (a hand-built rung) is treated as cloud by a local-only
+    #: repo. Not part of equality, so ``Rung(1, "m")`` still equals a built rung.
+    cloud: bool | None = field(default=None, compare=False)
+
+    @property
+    def local(self) -> bool:
+        return self.cloud is False
 
 
 Ladder = tuple[Rung, ...]
@@ -182,15 +214,22 @@ class _ModelLike(Protocol):
     def name(self) -> str: ...
 
 
+def local_rungs(ladder: Sequence[Rung]) -> Ladder:
+    """The rungs a local-only repo (#49) may use: those whose model is local."""
+    return tuple(r for r in ladder if r.local)
+
+
 def build_ladder(models: Iterable[_ModelLike]) -> Ladder:
     """The ladder from configured models (e.g. ``config.models``): by tier, then in the
-    given order; a repeated model name keeps its first place."""
+    given order; a repeated model name keeps its first place. ``Rung.cloud`` comes from
+    the model's ``kind`` (None when it has none)."""
     seen: set[str] = set()
     out: list[Rung] = []
     for m in sorted(models, key=lambda m: m.tier):
         if m.name not in seen:
             seen.add(m.name)
-            out.append(Rung(m.tier, m.name))
+            kind = getattr(m, "kind", None)
+            out.append(Rung(m.tier, m.name, None if kind is None else kind != "local"))
     return tuple(out)
 
 
@@ -256,15 +295,22 @@ def next_step(
     attempt counts as a user kickback and the ticket starts on the lowest rung."""
     h = history if isinstance(history, History) else History(tuple(history))
     limits = _limits(limits)
-    rungs: Ladder = tuple(ladder)
-    if not rungs:
+    full: Ladder = tuple(ladder)
+    if not full:
         return HandToUser(f"{FLAG_NO_MODEL}: no writer model is configured on any tier")
+    rungs = full if limits.cloud else local_rungs(full)
     attempts = list(h.attempts)
-    if not attempts:
-        return _first(h, rungs)
-    last = attempts[-1]
-    if last.ended_at is None or last.outcome in (None, "accepted"):
+    if attempts and (attempts[-1].ended_at is None or attempts[-1].outcome in (None, "accepted")):
         return None
+    if not rungs:
+        return HandToUser(
+            f"{FLAG_LOCAL_ONLY}: the repo is local only (cloud = false) and no local writer "
+            "model is configured; over to you"
+        )
+    if not attempts:
+        return _first(h, rungs, local_only=not limits.cloud)
+    up = functools.partial(_up, cloud_next=None if limits.cloud else full)
+    last = attempts[-1]
     idx = _rung_of(last, rungs)
     here = rungs[idx]
     if last.outcome == "superseded":
@@ -288,7 +334,7 @@ def next_step(
     if stint[0].trigger == "explore":
         target = _start_index(_start(h), rungs)
         what = "failed its checks" if last.outcome == "failed_checks" else "was kicked back"
-        return _up(
+        return up(
             rungs,
             idx,
             FLAG_EXPLORE_FAILED,
@@ -302,7 +348,7 @@ def next_step(
         if by == "reviewer":
             n = _count(stint, kicks, "reviewer")
             if n >= limits.max_ai_kickbacks:
-                return _up(
+                return up(
                     rungs,
                     idx,
                     FLAG_AI_KICKBACK_CAP,
@@ -314,15 +360,15 @@ def next_step(
             )
         n = _count(stint, kicks, "user")
         if tag == "wrong":
-            return _up(rungs, idx, FLAG_KICKBACK_WRONG, "the change was kicked back as wrong", last)
+            return up(rungs, idx, FLAG_KICKBACK_WRONG, "the change was kicked back as wrong", last)
         if n >= limits.max_user_kickbacks:
-            return _up(rungs, idx, FLAG_KICKBACK_CAP, f"changes were requested {n} times", last)
+            return up(rungs, idx, FLAG_KICKBACK_CAP, f"changes were requested {n} times", last)
         return Retry("kickback", here.tier, f"user kickback {n} on {_name(here)}", here.model)
 
     # failed_checks
     failed = sum(a.outcome == "failed_checks" for a in _segment(stint))
     if failed >= limits.max_check_attempts:
-        return _up(
+        return up(
             rungs, idx, FLAG_CHECKS_FAILED, f"the checks failed {failed} times in a row", last
         )
     return Retry(
@@ -358,10 +404,14 @@ def _start(h: History) -> int | None:
     return h.start_tier if h.start_tier is not None else h.routed_tier
 
 
-def _first(h: History, rungs: Ladder) -> Retry:
+def _first(h: History, rungs: Ladder, *, local_only: bool = False) -> Retry:
     start = _start_index(_start(h), rungs)
     r = rungs[start]
-    if h.start_tier is not None and h.start_tier != h.routed_tier:
+    want = _start(h)
+    if local_only and want is not None and r.tier < want:
+        why = f"first attempt on {_name(r)}, the last local tier: the repo is local only "
+        why += f"(cloud = false), so not tier {want}"
+    elif h.start_tier is not None and h.start_tier != h.routed_tier:
         why = f"first attempt on {_name(r)}: the repo profile moved the start up from tier "
         why += f"{h.routed_tier}"
     elif h.routed_tier is None:
@@ -444,10 +494,29 @@ def _count(stint: list[Attempt], kicks: dict[int, list[Kick]], by: KickbackBy) -
 
 
 def _up(
-    rungs: Ladder, idx: int, flag: str, what: str, last: Attempt, *, target: int | None = None
+    rungs: Ladder,
+    idx: int,
+    flag: str,
+    what: str,
+    last: Attempt,
+    *,
+    target: int | None = None,
+    cloud_next: Ladder | None = None,
 ) -> Escalate | HandToUser:
+    """Move up from rung ``idx``. ``cloud_next``: the full ladder of a local-only repo
+    (``rungs`` is then its local rungs): past the last local rung, hand over with
+    ``local_only`` when a cloud rung would have been next."""
     to = idx + 1 if target is None else target
     here = rungs[idx]
+    if to >= len(rungs) and cloud_next is not None:
+        above = [r for r in cloud_next if not r.local and r.tier >= here.tier]
+        if above:
+            return HandToUser(
+                f"{FLAG_LOCAL_ONLY}: {flag}: {what} on {_name(here)}, the last local tier; "
+                f"the repo is local only (cloud = false), so it does not move up to "
+                f"{_name(above[0])}; over to you",
+                mark_ready=bool(last.tests_passed),
+            )
     if to >= len(rungs):
         return HandToUser(
             f"{flag}: {what} on {_name(here)}, the top of the ladder; over to you",
@@ -471,6 +540,7 @@ __all__ = [
     "FLAG_INTERRUPTED",
     "FLAG_KICKBACK_CAP",
     "FLAG_KICKBACK_WRONG",
+    "FLAG_LOCAL_ONLY",
     "FLAG_NO_MODEL",
     "MAX_AI_KICKBACKS",
     "MAX_ATTEMPTS_PER_RUNG",
@@ -489,6 +559,8 @@ __all__ = [
     "Step",
     "attempt_bound",
     "build_ladder",
+    "local_rungs",
     "make_policy",
     "next_step",
+    "with_cloud",
 ]
