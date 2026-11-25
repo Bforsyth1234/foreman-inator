@@ -5,6 +5,8 @@ On-disk layout, under the worktrees root (normally ``~/.foreman-inator/worktrees
     <root>/<owner>/<repo>/.mirror                 bare clone; remote refs in refs/remotes/origin/*
     <root>/<owner>/<repo>/issue-<n>-a<attempt>    worktree on branch fman/issue-<n>/a<attempt>
     <root>/<owner>/<repo>/scratch-<name>          scratch worktree at any commit, never pushes
+    <root>/<owner>/<repo>/chat-<id>               chat session worktree on fman/chat/<id> (#71)
+    <root>/<owner>/<repo>/.mirror.lock            cross-process lock around mirror changes
 
 Invariant 7a lives here: the manager refuses to create, commit to or push any branch whose
 name does not start with ``fman/``, and force-push is only ever sent to an ``fman/`` branch.
@@ -12,6 +14,15 @@ name does not start with ``fman/``, and force-push is only ever sent to an ``fma
 Every git call runs with global and system git config ignored, so a user's or CI runner's
 settings (signing, hooks path, credential helpers, default branch) never change behaviour.
 Commits use the identity passed in, never a global one.
+
+Mirror lock (#71): every change to the mirror or its worktree list (fetch, ``worktree
+add/remove/prune``, local branch deletes) holds ``flock`` on ``.mirror.lock`` beside the
+mirror, so the worker and a chat host (``fman chat``, ``fman metrics``) in another process
+never run git on one mirror at the same time. The lock is re-entrant within a process
+(``create`` -> ``ensure`` -> ``prune``) and serialises threads too; the kernel drops it if
+a process dies. It sits beside the mirror (not under ``<home>/run`` as the chat design
+first said) so every process that opens the same mirror finds the same lock with no
+configuration, and its name cannot collide between repos.
 
 The push/fetch token is handed to git through ``GIT_CONFIG_COUNT``/``GIT_CONFIG_KEY_0``/
 ``GIT_CONFIG_VALUE_0`` environment variables as an ``http.extraHeader``: it is never part of
@@ -22,18 +33,28 @@ error message.
 from __future__ import annotations
 
 import base64
+import contextlib
+import fcntl
+import functools
 import os
 import re
 import shutil
 import subprocess
 import tempfile
-from collections.abc import Iterator, Mapping, Sequence
+import threading
+import time
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlsplit
 
 BRANCH_PREFIX = "fman/"
+CHAT_PREFIX = "fman/chat/"  # #71: chat session branches (chat.CHAT_BRANCH_PREFIX)
 MIRROR_DIRNAME = ".mirror"
+LOCK_NAME = ".mirror.lock"
+#: How long a mirror change waits for another process's (a fetch can take NETWORK_TIMEOUT).
+LOCK_TIMEOUT = 1800.0
 BASE_FILE = "fman-base"  # stored in the worktree's private git dir, never in the tree
 NETWORK_TIMEOUT = 600.0
 LOCAL_TIMEOUT = 120.0
@@ -102,6 +123,39 @@ def branch_name(issue: int, attempt: int) -> str:
     if issue < 1 or attempt < 1:
         raise ValueError("issue and attempt must be positive")
     return f"{BRANCH_PREFIX}issue-{issue}/a{attempt}"
+
+
+def chat_branch_name(session_id: int) -> str:
+    """A chat session's branch: ``fman/chat/<id>`` (7a: under ``fman/``)."""
+    if isinstance(session_id, bool) or not isinstance(session_id, int) or session_id < 1:
+        raise ValueError(f"chat session id must be a positive int, not {session_id!r}")
+    return f"{CHAT_PREFIX}{session_id}"
+
+
+def check_chat_base(base_branch: str) -> str:
+    """The base branch a chat may start from: a plain branch name, never an ``fman/``
+    branch (decision 5: a chat must not continue a ticket's branch, it would collide
+    with the worker's next attempt). ``origin/`` and ``refs/...`` spellings are checked
+    the same way. Returns the bare name; raises :class:`BranchRefused`."""
+    name = base_branch.strip() if isinstance(base_branch, str) else ""
+    for prefix in ("refs/remotes/origin/", "refs/heads/", "origin/"):
+        if name.startswith(prefix):
+            name = name[len(prefix) :]
+            break
+    if not name or name.startswith((BRANCH_PREFIX, "refs/", "origin/")):
+        raise BranchRefused(
+            f"refusing chat base {base_branch!r}: a chat starts from the repo's base branch, "
+            "never from an fman/ branch"
+        )
+    ok = subprocess.run(
+        ["git", "check-ref-format", f"refs/heads/{name}"],
+        env=_base_env(),
+        capture_output=True,
+        timeout=LOCAL_TIMEOUT,
+    )
+    if ok.returncode != 0:
+        raise BranchRefused(f"refusing chat base {base_branch!r}: not a valid branch name")
+    return name
 
 
 def check_branch(branch: str) -> str:
@@ -338,6 +392,93 @@ class Replay:
         return not self.conflicted
 
 
+# --------------------------------------------------------------------------- mirror lock
+
+
+class MirrorLock:
+    """``flock`` on one lock file, re-entrant per thread and exclusive across threads and
+    processes.
+
+    One instance per lock path per process (``mirror_lock``): the outermost ``held()``
+    takes a thread lock, then the file lock; nested calls on the same thread only count.
+    flock locks belong to the open file, so a second ``open`` of the same path in this
+    process would deadlock against the first: the registry prevents that."""
+
+    def __init__(self, path: Path, timeout: float = LOCK_TIMEOUT) -> None:
+        self.path = path
+        self.timeout = timeout
+        self._thread_lock = threading.RLock()
+        self._depth = 0
+        self._fd: int | None = None
+
+    @contextlib.contextmanager
+    def held(self) -> Iterator[None]:
+        if not self._thread_lock.acquire(timeout=self.timeout):
+            raise WorktreeError(f"timed out after {self.timeout:.0f}s waiting for {self.path}")
+        try:
+            if self._depth == 0:
+                self._fd = self._take()
+            self._depth += 1
+            try:
+                yield
+            finally:
+                self._depth -= 1
+                if self._depth == 0 and self._fd is not None:
+                    fd, self._fd = self._fd, None
+                    with contextlib.suppress(OSError):
+                        fcntl.flock(fd, fcntl.LOCK_UN)
+                    os.close(fd)
+        finally:
+            self._thread_lock.release()
+
+    def _take(self) -> int:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
+        end = time.monotonic() + self.timeout
+        delay = 0.01
+        try:
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    return fd
+                except BlockingIOError:
+                    if time.monotonic() >= end:
+                        raise WorktreeError(
+                            f"timed out after {self.timeout:.0f}s waiting for {self.path} "
+                            "(another process is changing this mirror)"
+                        ) from None
+                    time.sleep(delay)
+                    delay = min(delay * 2, 0.25)
+        except BaseException:
+            os.close(fd)
+            raise
+
+
+_LOCKS: dict[str, MirrorLock] = {}
+_LOCKS_GUARD = threading.Lock()
+
+
+def mirror_lock(path: Path | str) -> MirrorLock:
+    """This process's one ``MirrorLock`` for ``path``."""
+    key = os.path.abspath(path)
+    with _LOCKS_GUARD:
+        lock = _LOCKS.get(key)
+        if lock is None:
+            lock = _LOCKS[key] = MirrorLock(Path(key))
+        return lock
+
+
+def _locked[F: Callable[..., Any]](method: F) -> F:
+    """Run a ``RepoMirror`` method under its mirror lock."""
+
+    @functools.wraps(method)
+    def wrapper(self: RepoMirror, *args: Any, **kw: Any) -> Any:
+        with self.lock.held():
+            return method(self, *args, **kw)
+
+    return wrapper  # type: ignore[return-value]
+
+
 # --------------------------------------------------------------------------- mirror
 
 
@@ -361,6 +502,7 @@ class RepoMirror:
         self.identity = identity
         self.repo_dir = self.root / repo
         self.mirror_path = self.repo_dir / MIRROR_DIRNAME
+        self.lock = mirror_lock(self.repo_dir / LOCK_NAME)
 
     # -- mirror maintenance ---------------------------------------------------
 
@@ -370,6 +512,7 @@ class RepoMirror:
         proc = _git(["rev-parse", "--is-bare-repository"], cwd=self.mirror_path, check=False)
         return proc.returncode == 0 and proc.stdout.strip() == "true"
 
+    @_locked
     def ensure(self, token: str | None = None) -> Path:
         """Create the mirror if missing (or half-made by a crash), then fetch. Idempotent."""
         if not self._mirror_ok():
@@ -387,6 +530,7 @@ class RepoMirror:
         self.fetch(token)
         return self.mirror_path
 
+    @_locked
     def fetch(self, token: str | None = None) -> None:
         _git(
             ["fetch", "-q", "--prune", "--no-tags", "origin"],
@@ -395,6 +539,7 @@ class RepoMirror:
             timeout=NETWORK_TIMEOUT,
         )
 
+    @_locked
     def prune(self) -> None:
         """Forget worktrees whose directories are gone (e.g. after a crash)."""
         if self.mirror_path.exists():
@@ -417,6 +562,7 @@ class RepoMirror:
     def attempt_path(self, issue: int, attempt: int) -> Path:
         return self.repo_dir / f"issue-{issue}-a{attempt}"
 
+    @_locked
     def create(
         self,
         base_branch: str,
@@ -448,6 +594,7 @@ class RepoMirror:
         _write_base(path, base_sha)
         return Worktree(self, path, branch, base_sha, can_push=True)
 
+    @_locked
     def replay_onto_base(
         self,
         base_branch: str,
@@ -488,6 +635,7 @@ class RepoMirror:
             raise WorktreeError(f"replaying {prev_sha[:12]} onto {base_branch} failed: {detail}")
         return Replay(wt, conflicted, prev_sha)
 
+    @_locked
     def scratch(self, commit: str, name: str, *, branch: str | None = None) -> Worktree:
         """A throwaway worktree at ``commit`` that can never push (reviewer revert check,
         replays). Detached by default; pass an ``fman/`` ``branch`` to allow local commits."""
@@ -525,6 +673,7 @@ class RepoMirror:
         mirror = self.mirror_path.resolve()
         return [p for p in paths if p.resolve() != mirror]
 
+    @_locked
     def cleanup_issue(self, issue: int) -> None:
         """Remove every attempt worktree and local branch for an issue (after merge or drop).
         Remote branches are left alone."""
@@ -533,6 +682,70 @@ class RepoMirror:
         self.prune()
         for branch in self._local_branches(f"{BRANCH_PREFIX}issue-{issue}/"):
             self._delete_local_branch(branch)
+
+    # -- chat sessions (#71) -----------------------------------------------------
+
+    def chat_path(self, session_id: int) -> Path:
+        chat_branch_name(session_id)  # validates the id
+        return self.repo_dir / f"chat-{session_id}"
+
+    @_locked
+    def create_chat(
+        self,
+        base_branch: str,
+        session_id: int,
+        *,
+        token: str | None = None,
+        fetch: bool = True,
+    ) -> Worktree:
+        """A chat session's worktree, ``chat-<id>`` on ``fman/chat/<id>``, from
+        ``origin/<base_branch>`` only: the base must be a branch on the remote and never
+        an ``fman/`` one (decision 5, ``check_chat_base``). The base commit goes in
+        ``fman-base`` as for attempts, so diffs are measured against it.
+
+        Unlike an attempt, an existing chat worktree is never replaced (it is a kept,
+        ended session with the user's work in it): ``WorktreeError``; reattach with
+        ``open_chat``. A half-made one (no ``fman-base``) is cleared first."""
+        base = check_chat_base(base_branch)
+        branch = check_branch(chat_branch_name(session_id))
+        path = self.chat_path(session_id)
+        if _read_base(path) is not None:
+            raise WorktreeError(f"chat {session_id} already has a worktree; use open_chat")
+        if fetch or not self._mirror_ok():
+            self.ensure(token)
+        proc = _git(
+            ["rev-parse", "--verify", "-q", f"refs/remotes/origin/{base}^{{commit}}"],
+            cwd=self.mirror_path,
+            check=False,
+        )
+        if proc.returncode != 0:
+            raise WorktreeError(f"no branch {base!r} on the remote of {self.repo}")
+        base_sha = proc.stdout.strip()
+        self._remove_path(path)
+        self._delete_local_branch(branch)
+        _git(
+            ["worktree", "add", "-q", "--no-track", "-b", branch, str(path), base_sha],
+            cwd=self.mirror_path,
+        )
+        _write_base(path, base_sha)
+        return Worktree(self, path, branch, base_sha, can_push=True)
+
+    def open_chat(self, session_id: int) -> Worktree:
+        """Reattach to a kept chat worktree (an ``ended`` session, or after a restart).
+        Refuses one whose HEAD is no longer its ``fman/chat/<id>`` branch."""
+        path = self.chat_path(session_id)
+        base = _read_base(path)
+        if base is None:
+            raise WorktreeError(f"no worktree for chat {session_id}")
+        branch = chat_branch_name(session_id)
+        head = _git(["symbolic-ref", "-q", "--short", "HEAD"], cwd=path, check=False)
+        current = head.stdout.strip()
+        if current != branch:
+            raise BranchRefused(
+                f"chat {session_id} worktree is on {current or 'a detached HEAD'!r}, "
+                f"expected {branch!r}"
+            )
+        return Worktree(self, path, branch, base, can_push=True)
 
     # -- internals --------------------------------------------------------------
 
@@ -545,6 +758,7 @@ class RepoMirror:
         ).stdout
         return [b for b in out.splitlines() if b]
 
+    @_locked
     def _remove_path(self, path: Path) -> None:
         path = Path(path)
         if path.parent.resolve() != self.repo_dir.resolve() or path.name == MIRROR_DIRNAME:
@@ -559,6 +773,7 @@ class RepoMirror:
             shutil.rmtree(path)
         self.prune()
 
+    @_locked
     def _delete_local_branch(self, branch: str) -> None:
         if not branch.startswith(BRANCH_PREFIX) or not self._mirror_ok():
             return
