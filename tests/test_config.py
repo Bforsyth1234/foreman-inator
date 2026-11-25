@@ -270,3 +270,33 @@ base_url = "https://api.z.ai/api/coding/paas/v4"
 family = "glm"
 api_key_ref = "{cloud_ref}"
 {extra}"""
+
+
+# --------------------------------------------------------------------------- writer timeout
+
+
+def test_writer_timeout_round_trip_and_bounds(tmp_path):
+    """Live run 2026-11-24: on a large repo both first attempts hit the hard-coded 20
+    minutes while still reading code; the bound is now a setting."""
+    assert Config().writer_timeout_seconds == 1200.0  # unchanged default
+    path = config.save(Config(writer_timeout_seconds=2700), tmp_path / "c.toml")
+    assert config.load(path).writer_timeout_seconds == 2700.0
+    for bad in (0, -1, 24 * 3600 + 1):
+        with pytest.raises(ConfigError):
+            Config(writer_timeout_seconds=bad)
+
+
+def test_launch_writer_passes_the_configured_timeout(tmp_path):
+    from types import SimpleNamespace
+
+    from foreman_inator.worker_attempt import AttemptSteps
+
+    seen: dict = {}
+    stub = SimpleNamespace(
+        config=Config(writer_timeout_seconds=2700),
+        driver=SimpleNamespace(run=lambda **kw: seen.update(kw)),
+        _sandbox_policy=lambda *a, **k: None,
+        _drop_scratch=lambda policy: None,
+    )
+    AttemptSteps._launch_writer(stub, ticket=None, worktree=tmp_path, attempt_id=1, prompt="p")
+    assert seen["timeout"] == 2700.0
