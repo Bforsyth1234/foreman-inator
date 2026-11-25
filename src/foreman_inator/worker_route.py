@@ -48,6 +48,28 @@ read into ``History.start_tier``) and ``route_reason`` gains ``"; profile fast: 
 -> 2"``. ``limits(ticket)`` is the profile's escalation limits for the policy (None for
 today's rules).
 
+Splitting a large issue (#50)
+-----------------------------
+When the router's own pick is tier 3 (``decompose.eligible``: the classifier said
+``large``, or kNN wanted tier 3; never a ``tier:N`` label, never a router fallback), and
+``decompose.skip_reason`` finds no reason not to (``split_large`` off, the repo profile's
+writer mode ``fast``, no tier 3 model, or a cloud tier 3 model on a repo that may not use
+cloud models: ``split_cloud_allowed(repo)``, default True), the route job reads the
+issue's comments once and then:
+
+* the bot's proposal for an *earlier* ticket of this issue is there: the user re-labeled
+  the issue to run it as one ticket. No call; ``route_reason`` says so; tier 3 as before.
+* its proposal for *this* ticket is there (a crash after posting): flag it, no call.
+* none: ``decompose.propose`` (one tier 3 call through the proxy, inside the spend caps
+  and the per-attempt budget). A ``Proposal`` is posted as one comment, then
+  ``routed_tier`` (3, the router's pick) is stored with the flag ``split_proposed`` in
+  the routing transaction, so the ticket is not worked. A ``Skipped`` (the call failed or
+  was refused) is logged and the ticket runs on tier 3 as before, with the reason added
+  to ``route_reason``.
+
+Nothing creates a sub-issue or applies a label. A ticket whose flag is cleared later
+runs on its stored tier 3 route.
+
 Crash safety (routing): killed after ``route_knn`` but before that transaction, nothing
 is stored (``routed_tier`` NULL), so the ticket is routed again; the new ticket's vector
 was stored by ``route_knn``, so no second embedding call, and the explore draw is
@@ -65,6 +87,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import threading
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from foreman_inator import routing
@@ -73,7 +96,7 @@ from foreman_inator.github.app_auth import GitHubNotFound
 from foreman_inator.routing import explore, knn
 from foreman_inator.routing import profile as prof
 from foreman_inator.routing.escalation import DEFAULT_LIMITS, Limits
-from foreman_inator.tickets import clarify
+from foreman_inator.tickets import clarify, decompose
 from foreman_inator.tickets.lifecycle import clarify_cursor
 
 if TYPE_CHECKING:
@@ -83,6 +106,9 @@ log = logging.getLogger("foreman_inator.worker")
 
 #: Clarification states after which the ticket is routed without asking.
 CLARIFY_DONE = ("clear", "resumed")
+#: #50: module default for the ``split_large`` / ``split_timeout_seconds`` config keys.
+DEFAULT_SPLIT_LARGE = decompose.DEFAULT_ENABLED
+DEFAULT_SPLIT_TIMEOUT = decompose.DEFAULT_TIMEOUT
 #: #51: the ``poll_cursors`` row holding a ticket's (profile-shifted) start tier.
 START_CURSOR_PREFIX = "start:"
 
@@ -97,6 +123,9 @@ class RouteSteps:
     config: Any
     api: Any
     proxy: Any
+    #: #50/#49: ``repo -> bool``, False for a local-only repo (its issue is never sent to
+    #: a cloud splitter). None: every repo may (the wiring step passes the #49 check).
+    split_cloud_allowed: Callable[[str], bool] | None = None
 
     # ------------------------------------------------------------------ clarify (#44)
 
@@ -211,6 +240,10 @@ class RouteSteps:
             r.tier, (m.tier for m in self.config.models), limits, override=is_override
         )
         reason = r.reason + prof.shift_reason(p, r.tier, start)
+        flag: str | None = None
+        if override is None and decompose.eligible(r):
+            flag, note = self._split(t, r, p)
+            reason += note
         ex = explore.should_explore(
             t.id,
             prof.explore_rate(limits, float(self.config.explore_rate)),
@@ -225,6 +258,11 @@ class RouteSteps:
             cur = self.store.update_ticket(t.id, routed_tier=r.tier, route_reason=reason)
             self.store.set_cursor(t.repo, explore.encode(ex), explore.explore_cursor(t.id))
             self.store.set_cursor(t.repo, str(start), start_cursor(t.id))
+            if flag is not None:
+                cur = self.store.flag_ticket(t.id, flag)
+        if flag is not None:
+            log.info("ticket %d: split proposed on the issue; flagged, not worked", t.id)
+            return cur
         log.info(
             "ticket %d: routed to tier %d (%s)%s%s",
             t.id,
@@ -234,6 +272,67 @@ class RouteSteps:
             "; exploring one tier lower" if ex else "",
         )
         return cur
+
+    # ------------------------------------------------------------------ split (#50)
+
+    def _split(self, t: Ticket, r: routing.Route, p: prof.Profile) -> tuple[str | None, str]:
+        """For a ``large`` ticket: ``(flag_reason, "")`` when a split was proposed (and
+        posted), else ``(None, note for route_reason)``. Never raises; any failure runs
+        the ticket as one, as before (see the module docstring)."""
+        skip = decompose.skip_reason(
+            repo=t.repo,
+            models=self.config,
+            enabled=bool(getattr(self.config, "split_large", DEFAULT_SPLIT_LARGE)),
+            writer_mode=p.writer,
+            cloud_allowed=self._cloud_allowed,
+        )
+        if skip is not None:
+            log.info("ticket %d: not splitting: %s", t.id, skip)
+            return None, "" if skip == "splitting is off" else f"; not split: {skip}"
+        try:
+            comments = self.api.list_issue_comments(t.repo, t.issue_number)
+            found = decompose.find_proposal(comments, self.api.bot_login())
+        except Exception as exc:
+            log.warning("ticket %d: split skipped, comments unreadable (%s)", t.id, exc)
+            return None, f"; split fallback: comments unreadable ({type(exc).__name__})"
+        if found is not None:
+            owner = decompose.proposal_ticket(found)
+            if owner == t.id:  # posted before a crash: flag, no second call
+                log.info("ticket %d: its split proposal was already posted; flagging", t.id)
+                return decompose.flag_reason(), ""
+            log.info("ticket %d: split already proposed (ticket %s); running as one", t.id, owner)
+            return None, f"; split already proposed on the issue (ticket {owner}); running as one"
+        with self._trace(t):  # type: ignore[attr-defined]
+            result = decompose.propose(
+                t,
+                config=self.config,
+                proxy=self.proxy,
+                cloud_allowed=self._cloud_allowed,
+                timeout=float(getattr(self.config, "split_timeout_seconds", DEFAULT_SPLIT_TIMEOUT)),
+                watch=self.ollama_watch,  # type: ignore[attr-defined]
+                cold_load_allowance=float(self.config.cold_load_timeout_seconds),
+                attempt_budget_usd=self.config.attempt_budget_usd,
+                max_input_tokens_cloud=self.config.attempt_max_input_tokens_cloud,
+                max_input_tokens_local=self.config.attempt_max_input_tokens_local,
+            )
+        if isinstance(result, decompose.Skipped):
+            log.warning("ticket %d: %s", t.id, result.reason)
+            return None, f"; {result.reason}"
+        if self.store.get_ticket(t.id).routed_tier is not None:  # a tier:N label meanwhile
+            return None, ""
+        body = decompose.proposal_comment(t.id, result)
+        try:
+            self._gh(  # type: ignore[attr-defined]
+                t, "split_proposed", lambda: self.api.post_comment(t.repo, t.issue_number, body)
+            )
+        except Exception as exc:  # bounded (7e): no retry loop of model calls
+            log.warning("ticket %d: split proposal not posted (%s); running as one", t.id, exc)
+            return None, f"; split fallback: proposal not posted ({type(exc).__name__})"
+        return decompose.flag_reason(result), ""
+
+    def _cloud_allowed(self, repo: str) -> bool:
+        check = self.split_cloud_allowed
+        return True if check is None else bool(check(repo))
 
     def _knn_route(self, t: Ticket) -> routing.Route | None:
         """#23 once ``knn_threshold`` tickets are accepted; None falls back to the rules.
@@ -278,4 +377,11 @@ class RouteSteps:
         return explore.decode(self.store.get_cursor(ticket.repo, explore.explore_cursor(ticket.id)))
 
 
-__all__ = ["CLARIFY_DONE", "START_CURSOR_PREFIX", "RouteSteps", "start_cursor"]
+__all__ = [
+    "CLARIFY_DONE",
+    "DEFAULT_SPLIT_LARGE",
+    "DEFAULT_SPLIT_TIMEOUT",
+    "START_CURSOR_PREFIX",
+    "RouteSteps",
+    "start_cursor",
+]
