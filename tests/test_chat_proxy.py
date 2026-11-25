@@ -292,30 +292,38 @@ async def test_cancelled_priority_waiter_removes_its_marker(tmp_path):
     holder.release()
 
 
-# --------------------------------------------------------------------------- wait_for_local
+# --------------------------------------------------------------------------- no probe
 
 
 @pytest.mark.anyio
-async def test_wait_for_local_probe():
-    proxy = ModelProxy(MODELS)
-    with proxy.context(chat_session_id=1) as ctx:
-        assert await proxy.wait_for_local_async(ctx, timeout=0.2) is True
-        assert proxy.local_slots() == (0, 1)  # a probe gives the slot back
-        await proxy.slots.acquire()
-        t0 = time.monotonic()
-        assert await proxy.wait_for_local_async(ctx, timeout=0.2) is False
-        assert time.monotonic() - t0 < 1.0
-        assert proxy.slots.waiting == 0
-        proxy.slots.release()
-    with pytest.raises(RuntimeError):
-        proxy.wait_for_local(ctx, 0.1)  # blocking call on a loop thread
+async def test_chat_keeps_priority_with_no_probe_to_hand_the_slot_to_a_ticket():
+    """Review P1 (wave 19): a probe that acquired the slot with priority and released it
+    handed the slot to the queued ticket call, so the chat call that followed ran after it.
+    The probe API is gone; the chat engine just makes the call (the in-call 5 s timer is
+    decision 2), and it is served before the ticket queued ahead of it.
 
-
-def test_wait_for_local_sync():
-    proxy = ModelProxy(MODELS)
-    with proxy.context(chat_session_id=1) as ctx:
-        assert proxy.wait_for_local(ctx, timeout=0.2) is True
-        assert proxy.local_slots() == (0, 1)
+    Non-vacuity: restoring `wait_for_local_async` fails the first assertion; driving the
+    engine through it (probe, then call) puts t2 first."""
+    assert not hasattr(ModelProxy, "wait_for_local_async")
+    assert not hasattr(ModelProxy, "wait_for_local")
+    gate = Gated(FakeModels())
+    proxy = ModelProxy(MODELS, transport=gate)
+    async with client_for(proxy) as c:
+        with proxy.context(chat_session_id=4) as ctx:
+            running = asyncio.create_task(c.post("/a/1/v1/chat/completions", json=chat("t1")))
+            assert await arrival(gate) == "127.0.0.1:t1"
+            t2 = asyncio.create_task(c.post("/a/2/v1/chat/completions", json=chat("t2")))
+            await asyncio.sleep(0.1)
+            ch = asyncio.create_task(c.post(path(ctx), json=chat("chat")))
+            await asyncio.sleep(0.1)
+            gate.open_one()
+            await running
+            assert await arrival(gate) == "127.0.0.1:chat"
+            gate.open_one()
+            await ch
+            assert await arrival(gate) == "127.0.0.1:t2"
+            gate.open_one()
+            assert (await t2).status_code == 200
 
 
 # --------------------------------------------------------------------------- fallback

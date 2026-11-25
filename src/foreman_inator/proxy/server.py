@@ -133,8 +133,9 @@ endpoint that passes the fail-closed checks and the spend preflight (its context
 ``llm.local_fallback = "local slot busy, used <model>"``, the open ``chat.turn`` span a
 ``local_fallback`` event, and the response the ``x-fman-fallback-model`` header. None, or
 any refusal, keeps the call waiting. Which model, and whether at all (local-only repo,
-caps), is the hook's decision. ``wait_for_local(context, timeout)`` lets the chat engine
-probe whether a slot would come within ``timeout`` seconds.
+caps), is the hook's decision. There is deliberately no "would a slot come?" probe: a
+probe that took the slot and gave it back would hand it to the oldest queued ticket call,
+putting the real chat call behind it; the in-call timer above is decision 2's whole check.
 
 Running: `start()` runs uvicorn on a background thread, bound to 127.0.0.1 (port 0 picks a
 free port; `url` says which); `stop()` shuts it down. `proxy.app` is a plain ASGI app, so
@@ -954,37 +955,6 @@ class ModelProxy:
     def forget_queue_wait(self, attempt_id: SlotKey) -> None:
         with self._wait_lock:
             self._waits.pop(_slot_key(attempt_id), None)
-
-    async def wait_for_local_async(
-        self, context: CallContext, timeout: float = DEFAULT_CHAT_LOCAL_WAIT_SECONDS
-    ) -> bool:
-        """Would this context get a local slot within ``timeout`` seconds? Queues as its
-        calls would (a chat context with priority) and gives the slot straight back once
-        granted, so this is a probe, not a reservation: the real call queues again, still
-        ahead of ticket calls when it is a chat's."""
-        acq = asyncio.ensure_future(self._slots.acquire(priority=context.is_chat))
-        try:
-            done, _ = await asyncio.wait({acq}, timeout=max(0.0, float(timeout)))
-            if done:
-                acq.result()
-                self._slots.release()
-                return True
-            await self._abandon(acq)
-            return False
-        except BaseException:
-            await self._abandon(acq)
-            raise
-
-    def wait_for_local(
-        self, context: CallContext, timeout: float = DEFAULT_CHAT_LOCAL_WAIT_SECONDS
-    ) -> bool:
-        """`wait_for_local_async` from synchronous code (the chat engine's thread). Blocks
-        up to ``timeout``. Not for use on a thread that runs an event loop."""
-        try:
-            asyncio.get_running_loop()
-        except RuntimeError:
-            return asyncio.run(self.wait_for_local_async(context, timeout))
-        raise RuntimeError("wait_for_local blocks; await wait_for_local_async in async code")
 
     async def _wait_for_slot(
         self,

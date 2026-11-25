@@ -129,6 +129,22 @@ def test_spend_lets_the_proxy_fallback_through_but_not_other_models(store: Store
     assert not sp.hook(CLOUD, 0.1, fallback, phase="estimate")
 
 
+def test_spend_unset_small_model_does_not_let_ordinary_cloud_calls_through(
+    store: Store,
+) -> None:
+    """Review P0 (wave 19): with small_model None, `None in (model, None)` made every
+    ordinary call (fallback_from None) count as a fallback, skipping the chat_model check.
+    Non-vacuity: with the old tuple membership test the first assertion fails."""
+    sid = _session(store)
+    sp = _spend(store)
+    sp.register_chat_session(sid, repo=REPO, model=LOCAL.name)
+    sp.start_chat_turn(sid)
+    ctx = SimpleNamespace(kind="registered", bucket="live", chat_session_id=sid, token="t")
+    assert not sp.hook(CLOUD, 0.1, ctx, phase="estimate")
+    assert sp.refusal_for_chat(sid).cap == "chat_model"
+    assert sp.hook(CLOUD, 0.1, replace_ns(ctx, fallback_from=LOCAL.name), phase="estimate")
+
+
 def replace_ns(ns: SimpleNamespace, **kw: object) -> SimpleNamespace:
     return SimpleNamespace(**{**vars(ns), **kw})
 

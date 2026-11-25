@@ -869,10 +869,12 @@ class Spend:
             if cloud and not self.store.repo_allows_cloud(st.repo):
                 bare = Refusal("live", "local_only", 0.0, 0.0, 0.0, estimate, None, now)
                 return self._chat_refuse(bare, session_id, ep)
-            allowed = (st.turn_model or st.model, st.small_model)
+            allowed = {m for m in (st.turn_model or st.model, st.small_model) if m}
             # The proxy's 5 s local-slot fallback (decision 2): a cloud call standing in
-            # for a queued call to one of this turn's own (local) models.
-            fallback = cloud and getattr(ctx, "fallback_from", None) in allowed
+            # for a queued call to one of this turn's own (local) models. An ordinary call
+            # has fallback_from None, which must never match an unset small_model.
+            fb = getattr(ctx, "fallback_from", None)
+            fallback = cloud and fb is not None and fb in allowed
             if ep.name not in allowed and not fallback:
                 bare = Refusal("live", "chat_model", 0.0, 0.0, 0.0, estimate, None, now)
                 return self._chat_refuse(bare, session_id, ep)
