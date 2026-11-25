@@ -580,7 +580,8 @@ def test_fake_records_every_write_and_can_forbid_them() -> None:
     fake.mark_ready_for_review(REPO, pr.number)
     fake.add_labels(REPO, 1, ["x"])
     fake.remove_label(REPO, 1, "x")
-    fake.post_comment(REPO, 1, "hi")
+    posted = fake.post_comment(REPO, 1, "hi")
+    fake.update_comment(REPO, posted.id, "hi again")
     fake.close_issue(REPO, 1)
     assert {c.method for c in fake.writes} == WRITE_METHODS
     with pytest.raises(AssertionError):
