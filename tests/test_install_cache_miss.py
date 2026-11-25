@@ -87,6 +87,56 @@ def test_refill_refuses_a_scratch_that_is_not_the_base(tmp_path, monkeypatch):
     assert ran == []
 
 
+class _Scratch:
+    def __init__(self, path: Path):
+        self.path = path
+        self.removed = False
+
+    def remove(self) -> None:
+        self.removed = True
+
+
+class _Mirror:
+    def __init__(self, tmp: Path, fail: Exception | None):
+        self.tmp, self.fail, self.made = tmp, fail, []
+
+    def scratch(self, commit: str, name: str) -> _Scratch:
+        if self.fail is not None:
+            raise self.fail
+        s = _Scratch(self.tmp / f"scratch-{name}")
+        self.made.append(s)
+        return s
+
+
+@pytest.mark.parametrize("where", ["scratch", "policy"])
+def test_refill_setup_errors_are_setup_failed_and_drop_the_scratch(tmp_path, monkeypatch, where):
+    """A refill that cannot even be set up (the mirror's scratch worktree or the sandbox
+    policy raises) is a ``setup_failed`` flag, not a job crash; a scratch that was made
+    is removed."""
+    from foreman_inator.runner.worktree import WorktreeError
+    from foreman_inator.worker_setup import SetupFailed
+
+    monkeypatch.setattr(install, "dependency_files_changed", lambda *a, **k: [])
+    mirror = _Mirror(tmp_path, WorktreeError("no mirror") if where == "scratch" else None)
+    w = FakeWorker(tmp_path)
+
+    def bad_policy(*a, **k):
+        raise OSError("scratch dir not writable")
+
+    if where == "policy":
+        monkeypatch.setattr(w, "_sandbox_policy", bad_policy, raising=False)
+    wt = type("Wt", (), {"base_sha": "abc123", "mirror": mirror, "path": tmp_path})()
+    first = install.InstallFailed("offline install missed the cache", "cache miss")
+    monkeypatch.setattr(install, "dependency_files", lambda c: ["uv.lock"])
+    with pytest.raises(SetupFailed) as err:
+        w._recover_cache_miss(_Ticket(COLD), 2, wt, tmp_path, None, first)
+    assert err.value.reason == "dependency_install"
+    assert "could not set up filling the empty cache" in err.value.detail
+    assert ("WorktreeError" if where == "scratch" else "OSError") in err.value.detail
+    assert all(s.removed for s in mirror.made)
+    assert len(mirror.made) == (1 if where == "policy" else 0)
+
+
 # --------------------------------------------------------------------------- end to end
 
 

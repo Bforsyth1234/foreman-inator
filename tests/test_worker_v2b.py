@@ -433,6 +433,25 @@ def test_leftover_markers_fail_then_second_rebase_then_cap_flags(env: Env) -> No
     assert len(env.attempts(n)) == 3
 
 
+def test_rebase_stopped_at_its_budget_is_handed_over_not_retried(env: Env) -> None:
+    """#58: a rebase attempt that ended at its per-attempt budget is not re-run (that would
+    spend another budget); escalation hands the ticket over with ``attempt_budget``."""
+    n = env.label()
+    conflicted(env, n)
+    env.once(Script([edit("status.txt", "pass\n"), say("Done.")]))  # markers left in
+    a2 = env.attempts(n)[1]
+    assert (a2.trigger, a2.outcome) == ("rebase", "failed_checks")
+    env.store.set_attempt_end_reason(a2.id, "budget", "spent $1.02 of $1.00")
+    t = env.ticket(n)
+    assert not env.worker.rebase_pending(t)
+    env.once(RESOLVED)
+    env.once(RESOLVED)
+    t = env.ticket(n)
+    assert len(env.attempts(n)) == 2
+    assert t.flag_reason.startswith("attempt_budget: spent $1.02 of $1.00")
+    assert len(handover_comments(env, n)) == 1
+
+
 def test_crash_with_a_rebase_pending_before_it_starts(env: Env) -> None:
     n = env.label()
     conflicted(env, n)

@@ -15,7 +15,10 @@ Flow
    column and stores nothing (``worker_review``).
 3. The queue gives the ticket a ``rebase`` job while a rebase is pending: the mark names
    the ticket's latest attempt (no rebase attempt has started since), or the latest
-   attempt is a rebase attempt that failed its checks or was cut short.
+   attempt is a rebase attempt that failed its checks or was cut short. A rebase attempt
+   stopped at its per-attempt budget (#58, ``end_reason`` budget) is not retried: it stays
+   visible to escalation (``lifecycle.rebase_uncounted``), which hands the ticket to the
+   user with ``attempt_budget`` as for any attempt.
 4. ``rebase_job``: under the cap, replay the PR head (``origin/<pr branch>``) onto the moved
    base (``RepoMirror.replay_onto_base``), store an attempt with trigger ``rebase`` on the
    model and tier that wrote the change, and run it like any attempt with the conflicted
@@ -83,6 +86,8 @@ class RebaseSteps:
             return False
         last = attempts[-1]
         if last.trigger == "rebase":
+            if getattr(last, "end_reason", None) == "budget":
+                return False  # #58: stopped at its budget; escalation hands it over
             return last.ended_at is not None and last.outcome in ("failed_checks", "superseded")
         return self.store.get_cursor(t.repo, _rebase_key(t.id)) == str(last.id)
 

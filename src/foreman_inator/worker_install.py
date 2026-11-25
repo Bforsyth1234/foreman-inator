@@ -35,6 +35,7 @@ from typing import Any
 
 from foreman_inator.db.store import Ticket
 from foreman_inator.runner import install, sandbox
+from foreman_inator.runner.worktree import WorktreeError
 
 log = logging.getLogger("foreman_inator.worker")
 
@@ -180,11 +181,20 @@ class InstallSteps:
                  ticket.id, str(base_sha)[:12])  # fmt: skip
         trace = self.traces_dir / str(ticket.id)
         repo = ticket.repo
-        scratch = mirror.scratch(base_sha, f"a{att_id}-cachefill")
-        fill_policy = self._sandbox_policy(  # type: ignore[attr-defined]
-            ticket, scratch.path, f"a{att_id}-cachefill", writer=False
-        )
+        scratch: Any = None
+        fill_policy: sandbox.Policy | None = None
         try:
+            # Setting up the refill can fail too (WorktreeError from the mirror, ValueError
+            # or OSError from the policy): that is a setup failure, not a job crash.
+            try:
+                scratch = mirror.scratch(base_sha, f"a{att_id}-cachefill")
+                fill_policy = self._sandbox_policy(  # type: ignore[attr-defined]
+                    ticket, scratch.path, f"a{att_id}-cachefill", writer=False
+                )
+            except (WorktreeError, ValueError, OSError) as exc:
+                note = (f"; could not set up filling the empty cache from the base commit: "
+                        f"{type(exc).__name__}: {exc}")  # fmt: skip
+                raise self._install_failed(ticket, first, note) from exc
             install.refill_cache(
                 command, scratch.path, base_sha, policy=fill_policy,
                 cache=install.cache_root(repo),
@@ -196,7 +206,8 @@ class InstallSteps:
             raise self._install_failed(ticket, exc, note) from exc
         finally:
             self._drop_scratch(fill_policy)  # type: ignore[attr-defined]
-            scratch.remove()
+            if scratch is not None:
+                scratch.remove()
         # A fresh policy: its scratch holds a new snapshot of the now-filled cache.
         retry_policy = self._sandbox_policy(  # type: ignore[attr-defined]
             ticket, wt_path, f"a{att_id}-install-retry", writer=False
