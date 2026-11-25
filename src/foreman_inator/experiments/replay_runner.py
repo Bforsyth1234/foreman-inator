@@ -932,7 +932,14 @@ def _drive(
     tap = _tap_for(deps.proxy)
     mirrors: dict[str, RepoMirror] = {}
     try:
-        for case in rs.list_cases(store, set_id) if cases is None else cases:
+        # #49: a local-only repo's cases run only when both sides are local models.
+        cloud = bool(champion.endpoint.is_cloud or challenger.endpoint.is_cloud)
+        if cases is None:
+            cases = rs.list_cases(store, set_id, cloud_models=cloud)
+        else:
+            local = store.local_only_repos() if cloud else frozenset()
+            cases = [c for c in cases if c.repo not in local]
+        for case in cases:
             for side, variant in (("champion", champion), ("challenger", challenger)):
                 if (case.id, side) in done:
                     continue
@@ -1582,7 +1589,12 @@ def run_seeded(
     run = _run_row(store, experiment_id)
     run_set = int(run["set_id"])
     built = sd.seeded_cases(store, run_set, deps.mirror_for, seed=seed, kinds=want)  # type: ignore[arg-type]
-    stored = {c.id: c for c in rs.list_cases(store, run_set)}
+    stored = {
+        c.id: c
+        for c in rs.list_cases(
+            store, run_set, cloud_models=champion.endpoint.is_cloud or challenger.endpoint.is_cloud
+        )
+    }
     cases = [b.stored(stored[b.case_id]) for b in built if isinstance(b, sd.SeededCase)]
     for b in built:
         if isinstance(b, sd.SeededCase):

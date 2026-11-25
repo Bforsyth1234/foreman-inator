@@ -684,3 +684,102 @@ Live: none needed.
 #47 — Post-merge quality signal: data layer only this wave (C5, GH #24); it stays in todo.md as `[~]` until the display in wave 16.
 
 Runner at close: everything under each item's "Runner at close" above; plus `QualitySteps` mixed into `Worker` with `maybe_scan_quality()` in `poll_and_handle` after recover (#47); `tests/test_reviewer.py`'s signature test allows `conventions` (repo input, not writer text). Proof each wiring is called, each checked by reverting it: `tests/test_wave15_wiring.py`.
+
+## Wave 16
+
+#65 — `fman rules show`: preview the rules an agent will get [x] · Added: 2026-11-23 · Source: user (asked how to test rules)
+Why: there is no way to see what a rules file turns into before a real ticket runs: which files were found, which order, and whether the budget clipped them.
+Idea: `fman rules show <repo>` prints the assembled conventions block for the writer and the reviewer exactly as the prompt builder renders it, with each source file, its character count and a clear "CLIPPED at N chars" line. No model call. Estimate: about 30 minutes. Depends on #61–#63.
+Built (wave 16, D1, GH #42): `rules_show.py`: writer and reviewer blocks exactly as built, per-source char counts, `CLIPPED at N chars`, no model call. Runner: `fman rules show REPO [--ref] [--file]...`, docs/commands.md.
+Deviations: none recorded by the runner.
+Live: none needed.
+
+#49 — Per-repo "local only" setting [x] · Added: 2026-11-23 · Source: assistant (gap review)
+Why: config has one global model list and no per-repo settings, so any repo's code can go to a cloud tier on escalation or AI review (invariant 7c limits cloud by tier and spend, not by repo).
+Idea: `cloud = false` for a repo: escalation stops at tier 2 and flags the user, and AI review uses a local reviewer or is skipped with a note in the PR.
+Built (wave 16, D2, GH #26): migration 010 `repo_settings.cloud`; ladder capped at local rungs then `local_only` hand-over; `Spend._estimate` refuses cloud for the repo; local reviewer of another family or skip with a PR note; shadow, replay sets and the labeler leave it out. Runner: `fman repo set-cloud`, `worker_route.limits` via `with_cloud`, kNN and the backfill never use a cloud embedder for it (the backfill not at all while any repo is local only), replay `cloud_models`, status line, `local_only` dormant flag; docs + SPEC "Local only".
+Deviations: none recorded by the runner.
+Live: none needed.
+
+#47 — Post-merge quality signal [x] · Added: 2026-11-23 · Source: assistant (gap review)
+Why: a merge counts as success forever. A merged change that is reverted, or fixed by a follow-up ticket a few days later, still counts as accepted for its model and still trains the router.
+Idea: detect a revert of the merge commit, and a later ticket touching the same files within N days; record it against the accepted attempt and show "accepted, then reverted" per model.
+Built (wave 15, C5): migration 009 `post_merge_signals(ticket_id, kind IN ('reverted','followup'), at, detail)`; `metrics/quality.scan` over tickets merged in the last 14 days (a revert commit naming the merge sha, or GitHub's `Revert "<title>"` with the PR number; a follow-up = a later accepted ticket with overlapping owned files within 7 days); `PullRequest.merge_commit_sha`, `GitHubAPI.list_commits`; `QualitySteps.maybe_scan_quality()` once a day in the poll loop after recover. Tests: `tests/test_post_merge_quality.py`, `tests/test_wave15_wiring.py`. Still to do (wave 16, D3): "accepted, then reverted" and follow-up counts per model on the metrics page; kNN leaves reverted tickets out.
+Built (wave 16, D3, GH #24 display): "accepted, then reverted" and follow-up counts per model on the metrics page; kNN leaves reverted tickets out. Runner: SPEC Metrics view line.
+Deviations: none recorded by the runner.
+Live: none needed.
+
+#35 — Seeded-bug reviewer test cases [x] · Added: 2026-11-23 · Source: spec
+Built (wave 16, D5, GH #17): `experiments/seeded.py` mutates merged diffs (drop an added if-guard, neutralise an added check, flip a comparison), keeps those that apply, expects request_changes; `replay_runner.run_seeded` reports each side's catch rate. Runner: `fman experiment run --mode seeded [--seed] [--kinds]`, status prints the result note; docs.
+Deviations: none recorded by the runner.
+Live: none needed.
+
+#50 — Split a large issue into smaller tickets [x] · Added: 2026-11-23 · Source: assistant (gap review)
+Why: an issue classified `large` goes straight to tier 3 as one attempt. Nothing breaks it into pieces a local model could do, which is the work the v1 goal (replace Max usage with local models) most needs.
+Idea: for `large`, a tier 3 model proposes sub-issues in a comment; the user approves by labeling them; each runs as a normal ticket. No sub-issue is created without the user (same consent idea as invariant 7b).
+Built (wave 16, D6, GH #27): `tickets/decompose.py` + `prompts/split-v1.md`: one tier 3 call proposes sub-issues as a defused comment; ticket flagged `split_proposed`; nothing is created or labeled. Runner: config `split_large`, `split_timeout_seconds`; `split_cloud_allowed` from the repo's cloud setting; a `tier:N` label after a proposal clears the flag (runs as one); `split_proposed` dormant; docs + SPEC.
+Deviations: none recorded by the runner.
+Live: none needed.
+
+#77 — `fman sweep`: start every open issue, dynamic waves, cap on open PRs [~] live · Added: 2026-11-25 · Source: user
+Why: today work starts only when you label an issue by hand, one at a time. The worker already runs tickets in parallel with file locks (`locks.py`: predicted files, all-or-nothing acquire, wait instead of fail), so "waves" mostly exist; what is missing is a bulk start and a way to keep the PR pile reviewable.
+DECISIONS (user, 2026-11-25):
+1. Dynamic waves: a ticket starts as soon as its files are free (existing lock gate + `max_parallel_per_repo`). No strict wave barrier waiting on merges, since the worker never merges (invariant 7a).
+2. A cap on open PRs per repo, so a sweep of 40 issues does not land 40 PRs on the user at once.
+DECISIONS (assistant, 2026-11-25):
+3. The label is applied with the user's own GitHub credentials (`gh` CLI token), not the App's. The poller counts a label only when an `allowed_users` user applied it (`github/poller.py:340`, invariant 7b), so a bot-applied label would start nothing, and that rule stays.
+4. Preview first, then one confirmation (`--yes` skips it). Nothing is labeled on a dry run (`--dry-run`).
+Files:
+⚬ OWNED: src/foreman_inator/sweep.py (new), tests/test_sweep.py (new), tests/test_open_pr_cap.py (new)
+⚬ EDITED: src/foreman_inator/config.py (`max_open_prs_per_repo`, default 5, 0 = no cap, validated like `max_parallel_per_repo`), src/foreman_inator/worker_queue.py (the gate), docs/setup.md (usage)
+⚬ Runner registers: `sweep` command in cli.py. No new dependencies.
+Approach:
+⚬ Select: open issues (not PRs) in `owner/repo` that have no `agent` label, no open ticket, and no `fman/` PR already. Filters: `--label`, `--exclude-label`, `--limit N`, `--author`. Skip issues whose author is not on `allowed_users` unless `--include-any-author` (shown in the preview).
+⚬ Preview: per issue, its predicted files (`locks.predict_files`), the tier the router would pick, and the wave it falls into: greedy grouping so no file appears in two issues of one wave (same rule as todo.md rule 3); issues that predict no files go in a separate "unknown files" group, since they may collide later (see `locks.py`, "No prediction"). Totals: issue count, waves, estimated cloud spend against the remaining `spend_caps` (cloud-tier issues × average cost from metrics, or "unknown" with no history).
+⚬ Apply: label each issue `agent` via `gh issue edit --add-label`, paced to stay under rate limits, printing progress; stop on the first auth error. Re-running is safe (already-labeled issues are skipped).
+⚬ Open-PR cap: in `job_for`, the `publish` step (opening a draft PR) waits while the repo has `max_open_prs_per_repo` open `fman/` PRs that are not merged or closed. Attempts may still run and finish; only opening new PRs waits. Waiting is not a failure: no attempt counted, nothing flagged (same as the lock gate). `fman status` shows "waiting: open-PR cap (5/5)".
+⚬ Fallback: if `gh` is missing or not logged in, print the exact `gh auth login` step and stop; never fall back to the App token.
+Verify:
+⚬ With a fake GitHub of 10 issues (2 labeled, 1 PR, 1 from a non-allowed author): the preview lists 6, waves have no shared file, `--dry-run` labels nothing.
+⚬ Apply labels through a fake `gh`; a re-run labels nothing new.
+⚬ With the cap at 2 and 2 open `fman/` PRs, a passed attempt's publish waits and a third PR is not opened; after one PR merges it publishes. Cap 0 means no limit.
+⚬ The poller still ignores a label applied by the bot (existing test stays green).
+⚬ Non-vacuous: remove the cap check from `job_for` and the "third PR is not opened" test fails; drop the shared-file check from wave grouping and the "no shared file" test fails.
+⚬ pytest + ruff gate (rule 8).
+Live (user): run `fman sweep owner/test-repo --dry-run` on the private test repo, check the preview, then run it for real with `--limit 3` and watch the PR count stay under the cap.
+Estimate: about 2 to 3 hours of agent work with tests. Related: #19 (file locks), #21 (queue), #76 (activity page would show sweep progress).
+Deviations:
+Built (wave 16, D7, GH #70): `sweep.py` (gh as the user, preview with tiers, waves and spend, then labels), open-PR cap in `worker_queue`. Runner: `fman sweep` with `classifier_router`, `WAITING: open-PR cap` in `fman status`; docs.
+Deviations: none recorded by the runner.
+Live: see the item's Live (user) step.
+
+#70 — Tier 2 default becomes open-weights cloud (GLM); local 27B becomes optional [x] · Added: 2026-11-25 · Source: user
+Goal (user, 2026-11-25): "the main goal of this app is to cancel my max plan at 100 a month." So the test is total monthly cost (cloud spend, with the $50 default `spend_caps.monthly_usd` well under $100) at an acceptable merge rate, not the share of tickets that run locally.
+Why: a 27B model on a Mac is slow on agent loops, which resend long prompts every turn (the writer timeout had to become configurable). Local runs also compete for memory (#57–#59), and those slowdowns get recorded as model failures. An open-weights cloud attempt costs a few cents, so a failed 15-minute local attempt that escalates anyway costs more in time than the cloud call costs in money. Tier 1 stays local: small mechanical changes are where small local models pass, and it keeps the v1 goal (replace Max usage with local models) and "local by default" for the easy work.
+Idea: default ladder becomes tier 1 `inkling-2-mini` (local), tier 2 `glm-5.3` (cloud), tier 3 Claude Opus then Fable. `qwen3.8-27b` stays in the code as an opt-in local tier 2 for users who want it (documented in docs/setup.md). Check that reviewer independence still holds: a GLM tier 2 writer must get `claude-opus` as reviewer, which `reviewer_models` order already gives. #49 (`cloud = false`) must still work: with no local tier 2, a local-only repo stops at tier 1 and flags the user, or uses the opt-in qwen tier if configured.
+Decide with data first: before changing the default, run tier 1 local and GLM on the same mix of tickets for about a week and compare accept rate and attempt minutes per accepted PR (needs #46). If qwen 27B matches GLM's accept rate within a reasonable time, keep it.
+Verify: default config lists tiers 1/2/3 as local/cloud/cloud; an existing config.toml with qwen at tier 2 loads unchanged; escalation from tier 1 goes to GLM; a GLM writer gets a non-GLM reviewer; a `cloud = false` repo never calls a cloud endpoint (once #49 lands). Non-vacuous: put GLM in both writer and reviewer slots and the independence test fails.
+SPEC change needed: the tier table in SPEC.md and README.md (tier 2 "Local, Ollama" → "Cloud, pay per use"), and the spend-cap note, since tier 2 now spends money.
+Estimate: about 30 minutes for config and docs, about 2 hours with tests. Related: #46, #49, #57.
+Built (wave 16, D7, GH #59): default tier 2 is GLM (cloud); `qwen_27b_local()` / `local_tier2_models()` are the opt-in local tier 2; test env keeps the old ladder. Runner: docs/how-it-works.md ladder text.
+Deviations: none recorded by the runner.
+Live: none needed.
+
+#72 — Cheapest-first cross-family reviewer [x] · Added: 2026-11-25 · Source: user
+Ask: "having different families of models reviewing code should help raise the quality of the code", then "yes, add it" to cheapest-first reviewer picking.
+Why: the family rule (invariant 7f, `review/reviewer.py:322`) already makes the reviewer independent. But `pick_reviewer` → `config.reviewer_for` takes the first entry of `reviewer_models` from a different family, and the default order is `("claude-opus", "glm")`. So every Inkling, Qwen or GLM writer gets Claude Opus as its reviewer, at Opus prices on even the smallest ticket. Against the goal in #70 (cancel the $100/month Max plan), review is likely the largest cloud cost.
+Idea: pick the cheapest reviewer from a different family, with Opus last. Local/Qwen writer → GLM; GLM writer → a cheap cloud model of a third family (DeepSeek or Kimi; needs a new endpoint and Keychain key); Claude writer → GLM. Opus reviews only tier 3 work, or when the cheap reviewer's verdict is low confidence (a second review, at most one per attempt). Keep `reviewer_models` as an override for users who want a fixed order.
+Measure first: run the cheap reviewer as a shadow reviewer (`experiments/shadow.py`) next to Opus on live tickets, and compare catch rate and false kickbacks before changing the default.
+Verify: a local writer gets GLM; a GLM writer gets the third-family model, never GLM; with only Opus and GLM configured, behaviour matches today; a low-confidence cheap verdict triggers exactly one Opus review; review cost per ticket shows in metrics. Non-vacuous: drop the family check and the GLM-writer test picks GLM and fails.
+SPEC change needed: reviewer selection paragraph (cost order, family rule unchanged, the one-escalation limit).
+Estimate: about half a day with tests, plus a week of shadow data before switching the default. Related: #70, #46.
+Built (wave 16, D8, GH #61): `pick_reviewer(order=)`, `reviewer_candidates` by cost, `review_with_escalation` (one Opus second opinion on a low-confidence cheap verdict), `cheapest_shadow_challenger`. Runner: config `reviewer_order` (default `configured`), `champion_reviewer` picks cheapest when set, review launch wrapped (no escalation for local-only repos); docs + SPEC "Reviewer selection".
+Deviations: none recorded by the runner.
+Live: none needed.
+
+#34 — Traffic split and head-to-head (`ab:pair`) writer experiments [~] split built, `ab:pair` not built · Added: 2026-11-23 · Source: spec
+Built (wave 16, D4, GH #16): traffic split only: `experiments/split.py` (stable ~15% hash of first attempts to a replay-winning challenger, live judge from `attempts.variant_id`), promotion treats a split as "holds live". NOT built: `ab:pair` head-to-head (needs a data-model rework); stays open. Runner: `fman experiment split start|stop|status`; promote help; docs + SPEC Promotion rule.
+Deviations: none recorded by the runner.
+Live: none needed.
+
+Runner at close (wave 16): see the wave 16 row in todo.md; cross-slot fixes: `tests/test_local_only.py` and `tests/test_reviewer_order.py` pinned to `local_tier2_models()` (written against the five-rung ladder); `tracing/replay.py` writes ladder rows as `{tier, model}` (D2's `Rung.cloud` had leaked into the checked-in rows format); `tests/test_wave16_wiring.py` (each wiring reverted → its test fails).

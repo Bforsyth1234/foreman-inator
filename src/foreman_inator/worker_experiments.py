@@ -641,14 +641,26 @@ def run_command(
     config: Config | None = None,
     local_slots: Any = None,
     rules: Path | str | None = None,
+    mode: str = "replay",
+    seed: int | None = None,
+    kinds: list[str] | tuple[str, ...] | None = None,
 ) -> int:
     """``fman experiment run``: its own proxy, its own mirrors, the run lock, clean stops.
     ``local_slots``: the worker proxy's ``slots`` when run inside the worker (#34).
     ``rules`` (#43, ``--rules FILE``): replay FILE in place of the gathered rules on the
     challenger side only; ``challenger`` may then be omitted (the champion's model and
-    prompt)."""
+    prompt). ``mode="seeded"`` (#35, ``--mode seeded``): a reviewer challenger against
+    the champion on merged cases with a planted bug (``replay_runner.run_seeded``);
+    ``seed`` and ``kinds`` choose the mutations."""
     from foreman_inator import config as config_mod
     from foreman_inator.spend import Spend
+
+    if mode not in ("replay", "seeded"):
+        raise ExperimentError(f"unknown --mode {mode!r}; valid: replay, seeded")
+    if mode == "seeded" and (all_ or rules is not None or role != "reviewer" or not challenger):
+        raise ExperimentError("--mode seeded needs --role reviewer and --challenger (no --rules)")
+    if mode == "replay" and (seed is not None or kinds):
+        raise ExperimentError("--seed and --kinds go with --mode seeded")
 
     if all_ == bool(role or challenger or rules):
         raise ExperimentError("give --role and --challenger (or --rules), or --all")
@@ -680,6 +692,8 @@ def run_command(
         try:
             if all_:
                 run_all(env, echo)
+            elif mode == "seeded":
+                run_seeded_experiment(env, challenger or "", seed=seed, kinds=kinds, echo=echo)
             else:
                 c = run_experiment(env, role or "", challenger, rules=rules)
                 echo(rr.comparison_note(c))
@@ -692,6 +706,38 @@ def run_command(
     if env.cancel.is_set():
         echo("Stopped; `fman experiment run --all` resumes it.")
     return 0
+
+
+def run_seeded_experiment(
+    env: RunEnv,
+    challenger: str,
+    *,
+    seed: int | None = None,
+    kinds: list[str] | tuple[str, ...] | None = None,
+    echo: Callable[[str], None] = print,
+) -> rr.SeededComparison:
+    """#35: start or resume the seeded-bug comparison of the reviewer champion against
+    ``challenger`` and print its result."""
+    champ = champion_variant(env.store, env.config, "reviewer")
+    chall = resolve_challenger(env.store, env.config, "reviewer", challenger)
+    if chall.variant_id == champ.variant_id:
+        raise ExperimentError(f"{chall.variant_id} is the reviewer champion")
+    _register(env.store, "reviewer", chall)
+    try:
+        c = rr.run_seeded(
+            env.deps,
+            champion=champ,  # type: ignore[arg-type]
+            challenger=chall,  # type: ignore[arg-type]
+            seed=seed,
+            kinds=kinds or None,
+            settings=settings_from(env.config),
+            cancel=env.cancel,
+        )
+    except ValueError as exc:
+        raise ExperimentError(str(exc)) from None
+    echo(rr.seeded_note(c))
+    echo(f"Experiment #{c.experiment_id}: `fman experiment status {c.experiment_id}`")
+    return c
 
 
 def _main_thread() -> bool:
@@ -738,6 +784,7 @@ __all__ = [
     "run_command",
     "run_experiment",
     "run_lock",
+    "run_seeded_experiment",
     "settings_from",
     "status_lines",
     "summary",

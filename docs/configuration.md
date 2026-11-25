@@ -25,6 +25,10 @@ as `"keychain:foreman-inator/<name>"`.
 | `poll_interval_seconds` | `45` | Seconds between polls. At least 5. |
 | `reviewer_models` | `["claude-opus", "glm"]` | AI reviewer preference order, by model `name`. The first whose `family` differs from the writer's is used. Each name must be in `[[models]]`. |
 | `max_parallel_per_repo` | `1` | Tickets of one repo worked at the same time, as far as file locks permit. 1 to 16. 1 suits one local GPU. |
+| `max_open_prs_per_repo` | `5` | Open `fman/` PRs one repo may have before the worker waits to open another (attempts still run; only the draft PR waits, and `fman status` says `WAITING: open-PR cap`). 0 = no cap. |
+| `reviewer_order` | `"configured"` | How the AI reviewer is picked. `"configured"`: the first of `reviewer_models` of another family. `"cheapest"`: the cheapest cloud model (or one named in `reviewer_models`) of another family; a low-confidence verdict gets one more review by the `"configured"` pick, which decides. A local-only repo never gets that second review. |
+| `split_large` | `true` | For an issue the router calls large (tier 3), one tier 3 call proposes sub-issues as a comment and the ticket is flagged `split_proposed` instead of worked. You create and label the sub-issues you want; a `tier:N` label on the issue runs it as one ticket instead. Never for a local-only repo with a cloud tier 3. |
+| `split_timeout_seconds` | `180` | Time limit for that proposal call. Above 0, at most 1800. |
 | `router_timeout_seconds` | `30` | Time limit for the router's classification call. Above 0, at most 600. |
 | `sandbox` | `"on"` | `"on"`: OpenCode, the verify command and the reviewer's checks run under `sandbox-exec`, and nothing runs if the sandbox cannot start. `"off"`: they run unsandboxed, and `fman status` and every PR description say so. |
 | `clarify` | `true` | Ask questions on a vague issue before working on it. |
@@ -215,11 +219,13 @@ api_key_ref = "keychain:foreman-inator/glm"
 
 ## Per-repo settings in the database
 
-Two settings are kept in the worker's database rather than in `config.toml`:
+Three settings are kept in the worker's database rather than in `config.toml`:
 
 * the verify command, set with `fman repo set-verify <owner/name> '<command>'`
   and cleared with `--clear`;
-* the repo profile, set with `fman repo set-profile` (below).
+* the repo profile, set with `fman repo set-profile` (below);
+* the cloud setting, set with `fman repo set-cloud <owner/name> on|off`: `off`
+  keeps the repo's code on this Mac (see [`fman repo set-cloud`](commands.md#fman-repo-set-cloud)).
 
 ### Repo profiles
 

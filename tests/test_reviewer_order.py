@@ -13,7 +13,8 @@ from typing import Any
 
 import pytest
 
-from foreman_inator.config import Config, ModelEndpoint, key_ref
+from foreman_inator.config import Config as _Config
+from foreman_inator.config import ModelEndpoint, key_ref, local_tier2_models
 from foreman_inator.review import checks as C
 from foreman_inator.review import reviewer as R
 from foreman_inator.review.reviewer import (
@@ -27,6 +28,12 @@ from foreman_inator.review.reviewer import (
     review_with_escalation,
     reviewer_candidates,
 )
+
+
+def Config(**kw: Any) -> _Config:  # noqa: N802 - stands in for the class
+    """The pre-#70 local tier 2 ladder these cases were written against (Qwen at tier 2)."""
+    return _Config(**({"models": local_tier2_models()} | kw))
+
 
 # A cheap third family (DeepSeek-like). Its id must be priced (an unpriced one gets the
 # conservative, highest price), so it borrows glm-4.5-air's price under its own family.

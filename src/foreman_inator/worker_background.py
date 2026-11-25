@@ -238,7 +238,10 @@ class BackgroundSteps:
             self.store,
             proxy=self.proxy,
             embedder=self.embedder,
-            allow_cloud_embedder=bool(self.config.allow_cloud_embedder),
+            # #49: the backfill batch is not split by repo, so while any repo is local
+            # only a cloud embedder is not used for it at all.
+            allow_cloud_embedder=bool(self.config.allow_cloud_embedder)
+            and not self.store.local_only_repos(),
         )
         if r.error is not None:
             # No loop (7e): a failing embedder (not installed, say) is retried less and

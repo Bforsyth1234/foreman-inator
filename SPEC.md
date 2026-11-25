@@ -150,6 +150,12 @@ A `tier:N` label on the issue overrides the router for that ticket, and the over
 
 The reviewer sees only the issue and the diff, not the writer's reasoning. It posts its verdict as a PR review from the bot account, so the exchange stays in the PR history. Two automatic kickbacks escalate the writer one tier.
 
+**Reviewer selection:** by default (`reviewer_order = "configured"`) the first of `reviewer_models` whose family differs from the writer's. Opt-in `"cheapest"` picks the cheapest model of another family instead; when its verdict is low confidence, exactly one more review by the configured pick decides (never a writer's family, never a loop).
+
+**Local only:** a repo set `cloud = false` (`fman repo set-cloud <repo> off`) never sends its code or issue text to a cloud model (7c, strictly): escalation stops at the last local rung and hands over (`local_only`), the reviewer is local or skipped with a PR note, and router, clarify check, embeddings, shadow, replays and the labeler stay local or leave it out.
+
+**Large issues:** when the router calls an issue large, one tier 3 call proposes sub-issues as a comment and the ticket is flagged `split_proposed`. Nothing is created or labeled for you (7b: the bot's own labels never count); a `tier:N` label on the issue runs it as one ticket instead, and `split_large = false` turns it off.
+
 **Repo profiles:** each repo has two settings. Cost is what speed and correctness are bought with, so there is one setting for each: `writer` spends money to save time, `review` spends money and time to catch bugs. A repo with no setting uses `normal` for both, which is the behaviour described above.
 
 | `writer` | Start tier | Failed checks | Exploration | Cloud writer |
@@ -200,6 +206,8 @@ Two trend lines on the page:
 - Cost per accepted ticket over time, which should fall as the router learns
 - Share of tickets solved locally, the number that tells you whether Max can go
 
+Per writer model it also shows changes accepted then reverted, and follow-up fixes within 7 days; reverted tickets never count as neighbours for the kNN router.
+
 The worker serves the metrics page on localhost. When an issue closes, it also posts a one-line summary comment on the issue: model, attempts, kickbacks and cost.
 
 ## Experiments
@@ -217,7 +225,7 @@ A **variant** is a model plus a prompt version, for example `inkling-2-mini / wr
 | Traffic split | Writer | 10–20% of live tickets go to the challenger; you review as normal | Normal | After a challenger wins on replay |
 | Head-to-head | Writer | Two PRs for one issue, you pick one (`ab:pair` label) | Double | Rarely, for a close call |
 
-**Promotion rule:** a challenger becomes champion only after it wins on replay *and* holds up live (shadow or traffic split). Its live accept rate must not fall below the champion's, and its cost per accepted ticket must not be higher. Both variants are judged on the same tickets wherever possible.
+**Promotion rule:** a challenger becomes champion only after it wins on replay *and* holds up live (shadow for a reviewer; for a writer, a traffic split, `fman experiment split start`, giving it a stable ~15% of first attempts). Its live accept rate must not fall below the champion's, and its cost per accepted ticket must not be higher. Both variants are judged on the same tickets wherever possible.
 
 **Cautions:**
 

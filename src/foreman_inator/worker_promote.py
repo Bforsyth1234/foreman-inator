@@ -57,6 +57,9 @@ def summary(store: Store, exp: Experiment, config: Config) -> str:
             return split_mod.summary(store, exp.id, min_sample=config.experiments.live_min_sample)
         except Exception as exc:
             return f"not scored ({type(exc).__name__})"
+    if exp.mode == "seeded":  # #35: the note's first line; the details print it whole
+        lines = (exp.result_note or "").splitlines()
+        return lines[0] if lines else "not finished"
     return exp.result_note or ""
 
 
@@ -72,7 +75,7 @@ def status_lines(store: Store, config: Config, experiment_id: int | None = None)
             + (f", ended {exp.ended_at:%Y-%m-%d %H:%M}" if exp.ended_at else ""),
             f"  {summary(store, exp, config)}",
         ]
-        if exp.mode == "replay" and exp.result_note:
+        if exp.mode in ("replay", "seeded") and exp.result_note:
             lines += ["", *exp.result_note.splitlines()]
         return lines
     lines = [f"Champion {line}" for line in variants.status_lines(store)]

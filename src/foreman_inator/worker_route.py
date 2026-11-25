@@ -70,6 +70,14 @@ issue's comments once and then:
 Nothing creates a sub-issue or applies a label. A ticket whose flag is cleared later
 runs on its stored tier 3 route.
 
+Local-only repos (#49)
+----------------------
+The router and the clarify check only ever call a local classifier (``routing.route`` and
+``clarify.assess`` are called without ``allow_cloud_classifier``), and for a repo with
+``cloud = false`` the kNN router is given ``allow_cloud_embedder=False`` whatever the
+config says, so its issue text never reaches a cloud embedder. ``limits`` caps its
+escalation ladder at the local rungs (``escalation.with_cloud``).
+
 Crash safety (routing): killed after ``route_knn`` but before that transaction, nothing
 is stored (``routed_tier`` NULL), so the ticket is routed again; the new ticket's vector
 was stored by ``route_knn``, so no second embedding call, and the explore draw is
@@ -95,7 +103,7 @@ from foreman_inator.db.store import Ticket
 from foreman_inator.github.app_auth import GitHubNotFound
 from foreman_inator.routing import explore, knn
 from foreman_inator.routing import profile as prof
-from foreman_inator.routing.escalation import DEFAULT_LIMITS, Limits
+from foreman_inator.routing.escalation import DEFAULT_LIMITS, Limits, with_cloud
 from foreman_inator.tickets import clarify, decompose
 from foreman_inator.tickets.lifecycle import clarify_cursor
 
@@ -347,7 +355,9 @@ class RouteSteps:
             threshold=int(self.config.knn_threshold),
             k=int(self.config.knn_k),
             timeout=float(self.config.knn_timeout_seconds),
-            allow_cloud_embedder=bool(self.config.allow_cloud_embedder),
+            # #49: a local-only repo's issue text never goes to a cloud embedder.
+            allow_cloud_embedder=bool(self.config.allow_cloud_embedder)
+            and self.store.repo_allows_cloud(t.repo),
         )
 
     # ------------------------------------------------------------------ profiles (#51)
@@ -358,9 +368,11 @@ class RouteSteps:
 
     def limits(self, ticket: Ticket) -> Limits | None:
         """The repo profile's escalation limits for the policy; None for today's rules
-        (so the module constants decide, exactly as before)."""
+        (so the module constants decide, exactly as before). #49: a local-only repo's
+        limits have ``cloud=False`` (the ladder stops at its last local rung)."""
         limits = prof.limits_for(self.repo_profile(ticket))
-        return None if limits == DEFAULT_LIMITS else limits
+        current = None if limits == DEFAULT_LIMITS else limits
+        return with_cloud(current, self.store.repo_allows_cloud(ticket.repo))
 
     def start_tier(self, ticket: Ticket) -> int | None:
         """The stored start (``start:<ticket>`` cursor, written with the route); None for

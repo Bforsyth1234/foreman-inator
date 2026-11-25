@@ -17,9 +17,13 @@ current text. `fman --version` prints the version.
 | [`fman repo list`](#fman-repo-list) | The repos in `config.toml`, marking any the installation no longer covers. |
 | [`fman repo set-verify`](#fman-repo-set-verify) | Save the command that verifies a repo. |
 | [`fman repo set-profile`](#fman-repo-set-profile) | Set a repo's profile: how hard the writer tries and how much review a change gets. |
+| [`fman repo set-cloud`](#fman-repo-set-cloud) | Allow or forbid cloud models for a repo (off: local only). |
+| [`fman rules show`](#fman-rules-show) | Print the writer's and reviewer's rules blocks for a repo, as built. |
+| [`fman sweep`](#fman-sweep) | Label a repo's open issues for the worker in waves, after a preview. |
 | [`fman experiment run`](#fman-experiment-run) | Replay the champion against a challenger on past tickets. |
 | [`fman experiment status`](#fman-experiment-status) | Champions, running and ended experiments with their results. |
 | [`fman experiment promote`](#fman-experiment-promote) | Make a challenger champion if it won on replay and holds live. |
+| [`fman experiment split`](#fman-experiment-split) | Send a share of first attempts to a writer challenger (the live check). |
 | [`fman replay`](#fman-replay) | Check that today's logic still decides a recorded ticket as it did. |
 | [`fman export`](#fman-export) | Export one ticket's trace, recordings and rows for a bug report, redacted. |
 | [`fman prune`](#fman-prune) | Delete old recordings, traces and scratch of unmerged tickets. |
@@ -164,6 +168,48 @@ See [Repo profiles](configuration.md#repo-profiles).
 | `--writer` | `thrifty`, `normal` or `fast`. |
 | `--review` | `off`, `light`, `normal` or `strict`. |
 
+## `fman repo set-cloud`
+
+```bash
+fman repo set-cloud <owner/name> on|off
+```
+
+`off` makes the repo local only: its code and issue text never go to a cloud
+model. Escalation stops at the last local rung and hands the ticket to you
+(flag `local_only`); the AI reviewer is a local model of another family, or the
+review is skipped with a note on the PR; the spend gate refuses cloud calls for
+it; kNN routing and the embedding backfill do not use a cloud embedder; shadow
+reviews, replays with a cloud model and the failure labeler leave it out.
+`fman status` lists local-only repos. `on` (the default) undoes it.
+
+## `fman rules show`
+
+```bash
+fman rules show <owner/name> [--ref REF] [--file PATH]...
+```
+
+Print the rules blocks the writer and the reviewer get for the repo, exactly as
+built: each source (global `AGENTS.md`, the repo's `AGENTS.md` / `CLAUDE.md`,
+nested files on the `--file` paths, the `rules_file`) with its size, and
+`CLIPPED at N chars` where the shared budget cut it. `--ref` reads another
+commit or branch. No model call. Exit 1 when the repo has no local mirror yet.
+
+## `fman sweep`
+
+```bash
+fman sweep <owner/name> [--label L] [--exclude-label L]... [--author A]
+           [--limit N] [--include-any-author] [--dry-run] [--yes]
+```
+
+Label a repo's open issues for the worker, as you, through the GitHub CLI
+(`gh auth login` first; the App's token is never used, since the worker ignores
+labels the bot applies). It prints a preview first: each issue's tier from the
+local router (a `tier:N` label wins), file overlaps grouped into waves, and the
+spend estimate. Issues already worked, with a `fman/` PR, or by authors not on
+`allowed_users` (unless `--include-any-author`) are skipped. `--dry-run` stops
+after the preview; `--yes` labels without asking. New PRs then wait at
+`max_open_prs_per_repo`.
+
 ## `fman experiment run`
 
 Replay the champion against a challenger on past tickets. Resumable; Ctrl-C
@@ -176,6 +222,9 @@ starts shadow-reviewing live PRs. Nothing is promoted.
 | `--role <role>` | `writer` or `reviewer`. |
 | `--challenger <variant>` | `MODEL/PROMPT@HASH8`, `MODEL/PROMPT` (the prompt file as it is now) or `MODEL`. |
 | `--all` | Resume every unfinished replay (what the nightly agent runs). |
+| `--mode <mode>` | `replay` (default) or `seeded`: reviewers only; merged cases with a planted bug (a dropped `if` guard, a neutralised check, a flipped comparison) that each reviewer should kick back. Reports each side's catch rate. |
+| `--seed <n>` | `--mode seeded`: the mutation seed (a resumed run keeps its own). |
+| `--kinds <kind>` | `--mode seeded`: only these mutation kinds (repeatable). |
 | `--rules <file>` | Replay this rules file in place of the repo's rules, on the challenger side only (same model and prompt on both sides, so the run compares the rules). `--challenger` may then be omitted. The file's hash is part of the challenger's id (`...+rules@HASH8`). A reviewer replay shows rules only with a `reviewer-v2` prompt. |
 
 Example: `fman experiment run --role writer --challenger inkling-2-mini/writer-v2`.
@@ -201,7 +250,21 @@ that loses either is ended as rejected. Exits 0 only when promoted.
 
 | Option | Meaning |
 | --- | --- |
-| `--replay-only` | Writers only: promote on the replay alone (no live writer check exists yet). |
+| `--replay-only` | Writers only: promote on the replay alone, without the live check. Otherwise a writer holds live through its running `fman experiment split`. |
+
+## `fman experiment split`
+
+```bash
+fman experiment split start <variant> [--share 0.15]
+fman experiment split stop <experiment id>
+fman experiment split status [experiment id]
+```
+
+`start`: a stable share (default 15%) of new tickets' first attempts go to the
+writer challenger, which must have won its replay; the champion writes the
+rest. `status`: the split's share and each side's live accept rate and cost per
+accepted ticket. `stop`: end it as rejected (its attempts are kept).
+`fman experiment promote` judges a running split as the "holds live" check.
 
 ## `fman replay`
 

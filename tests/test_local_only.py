@@ -12,7 +12,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from foreman_inator.config import Config, ModelEndpoint, SpendCaps, default_models
+from foreman_inator.config import (
+    Config,
+    ModelEndpoint,
+    SpendCaps,
+    local_tier2_models,
+)
 from foreman_inator.db.store import Attempt, Kickback, Store
 from foreman_inator.experiments import replay_sets as rs
 from foreman_inator.experiments import shadow as S
@@ -40,7 +45,7 @@ from foreman_inator.worker_review import (
 
 T0 = datetime(2026, 11, 25, 12, 0, tzinfo=UTC)
 LOCAL_URL = "http://127.0.0.1:11434/v1"
-LADDER = build_ladder(default_models())  # inkling (1, local), qwen (2, local), 3 cloud rungs
+LADDER = build_ladder(local_tier2_models())  # inkling (1, local), qwen (2, local), 3 cloud rungs
 Q1, Q2, GLM, OPUS, FABLE = LADDER
 LOCAL = with_cloud(None, False)
 REPO = "me/secret"

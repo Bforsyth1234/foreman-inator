@@ -330,6 +330,15 @@ class Config:
     #: #34: local-model completion calls in flight at once, across the worker and its
     #: experiment runs (one local GPU: 1). Queued time never counts against an attempt.
     max_local_inference: int = 1
+    #: #50: propose sub-issues (one tier 3 call, posted as a comment) for an issue the
+    #: router calls large, instead of working it as one ticket.
+    split_large: bool = True
+    #: #50: whole-call bound for that one proposal call.
+    split_timeout_seconds: float = 180.0
+    #: #72: how the AI reviewer is picked: "configured" (``reviewer_models`` order, as
+    #: before) or "cheapest" (the cheapest model of another family, one Opus review more
+    #: when its verdict is low-confidence).
+    reviewer_order: str = "configured"
     #: #45: bound on one dependency install (the step fails, and the ticket is flagged).
     install_timeout_seconds: float = 900.0
     #: #57: when an offline install (after a model edit) misses the package cache and the
@@ -451,6 +460,14 @@ def _validate(cfg: Config) -> None:
         )
     if not 0 < cfg.router_timeout_seconds <= 600:
         raise ConfigError("router_timeout_seconds must be > 0 and <= 600")
+    if not 0 < cfg.split_timeout_seconds <= 1800:
+        raise ConfigError("split_timeout_seconds must be > 0 and <= 1800")
+    if not isinstance(cfg.split_large, bool):
+        raise ConfigError("split_large must be true or false")
+    from foreman_inator.review.reviewer import REVIEWER_ORDERS
+
+    if cfg.reviewer_order not in REVIEWER_ORDERS:
+        raise ConfigError(f"reviewer_order must be one of {', '.join(REVIEWER_ORDERS)}")
     for cap in fields(SpendCaps):
         if getattr(cfg.spend_caps, cap.name) < 0:
             raise ConfigError(f"spend_caps.{cap.name} must be >= 0")
@@ -677,11 +694,20 @@ def from_dict(data: Mapping[str, Any]) -> Config:
         kw["sandbox"] = _typed(data["sandbox"], str, "sandbox")
     if "clarify" in data:
         kw["clarify"] = _typed(data["clarify"], bool, "clarify")
+    if "split_large" in data:
+        kw["split_large"] = _typed(data["split_large"], bool, "split_large")
+    if "reviewer_order" in data:
+        kw["reviewer_order"] = _typed(data["reviewer_order"], str, "reviewer_order")
     if "install_refill_cache" in data:
         kw["install_refill_cache"] = _typed(
             data["install_refill_cache"], bool, "install_refill_cache"
         )
-    for key in ("attempt_budget_usd", "retention_days", "cold_load_timeout_seconds"):
+    for key in (
+        "attempt_budget_usd",
+        "retention_days",
+        "cold_load_timeout_seconds",
+        "split_timeout_seconds",
+    ):
         if key in data:
             kw[key] = float(_typed(data[key], (int, float), key))
     for key in (
@@ -778,6 +804,9 @@ def to_dict(cfg: Config) -> dict[str, Any]:
         out["rules_file"] = dict(cfg.rules_file)
     out["cold_load_timeout_seconds"] = cfg.cold_load_timeout_seconds
     out["max_local_inference"] = cfg.max_local_inference
+    out["split_large"] = cfg.split_large
+    out["split_timeout_seconds"] = cfg.split_timeout_seconds
+    out["reviewer_order"] = cfg.reviewer_order
     out["install_timeout_seconds"] = cfg.install_timeout_seconds
     out["install_refill_cache"] = cfg.install_refill_cache
     out["attempt_budget_usd"] = cfg.attempt_budget_usd

@@ -172,6 +172,7 @@ class ReviewSteps:
             return
         writer = self._endpoint_named(att)
         light = plan.kind == "light"
+        order = "configured"  # #72: no second (possibly cloud) opinion on a light review
         if light:  # #51: no model reads the diff, so no reviewer is picked (7f not in play)
             reviewer, prompt_name = writer, rv.REVIEWER_PROMPT_NAME
         else:
@@ -181,6 +182,8 @@ class ReviewSteps:
                 reason = local_only_skip_reason(writer)
                 self.hand_over(t, reason, ready=True, attempt=att)
                 return
+            if not local_only:  # #49: a local-only repo never escalates to a cloud reviewer
+                order = self._reviewer_order()
             try:
                 reviewer, prompt_name = self.champion_reviewer(writer, local_only=local_only)
             except rv.ReviewError as exc:
@@ -197,7 +200,10 @@ class ReviewSteps:
             rv.LIGHT_REVIEWER_MODEL if light else reviewer.name,
         )
         with self._trace(t):  # type: ignore[attr-defined]
-            outcome = self._launch_review(
+            outcome = rv.review_with_escalation(
+                self._launch_review,
+                config=self.config,
+                order=order,
                 issue=rv.IssueText(t.issue_number, t.title, t.request),
                 change=rv.ChangeRef(mirror, att.base_commit or "", head),
                 writer=writer,
@@ -213,7 +219,7 @@ class ReviewSteps:
                 cancel=cancel,
                 depth=plan.depth,
                 rules_file=self._rules_file(t.repo),  # #39: same rules file the writer gets
-            )
+            ).outcome
         if (cancel is not None and cancel.is_set()) or self.stopping:  # type: ignore[attr-defined]
             log.info("ticket %d: AI review cut short; it runs again", t.id)
             return
@@ -297,6 +303,10 @@ class ReviewSteps:
             except (FileNotFoundError, ValueError):
                 log.warning("reviewer champion's prompt %s is missing; using the default",
                             champ.prompt_name)  # fmt: skip
+        if not local_only and self._reviewer_order() == "cheapest":
+            # #72: the cheapest model of another family reads the diff (champion's prompt).
+            return rv.pick_reviewer(self.config, writer, order="cheapest"), prompt_name
+        if champ is not None:
             try:
                 candidate = self.config.model(champ.model)
                 rv.check_independent(candidate, writer)
@@ -309,6 +319,9 @@ class ReviewSteps:
             if reviewer is None:
                 raise rv.NoIndependentReviewer(local_only_skip_reason(writer))
         return reviewer or rv.pick_reviewer(self.config, writer), prompt_name
+
+    def _reviewer_order(self) -> str:
+        return str(getattr(self.config, "reviewer_order", rv.DEFAULT_REVIEWER_ORDER))
 
     # ------------------------------------------------------------------ ready + hand-over
 

@@ -35,6 +35,9 @@ from foreman_inator.setup.deps import ollama_host
 
 DEFAULT_TTL_SECONDS = 5.0
 TIMEOUT_SECONDS = 2.0
+#: ``fman status``'s bound: a busy Ollama (a model loading, a long generation) can take
+#: longer than 2 s to answer /api/ps, and that is "slow", not "unreachable".
+STATUS_TIMEOUT_SECONDS = 5.0
 
 
 @dataclass(frozen=True)
@@ -49,9 +52,11 @@ class LoadedModel:
 
 @dataclass(frozen=True)
 class Unreachable:
-    """Ollama could not be asked, or its answer could not be read."""
+    """Ollama could not be asked, or its answer could not be read. ``slow``: it took the
+    connection but sent no reply within the timeout (busy, not down)."""
 
     reason: str
+    slow: bool = False
 
 
 def _parse(data: object) -> list[LoadedModel]:
@@ -97,6 +102,8 @@ def loaded_models(
             return _parse(resp.json())
     except httpx.HTTPStatusError as exc:
         return Unreachable(f"Ollama at {base} answered HTTP {exc.response.status_code}")
+    except httpx.ReadTimeout:
+        return Unreachable(f"no reply from {base} in {timeout:g}s", slow=True)
     except httpx.HTTPError as exc:
         return Unreachable(f"Ollama not reachable at {base} ({exc.__class__.__name__})")
     except (ValueError, TypeError) as exc:
