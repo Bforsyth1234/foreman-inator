@@ -43,11 +43,22 @@ gets traffic). ``run --all`` resumes every unfinished replay; it never promotes.
 2. holds live:
    * reviewer: ``shadow.judge_live`` over at least ``live_min_sample`` paired PRs the user
      decided: ``holds`` → promote; ``fails`` → ``rejected``; ``insufficient`` → nothing;
-   * writer: there is no live writer traffic yet (traffic split, #34, is unscheduled), so
-     promotion on the replay alone needs ``--replay-only`` and says so in the champion
-     history note; without it nothing changes.
+   * writer: the traffic split (#34, ``experiments.split``): the newest running split of
+     V against the current champion, ``split.judge`` over at least ``live_min_sample``
+     decided first attempts per side: ``holds`` → promote; ``fails`` → ``rejected``;
+     ``insufficient`` (or no split) → nothing, unless ``--replay-only``, which promotes
+     on the replay alone and says so in the champion history note.
 3. promoting writes a ``champion_history`` row and ends V's running experiments as
    ``promoted``; the worker uses the new champion from its next attempt or review.
+
+Traffic split (#34, GH #16)
+---------------------------
+``split start V [--share 0.15]`` (``start_split``) starts a writer split of the current
+champion against V, refused unless V's newest replay against that champion finished and
+``wins``, V's model is configured on the champion model's tier and is not cloud when the
+champion's model is local, and no other split against the champion is running.
+``split stop <id>`` (``stop_split``) ends it as ``rejected``. The worker reads the
+running split on each first attempt (``worker_attempt``). ``ab:pair`` is not built.
 
 Rules replays (#43, todo #66)
 -----------------------------
@@ -80,6 +91,7 @@ from foreman_inator.db.store import Experiment, Store
 from foreman_inator.experiments import replay_runner as rr
 from foreman_inator.experiments import replay_sets as rs
 from foreman_inator.experiments import shadow, variants
+from foreman_inator.experiments import split as split_mod
 from foreman_inator.runner.worktree import MIRROR_DIRNAME, RepoMirror, WorktreeError, _git
 
 log = logging.getLogger("foreman_inator.experiments")
@@ -336,6 +348,98 @@ def ensure_shadow(store: Store, champion: str, challenger: str) -> Experiment:
     )
     log.info("experiment %d: shadow reviews by %s started", exp.id, challenger)
     return exp
+
+
+# =========================================================================== split (#34)
+
+
+def start_split(
+    store: Store, config: Config, challenger: str, *, share: float = split_mod.DEFAULT_SHARE
+) -> Experiment:
+    """``fman experiment split start V``: see the module docstring ("Traffic split").
+    Returns the running split (an already running one of V against the champion as is)."""
+    try:
+        share = split_mod.check_share(share)
+    except ValueError as exc:
+        raise ExperimentError(str(exc)) from None
+    champ = champion_variant(store, config, "writer")
+    chall = resolve_challenger(store, config, "writer", challenger)
+    vid = chall.variant_id
+    if vid == champ.variant_id:
+        raise ExperimentError(f"{vid} is the writer champion")
+    for e in split_mod.running_splits(store):
+        if e.champion_variant != champ.variant_id:
+            continue
+        if e.challenger_variant == vid:
+            return e
+        raise ExperimentError(
+            f"split #{e.id} ({e.challenger_variant}) is already running against the champion;"
+            f" stop it first (`fman experiment split stop {e.id}`)"
+        )
+    min_cases = config.experiments.min_cases
+    if not split_mod.replay_won(store, vid, champ.variant_id, min_cases=min_cases):
+        raise ExperimentError(
+            f"{vid} has not won a finished replay against the champion {champ.variant_id}; "
+            f"run `fman experiment run --role writer --challenger {vid}` first"
+        )
+    ch_ep, co_ep = chall.endpoint, champ.endpoint
+    if ch_ep.tier != co_ep.tier:
+        raise ExperimentError(
+            f"{ch_ep.name} is a tier {ch_ep.tier} model and the champion's {co_ep.name} is "
+            f"tier {co_ep.tier}; a split only swaps a model on the same tier"
+        )
+    if ch_ep.is_cloud and not co_ep.is_cloud:
+        raise ExperimentError(
+            f"{ch_ep.name} is a cloud model and the champion's {co_ep.name} is local; a split "
+            "never sends local tickets to the cloud"
+        )
+    exp = store.create_experiment(
+        role="writer",
+        champion_variant=champ.variant_id,
+        challenger_variant=vid,
+        mode="split",
+        traffic_share=share,
+    )
+    log.info("experiment %d: writer split %.0f%% to %s started", exp.id, share * 100, vid)
+    return exp
+
+
+def stop_split(store: Store, experiment_id: int) -> Experiment:
+    """``fman experiment split stop <id>``: end a running split (``rejected``, with its
+    live comparison so far in the note). Its attempts and their cursors are kept."""
+    exp = store.get_experiment(experiment_id)
+    if exp.mode != "split" or exp.status != "running":
+        raise ExperimentError(f"#{exp.id} is not a running split ({exp.mode}, {exp.status})")
+    c = split_mod.score(store, exp.id)
+    j = split_mod.judge(c)
+    note = f"stopped by `fman experiment split stop`\n{split_mod.comparison_note(c, j)}"
+    return store.end_experiment(exp.id, "rejected", note)
+
+
+def split_lines(store: Store, config: Config, experiment_id: int | None = None) -> list[str]:
+    """``fman experiment split status [id]`` (reads only)."""
+    exps = (
+        [store.get_experiment(experiment_id)]
+        if experiment_id is not None
+        else split_mod.running_splits(store)
+    )
+    if not exps:
+        return ["No running writer split. Start one with `fman experiment split start V`."]
+    min_sample = config.experiments.live_min_sample
+    lines: list[str] = []
+    active = split_mod.active_split(store, min_cases=config.experiments.min_cases)
+    for e in exps:
+        if e.mode != "split":
+            raise ExperimentError(f"#{e.id} is a {e.mode} experiment, not a split")
+        share = split_mod.DEFAULT_SHARE if e.traffic_share is None else e.traffic_share
+        live = "gets traffic" if active is not None and active.id == e.id else "no traffic"
+        c = split_mod.score(store, e.id)
+        j = split_mod.judge(c, min_sample=min_sample)
+        lines += [
+            f"Split #{e.id}: {e.status}, {share:.0%} of first attempts, {live}",
+            *split_mod.comparison_note(c, j).splitlines(),
+        ]
+    return lines
 
 
 # =========================================================================== running
@@ -637,6 +741,9 @@ __all__ = [
     "settings_from",
     "status_lines",
     "summary",
+    "split_lines",
+    "start_split",
+    "stop_split",
     "sync_replay_mirror",
     "unfinished_replays",
 ]
