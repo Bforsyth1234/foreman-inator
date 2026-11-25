@@ -53,6 +53,7 @@ as `"keychain:foreman-inator/<name>"`.
 | `classifier_router` | `true` | Route with a trained classifier on the issue embeddings once it beats the nearest-neighbor router on the held-out newest 20% of accepted tickets (chronological split; a tie keeps nearest-neighbor). The comparison is rechecked daily. `false`: nearest-neighbor only. |
 | `classifier_min_tickets` | `300` | Accepted tickets before the classifier is trained at all. At least 1. |
 | `relay_url` | none | A webhook relay (smee.io or your own; https, or http to localhost). Each delivery that verifies against the App's webhook secret triggers an immediate poll; nothing in a delivery is trusted. None: polling only. See [relay.md](relay.md). |
+| `relay_min_poll_gap_seconds` | 15 | The least time (0 to 3600 s) between a poll and a relay-nudged one. Nudges inside it are coalesced into one poll when it passes, so a flood of deliveries (replayed or not) polls at most once per gap. |
 | `relay_secret_ref` | none | Keychain reference of the webhook secret. None reads `keychain:foreman-inator/relay-webhook-secret`, where `fman setup --relay-url` stores it. |
 | `status_comment` | `true` | Keep one comment on the issue up to date while work runs: attempt and tier, verifying, in review, PR opened, handed over, dropped. Edited in place, never one per step. A repo's settings row can turn it off. |
 | `status_label` | `false` | Also add the `fman:working` label while work runs (removed when it stops). It never starts work. |

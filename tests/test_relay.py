@@ -14,13 +14,19 @@ from foreman_inator.setup import manifest
 SECRET = "test-secret-" + "x" * 8  # generated at test time, not a real key
 
 
-def smee_message(body: dict, *, secret: str | None = SECRET, event: str = "issues") -> str:
+def smee_message(
+    body: dict,
+    *,
+    secret: str | None = SECRET,
+    event: str = "issues",
+    delivery: str = "72d3162e-cc78-11e3-81ab-4c9367dc0958",
+) -> str:
     """One SSE ``data`` payload exactly as smee.io sends it."""
     raw = json.dumps(body, separators=(",", ":"), ensure_ascii=False).encode()
     data = {
         "host": "smee.io",
         "x-github-event": event,
-        "x-github-delivery": "72d3162e-cc78-11e3-81ab-4c9367dc0958",
+        "x-github-delivery": delivery,
         "content-type": "application/json",
         "body": body,
         "query": {},
@@ -81,6 +87,23 @@ def test_raw_body_from_self_hosted_relay_is_tried_first():
         "body": json.loads(raw),
     }
     assert relay.verified_delivery(json.dumps(data), SECRET).repo == "you/project"
+
+
+def test_repo_comes_from_the_raw_body_that_verified_not_the_unsigned_body():
+    raw = '{"repository": {"full_name": "you/a"}}'  # what the signature covers
+    data = {
+        "x-github-event": "push",
+        "x-github-delivery": "d-1",
+        "x-hub-signature-256": relay.sign(SECRET, raw.encode()),
+        "raw_body": raw,
+        "body": {"repository": {"full_name": "you/b"}},  # unsigned: must not be read
+    }
+    assert relay.verified_delivery(json.dumps(data), SECRET).repo == "you/a"
+    stream = sse_stream(json.dumps(data))
+    client, _, nudged = make_client([httpx.Response(200, content=stream)],
+                                    repos=["you/a", "you/b"])  # fmt: skip
+    client.run()
+    assert nudged == ["you/a"]
 
 
 @pytest.mark.parametrize(
@@ -336,3 +359,22 @@ def test_convert_code_keeps_webhook_secret_out_of_repr():
     creds = manifest.convert_code("c", transport=httpx.MockTransport(handler))
     assert creds.webhook_secret == "whsec-test"
     assert "whsec-test" not in repr(creds)
+
+
+def test_a_replayed_delivery_id_is_dropped():
+    msg = smee_message(issue_body(), delivery="d-1")
+    stream = sse_stream(msg, msg, smee_message(issue_body(), delivery="d-2"), msg)
+    client, _, nudged = make_client([httpx.Response(200, content=stream)])
+    client.run()
+    assert nudged == ["you/project"] * 2  # d-1 once, d-2 once
+    assert client.duplicates == 2
+
+
+def test_seen_delivery_ids_are_a_bounded_lru(monkeypatch):
+    monkeypatch.setattr(relay, "SEEN_DELIVERIES", 2)
+    ids = ["a", "b", "c", "a", "c"]  # "a" was evicted by "c"; "c" is still remembered
+    stream = sse_stream(*(smee_message(issue_body(), delivery=i) for i in ids))
+    client, _, nudged = make_client([httpx.Response(200, content=stream)])
+    client.run()
+    assert len(nudged) == 4 and client.duplicates == 1
+    assert list(client._seen) == ["a", "c"]

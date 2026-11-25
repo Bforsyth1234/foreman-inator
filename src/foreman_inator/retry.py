@@ -215,11 +215,38 @@ def retry_attempt_bound(rungs: int, limits: esc.Limits | None = None) -> int:
 
 
 def with_manual_retry(
-    store: Store, ticket: Ticket, history: esc.History, step: esc.Step | None
+    store: Store,
+    ticket: Ticket,
+    history: esc.History,
+    step: esc.Step | None,
+    ladder: esc.Ladder | None = None,
 ) -> esc.Step | None:
-    """``Worker.policy_for``'s decision with the ticket's latest retry mark applied."""
+    """``Worker.policy_for``'s decision with the ticket's latest retry mark applied.
+
+    A pending mark that no longer fits is dropped (logged) and escalation's ``step``
+    stands: its model left the configured ``ladder``, or its rung is cloud (or of unknown
+    kind: fails closed) while the repo is now local only (#49, invariant 7c), e.g. after
+    ``fman repo set-cloud <repo> false`` between the retry and the attempt."""
     marks = retry_marks(store, ticket)
-    return apply_mark(marks[-1] if marks else None, history.attempts, step)
+    mark = marks[-1] if marks else None
+    if mark is not None and _pending(mark, history.attempts):
+        stale = _stale(store, ticket, mark, ladder)
+        if stale:
+            log.info("ticket %d: manual retry on %s dropped: %s", ticket.id, mark.model, stale)
+            store.set_cursor(ticket.repo, json.dumps([asdict(m) for m in marks[:-1]]),
+                             _key(ticket.id))  # fmt: skip
+            return step
+    return apply_mark(mark, history.attempts, step)
+
+
+def _stale(store: Store, ticket: Ticket, mark: RetryMark, ladder: esc.Ladder | None) -> str:
+    """Why a pending ``mark`` may no longer run ("" when it may)."""
+    rung = next((r for r in ladder or () if r.model == mark.model), None)
+    if ladder is not None and rung is None:
+        return "the model is no longer in the configured ladder"
+    if not store.repo_allows_cloud(ticket.repo) and (rung is None or not rung.local):
+        return "the repo is now local only (cloud = false) and the rung is cloud"
+    return ""
 
 
 def apply_mark(

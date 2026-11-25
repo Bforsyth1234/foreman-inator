@@ -6,8 +6,12 @@ delivery that arrives is checked against ``X-Hub-Signature-256`` with the App's 
 secret from the Keychain (``relay_secret_ref``). A delivery that verifies does exactly one
 thing: ``nudge(repo)``, which asks the worker to poll that repo now instead of at the next
 interval. Nothing in a payload is trusted for a decision: the poller re-reads GitHub and
-stays the sole authority, including the allowed-users rule (SPEC 7b). A forged, replayed
-or unsigned event can at most cause one extra poll.
+stays the sole authority, including the allowed-users rule (SPEC 7b). A forged or
+unsigned event is dropped. A replayed signed delivery is dropped when its
+``X-GitHub-Delivery`` id was seen among the last ``SEEN_DELIVERIES`` verified ones; one
+with a fresh id can still nudge, but the worker never polls more often than once per
+``relay_min_poll_gap_seconds`` because of nudges (nudges inside that floor are coalesced
+into one poll when it passes), so a replay flood costs at most one extra poll per floor.
 
 No relay configured = no client = nothing changes. Errors never leave ``run``: the client
 logs, waits with capped exponential backoff and reconnects; polling continues regardless.
@@ -47,6 +51,7 @@ import json
 import logging
 import re
 import threading
+from collections import OrderedDict
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -67,6 +72,8 @@ BACKOFF_MAX_SECONDS = 300.0
 READ_TIMEOUT_SECONDS = 90.0
 #: GitHub caps payloads at 25 MB; a bigger SSE message is dropped unparsed.
 MAX_MESSAGE_BYTES = 26 * 1024 * 1024
+#: Verified ``X-GitHub-Delivery`` ids remembered; a repeat among them is dropped.
+SEEN_DELIVERIES = 1000
 #: Events that only check the hook itself.
 _IGNORED_EVENTS = frozenset({"ping"})
 _REPO_RE = re.compile(r"^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$")
@@ -184,8 +191,9 @@ def _header(data: dict[str, Any], name: str) -> str | None:
 def verified_delivery(message: str, secret: str | bytes) -> Delivery | None:
     """Parse one relay message; return its repo only if the signature verifies.
 
-    The repo name comes from the signed payload but is used only to pick which repo to
-    poll early; nothing else in the payload is read."""
+    The repo name is read from the bytes that verified (``raw_body`` when that is what
+    the signature covers, else the compact form of ``body``), never from an unsigned
+    field, and is used only to pick which repo to poll early; nothing else is read."""
     try:
         data = json.loads(message)
     except (ValueError, RecursionError):
@@ -193,12 +201,18 @@ def verified_delivery(message: str, secret: str | bytes) -> Delivery | None:
     if not isinstance(data, dict):
         return None
     signature = _header(data, SIGNATURE_HEADER)
-    if not any(verify_signature(secret, b, signature) for b in body_candidates(data)):
+    signed = next(
+        (b for b in body_candidates(data) if verify_signature(secret, b, signature)), None
+    )
+    if signed is None:
         return None
     event = _header(data, EVENT_HEADER) or ""
     if event in _IGNORED_EVENTS:
         return None
-    body = data.get("body")
+    try:
+        body = json.loads(signed)
+    except (ValueError, RecursionError):
+        return None
     repo_obj = body.get("repository") if isinstance(body, dict) else None
     repo = repo_obj.get("full_name") if isinstance(repo_obj, dict) else None
     if not isinstance(repo, str) or not _REPO_RE.match(repo):
@@ -238,8 +252,10 @@ class RelayClient:
         self._read_timeout = read_timeout
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._seen: OrderedDict[str, None] = OrderedDict()  # LRU of delivery ids
         self.nudges = 0
         self.rejected = 0
+        self.duplicates = 0
         self.connections = 0
 
     # ---- lifecycle
@@ -321,6 +337,10 @@ class RelayClient:
             self.rejected += 1
             log.info("relay: dropped an event that did not verify (or names no repo)")
             return
+        if self._replayed(delivery.delivery_id):
+            self.duplicates += 1
+            log.info("relay: dropped a repeated delivery")
+            return
         repo = delivery.repo
         if self._repos:
             known = self._repos.get(repo.lower())
@@ -334,6 +354,19 @@ class RelayClient:
             self._nudge(repo)
         except Exception as exc:
             log.warning("relay: nudge(%s) failed: %s", repo, _describe(exc))
+
+    def _replayed(self, delivery_id: str) -> bool:
+        """True when ``delivery_id`` is among the last ``SEEN_DELIVERIES`` verified ones
+        (then refreshed); else it is remembered. No id: never a repeat."""
+        if not delivery_id:
+            return False
+        if delivery_id in self._seen:
+            self._seen.move_to_end(delivery_id)
+            return True
+        self._seen[delivery_id] = None
+        if len(self._seen) > SEEN_DELIVERIES:
+            self._seen.popitem(last=False)
+        return False
 
 
 def _host(url: str) -> str:
@@ -389,6 +422,7 @@ def start_relay(
 
 __all__ = [
     "DEFAULT_SECRET_NAME",
+    "SEEN_DELIVERIES",
     "Delivery",
     "RelayClient",
     "RelayConfigError",

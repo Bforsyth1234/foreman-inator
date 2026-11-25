@@ -112,6 +112,30 @@ def test_up_moves_one_rung_higher(store):
     assert isinstance(step, esc.Escalate) and (step.tier, step.model) == (2, "glm")
 
 
+def test_a_pending_cloud_mark_is_dropped_once_the_repo_is_local_only(store):
+    t = flagged(store, "interrupted: x", [(1, "inkling-2-mini")])
+    res = rt.retry(store, CFG, t.id, tier="up", now=NOW)
+    assert (res.tier, res.model) == (2, "glm")  # chosen while the repo allowed cloud
+    store.set_cloud("me/toy", False)  # `fman repo set-cloud me/toy false`
+    t = store.get_ticket(t.id)
+    h = esc.History(rt.counted_attempts(store, t), routed_tier=t.routed_tier)
+    own = esc.next_step(h, LADDER, limits=esc.with_cloud(None, False))
+    step = rt.with_manual_retry(store, t, h, own, LADDER)
+    assert step == own and getattr(step, "model", None) != "glm"
+    assert rt.retry_marks(store, t) == []  # the stale mark is gone
+
+
+def test_a_pending_mark_whose_model_left_the_ladder_is_dropped(store):
+    t = flagged(store, "interrupted: x", [(1, "inkling-2-mini")])
+    rt.retry(store, CFG, t.id, tier=3, now=NOW)  # claude-opus
+    ladder = tuple(r for r in LADDER if r.model != "claude-opus")
+    t = store.get_ticket(t.id)
+    h = esc.History(rt.counted_attempts(store, t), routed_tier=t.routed_tier)
+    own = esc.next_step(h, ladder)
+    step = rt.with_manual_retry(store, t, h, own, ladder)
+    assert step == own and getattr(step, "model", None) != "claude-opus"
+
+
 def test_tier_n_picks_that_tier(store):
     t = flagged(store, "attempt_budget: spent $5.00", [(1, "inkling-2-mini")])
     res = rt.retry(store, CFG, t.id, tier=3, now=NOW)

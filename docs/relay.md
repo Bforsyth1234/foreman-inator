@@ -15,7 +15,13 @@ the relay only makes the next poll of one repo come sooner.
 - A verified delivery does one thing: it asks the worker to poll its repo now. The
   worker reads nothing else from the payload. The poller re-reads GitHub itself and
   decides everything, including the rule that only users on `allowed_users` can start
-  work. A forged or replayed event can at most cause one extra poll.
+  work. A forged or unsigned event is dropped. A replayed delivery whose
+  `X-GitHub-Delivery` id was among the last 1,000 verified ones is dropped too. Nudges
+  never poll more often than once per `relay_min_poll_gap_seconds` (default 15): nudges
+  inside that floor are coalesced into one poll when it passes, so a flood of deliveries
+  costs at most one extra poll per floor.
+- The repo to poll is read from the exact bytes the signature covers (`raw_body` when
+  that is what verified, else the compact `body`), never from an unsigned field.
 - If the relay is down, slow or misconfigured, the worker logs it, backs off (1 s,
   doubling, at most 5 minutes) and reconnects. It never stops the worker.
 

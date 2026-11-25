@@ -138,7 +138,7 @@ from typing import Any
 
 from foreman_inator import retry as retry_mod
 from foreman_inator import tracing
-from foreman_inator.config import Config, key_ref
+from foreman_inator.config import RELAY_MIN_POLL_GAP, Config, key_ref
 from foreman_inator.db.store import OPEN_COLUMNS, Store, Ticket
 from foreman_inator.github import relay as relay_mod
 from foreman_inator.github.client import GitHubAPI
@@ -321,7 +321,9 @@ class Worker(
     def serve_forever(self) -> None:
         """Poll every ``poll_interval_seconds``; start jobs as soon as a slot is free."""
         interval = float(self.config.poll_interval_seconds)
+        gap = float(getattr(self.config, "relay_min_poll_gap_seconds", RELAY_MIN_POLL_GAP))
         next_poll = 0.0
+        last_poll: float | None = None
         log.info(
             "worker started: %d repo(s), polling every %.0fs, up to %d ticket(s) per repo",
             len(self.repos),
@@ -335,13 +337,18 @@ class Worker(
                 with self._lock:
                     nudged, self._nudged = self._nudged, set()
                 if nudged and not self._stop.is_set():
-                    log.info("relay nudge for %s: polling now", ", ".join(sorted(nudged)))
-                    next_poll = 0.0
+                    # A floor between nudged polls: nudges inside it coalesce into one
+                    # poll when it passes (a replayed-delivery flood cannot poll in a loop).
+                    soonest = 0.0 if last_poll is None else last_poll + gap
+                    next_poll = min(next_poll, soonest)
+                    when = "now" if self.clock() >= next_poll else "when the floor passes"
+                    log.info("relay nudge for %s: polling %s", ", ".join(sorted(nudged)), when)
             if self._stop.is_set():
                 break
             if self.clock() >= next_poll:
                 self.poll_and_handle()
-                next_poll = self.clock() + interval
+                last_poll = self.clock()
+                next_poll = last_poll + interval
             self.dispatch(inline=False)
             self._wake.wait(min(1.0, max(0.0, next_poll - self.clock())))
         self.shutdown()
@@ -360,7 +367,9 @@ class Worker(
 
     def nudge(self, repo: str) -> None:
         """#15: a verified relay delivery for ``repo``: poll now instead of at the next
-        interval. Thread safe (called on the relay's thread)."""
+        interval, but never sooner than ``relay_min_poll_gap_seconds`` after the last poll
+        (``serve_forever`` coalesces nudges inside that floor). Thread safe (called on the
+        relay's thread)."""
         with self._lock:
             self._nudged.add(repo)
         self._wake.set()
@@ -403,7 +412,7 @@ class Worker(
             step = self.policy(h, limits=lim)  # type: ignore[call-arg]
         else:
             step = self.policy(h)
-        return retry_mod.with_manual_retry(self.store, ticket, h, step)
+        return retry_mod.with_manual_retry(self.store, ticket, h, step, self.ladder)
 
     def history(self, ticket: Ticket) -> escalation.History:
         """What escalation reads. Attempts paused by a spend cap or a lock yield are left

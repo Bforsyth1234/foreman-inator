@@ -37,6 +37,7 @@ Layout (every key optional; missing keys take the defaults below)::
     status_show_cost = false # #77: put the spend so far in the status comment
     # relay_url = "https://smee.io/<channel>"  # #15: webhook relay (nudges a poll)
     # relay_secret_ref = "keychain:foreman-inator/relay-webhook-secret"
+    # relay_min_poll_gap_seconds = 15  # #15: floor between nudged polls (nudges coalesce)
 
     [experiments]        # replays (#25) and the shadow reviewer (#26), wave 9 (#29)
     run_budget_usd = 2.0
@@ -97,6 +98,8 @@ KEY_REF_PREFIX = f"keychain:{KEYCHAIN_SERVICE}/"
 KEY_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 TIERS = (1, 2, 3)
 MIN_POLL_SECONDS = 5
+#: #15: default floor between relay-nudged polls (``relay_min_poll_gap_seconds``).
+RELAY_MIN_POLL_GAP = 15.0
 MAX_PARALLEL_PER_REPO = 16
 #: #77: open ``fman/`` PRs per repo before publishing waits (0 = no cap), and its bound.
 DEFAULT_MAX_OPEN_PRS_PER_REPO = 5
@@ -413,6 +416,9 @@ class Config:
     #: ``fman setup`` stored (``keychain:foreman-inator/relay-webhook-secret``).
     relay_url: str | None = None
     relay_secret_ref: str | None = None
+    #: #15: the least time between a poll and a nudged one; nudges inside it are coalesced
+    #: into one poll when it passes, so a flood of (replayed) deliveries cannot poll in a loop.
+    relay_min_poll_gap_seconds: float = RELAY_MIN_POLL_GAP
     #: #77: one status comment per issue, edited at each state change while work runs.
     status_comment: bool = True
     status_label: bool = False  # also add `fman:working` while active
@@ -624,6 +630,8 @@ def _validate_wave17(cfg: Config) -> None:
             raise ConfigError(f"relay_url: {exc}") from None
     if cfg.relay_secret_ref is not None:
         parse_key_ref(cfg.relay_secret_ref)
+    if not 0 <= cfg.relay_min_poll_gap_seconds <= 3600:
+        raise ConfigError("relay_min_poll_gap_seconds must be between 0 and 3600")
     ex = cfg.experiments
     for name in ("proposer_holdout_days", "proposer_lookback_days"):
         if getattr(ex, name) < 1:
@@ -832,6 +840,7 @@ _LEARNING_TYPES: dict[str, Any] = {
     "classifier_min_tickets": int,
     "relay_url": str,
     "relay_secret_ref": str,
+    "relay_min_poll_gap_seconds": float,
     "status_comment": bool,
     "status_label": bool,
     "status_show_cost": bool,

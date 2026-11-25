@@ -422,7 +422,7 @@ def test_classifier_keys_reach_the_route(
 def test_serve_forever_starts_the_relay_and_a_nudge_polls_now(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    e = Env(tmp_path, relay_url="https://smee.io/chan")
+    e = Env(tmp_path, relay_url="https://smee.io/chan", relay_min_poll_gap_seconds=0)
     started: list[tuple[Any, ...]] = []
     stopped: list[float] = []
     fake = SimpleNamespace(stop=lambda timeout=5.0: stopped.append(timeout))
@@ -451,6 +451,41 @@ def test_serve_forever_starts_the_relay_and_a_nudge_polls_now(
         th.join(10)
         e.close()
     assert stopped and not th.is_alive()
+
+
+def test_nudges_inside_the_floor_coalesce_into_one_poll(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    e = Env(tmp_path, relay_url="https://smee.io/chan", relay_min_poll_gap_seconds=15)
+    fake = SimpleNamespace(stop=lambda timeout=5.0: None)
+    monkeypatch.setattr(relay_mod, "start_relay", lambda *a, **kw: fake)
+    now = [100.0]
+    polls = threading.Semaphore(0)
+    w = e.worker
+    w.clock = lambda: now[0]
+    monkeypatch.setattr(w, "poll_and_handle", lambda: polls.release())
+    monkeypatch.setattr(w, "dispatch", lambda inline: None)
+    th = threading.Thread(target=w.serve_forever, daemon=True)
+    th.start()
+    try:
+        assert polls.acquire(timeout=5)  # the first poll, at 100
+        now[0] = 101.0
+        for _ in range(20):  # a flood of (replayed) deliveries inside the floor
+            w.nudge(REPO)
+        assert not polls.acquire(timeout=1.5)  # held back until 115
+        now[0] = 115.0
+        assert polls.acquire(timeout=5)  # one poll for all of them
+        assert not polls.acquire(timeout=1.5)
+        assert e.config.relay_min_poll_gap_seconds == 15
+    finally:
+        w.request_stop("test")
+        th.join(10)
+        e.close()
+    assert config_mod.Config().relay_min_poll_gap_seconds == 15
+    loaded = config_mod.from_dict({"relay_min_poll_gap_seconds": 30})
+    assert loaded.relay_min_poll_gap_seconds == 30.0
+    with pytest.raises(config_mod.ConfigError):
+        config_mod.from_dict({"relay_min_poll_gap_seconds": -1})
 
 
 def test_setup_relay_url_registers_the_hook_and_stores_the_secret(
@@ -515,7 +550,7 @@ def test_policy_for_applies_the_retry_mark(env: Env, monkeypatch: pytest.MonkeyP
     marker = object()
     seen: list[Any] = []
 
-    def fake(store: Any, ticket: Any, history: Any, step: Any) -> Any:
+    def fake(store: Any, ticket: Any, history: Any, step: Any, ladder: Any = None) -> Any:
         seen.append((ticket.id, step))
         return marker
 
