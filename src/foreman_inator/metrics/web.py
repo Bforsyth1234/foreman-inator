@@ -159,6 +159,13 @@ def fmt_cost(m: q.Mean) -> str:
     return f"{e(format_cost(m.value))} <small>({m.count} accepted)</small>"
 
 
+def fmt_per_accepted(m: q.Mean, *, unit: str = "") -> str:
+    """A per-accepted-ticket mean, shown like cost: value then the accepted count."""
+    if m.value is None:
+        return NO_DATA
+    return f"{m.value:.1f}{e(unit)} <small>({m.count} accepted)</small>"
+
+
 def fmt_kickbacks(k: q.KickbackStats) -> str:
     if k.value is None:
         return NO_DATA
@@ -323,8 +330,9 @@ def _form(filt: q.MetricsFilter, bucket: str, opts: q.FilterOptions) -> str:
 def _writer_table(rep: q.Report) -> str:
     head = (
         "<tr><th>Writer model (start)</th><th>First-try accept</th><th>Kickbacks / ticket"
-        "</th><th>Escalation rate</th><th>Cost / accepted ticket</th><th>Time to accept"
-        "</th><th>Router hit rate</th><th>AI kickbacks / ticket</th></tr>"
+        "</th><th>Escalation rate</th><th>Cost / accepted ticket</th>"
+        "<th>Attempt minutes / accepted ticket</th><th>Your reviews / accepted ticket</th>"
+        "<th>Time to accept</th><th>Router hit rate</th><th>AI kickbacks / ticket</th></tr>"
     )
 
     def row(r: q.WriterRow, cls: str = "") -> str:
@@ -334,6 +342,8 @@ def _writer_table(rep: q.Report) -> str:
             f"<td>{fmt_kickbacks(r.kickbacks_per_ticket)}</td>"
             f"<td>{fmt_rate(r.escalation_rate)}</td>"
             f"<td>{fmt_cost(r.cost_per_accepted_ticket)}</td>"
+            f"<td>{fmt_per_accepted(r.attempt_minutes_per_accepted_ticket, unit=' min')}</td>"
+            f"<td>{fmt_per_accepted(r.user_reviews_per_accepted_ticket)}</td>"
             f"<td>{fmt_duration(r.time_to_accept)}</td>"
             f"<td>{fmt_rate(r.router_hit_rate)}</td>"
             f"<td>{fmt_mean(r.ai_kickbacks_per_ticket)}</td></tr>"
