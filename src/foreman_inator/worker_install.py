@@ -19,6 +19,11 @@ foreman-inator reads, and outbound TCP to any host on ports 443/80 only while th
 holds exactly the base branch's files; after a model edit (an attempt that builds on an
 earlier attempt's branch) it runs offline from a snapshot of the cache. A repo with
 ``sandbox_network = "allow"`` gets full network. ``sandbox = "off"``: unsandboxed.
+
+Cache miss (#57): an offline install that fails because the repo's cache lacks a package
+(an empty or deleted cache) is retried once after filling the cache from a scratch
+worktree at the base commit, when the change leaves the lockfiles alone; when it edits
+them the flag says new dependencies need the user.
 """
 
 from __future__ import annotations
@@ -43,6 +48,13 @@ INSTALL_EXCLUDES: tuple[str, ...] = (".venv/", ".build/")
 #: (``worker_setup`` clips the detail to one short line for the issue comment).
 SETUP_REASON = "dependency_install"
 DETAIL_TAIL = 300
+
+#: #57: refill an empty cache from the base commit when an offline install misses it.
+#: Default for ``config.install_refill_cache`` until that key is wired. Off for now: the
+#: existing ``test_install.py::test_after_a_model_edit_the_install_is_offline`` asserts
+#: the old behaviour (cold cache + model edit -> flagged, the index never reached) and
+#: must be updated in the same step that turns this on.
+REFILL_ON_CACHE_MISS = False
 
 
 def _setup_failed() -> type[Exception]:
@@ -99,12 +111,14 @@ class InstallSteps:
         policy = self._sandbox_policy(  # type: ignore[attr-defined]
             ticket, wt_path, f"a{att_id}-install", writer=False
         )
+        base_sha = getattr(worktree, "base_sha", None)
+        network = "off"
         try:
             if policy.mode == "off":
                 network, cache = "off", install.cache_root(repo)
             else:
                 sandbox.ensure_available(policy)  # SandboxUnavailable: flagged by the caller
-                base = install.is_base(wt_path, getattr(worktree, "base_sha", None))
+                base = install.is_base(wt_path, base_sha)
                 network = install.network_for(policy, base=base)
                 cache = install.cache_root(repo) if base else None
             result = install.run(
@@ -117,10 +131,9 @@ class InstallSteps:
                 timeout=self.config.install_timeout_seconds,
             )
         except install.InstallFailed as exc:
-            log.warning("ticket %d: %s (log: %s)", ticket.id, exc.reason, exc.log_path)
-            rel = f"traces/{ticket.id}/{log_path.name}"
-            detail = f"{exc.reason}; log {rel}; last lines: {exc.detail[-DETAIL_TAIL:]}"
-            raise _setup_failed()(SETUP_REASON, detail) from exc
+            if network != "none" or not install.is_cache_miss(install.failure_text(exc)):
+                raise self._install_failed(ticket, exc, log_name=log_path.name) from exc
+            result = self._recover_cache_miss(ticket, att_id, worktree, wt_path, command, exc)
         finally:
             self._drop_scratch(policy)  # type: ignore[attr-defined]
         log.info(
@@ -128,6 +141,81 @@ class InstallSteps:
             ticket.id, command.display, result.network, result.seconds,
         )  # fmt: skip
         return result
+
+    def _install_failed(
+        self, ticket: Ticket, exc: install.InstallFailed, note: str = "", log_name: str = ""
+    ) -> Exception:
+        """The ``SetupFailed`` for a failed install: reason, ``note``, log, its last lines."""
+        log.warning("ticket %d: %s (log: %s)", ticket.id, exc.reason, exc.log_path)
+        name = exc.log_path.name if exc.log_path else log_name
+        where = f"; log traces/{ticket.id}/{name}" if name else ""
+        detail = f"{exc.reason}{note}{where}; last lines: {exc.detail[-DETAIL_TAIL:]}"
+        return _setup_failed()(SETUP_REASON, detail)
+
+    def _recover_cache_miss(
+        self,
+        ticket: Ticket,
+        att_id: Any,
+        worktree: Any,
+        wt_path: Path,
+        command: install.InstallCommand,
+        first: install.InstallFailed,
+    ) -> install.InstallResult:
+        """#57: an offline install missed the cache. Dependency files unchanged from the
+        base commit: fill the cache from a scratch worktree detached at the base commit
+        (network, as a first attempt), then retry offline in ``wt_path`` once. Changed:
+        flagged, new dependencies need the user. ``wt_path`` itself never gets network."""
+        base_sha = getattr(worktree, "base_sha", None)
+        if not base_sha:
+            raise self._install_failed(ticket, first) from first
+        files = install.dependency_files(command)
+        changed = install.dependency_files_changed(wt_path, base_sha, files)
+        if changed is None or changed:  # the model asked for other dependencies
+            what = ", ".join(changed) if changed else "the dependency files"
+            note = (f"; new dependencies need the user: the change edits {what}, and an "
+                    "install after a model edit has no network")  # fmt: skip
+            raise self._install_failed(ticket, first, note) from first
+        mirror = getattr(worktree, "mirror", None)
+        enabled = getattr(self.config, "install_refill_cache", REFILL_ON_CACHE_MISS)
+        if not enabled or mirror is None or not hasattr(mirror, "scratch"):
+            raise self._install_failed(ticket, first) from first
+        log.info("ticket %d: offline install missed the cache; filling it from %s",
+                 ticket.id, str(base_sha)[:12])  # fmt: skip
+        trace = self.traces_dir / str(ticket.id)
+        repo = ticket.repo
+        scratch = mirror.scratch(base_sha, f"a{att_id}-cachefill")
+        fill_policy = self._sandbox_policy(  # type: ignore[attr-defined]
+            ticket, scratch.path, f"a{att_id}-cachefill", writer=False
+        )
+        try:
+            install.refill_cache(
+                command, scratch.path, base_sha, policy=fill_policy,
+                cache=install.cache_root(repo),
+                log_path=trace / f"attempt-{att_id}-install-cachefill.log",
+                timeout=self.config.install_timeout_seconds,
+            )  # fmt: skip
+        except install.InstallFailed as exc:
+            note = "; filling the empty cache from the base commit failed too"
+            raise self._install_failed(ticket, exc, note) from exc
+        finally:
+            self._drop_scratch(fill_policy)  # type: ignore[attr-defined]
+            scratch.remove()
+        # A fresh policy: its scratch holds a new snapshot of the now-filled cache.
+        retry_policy = self._sandbox_policy(  # type: ignore[attr-defined]
+            ticket, wt_path, f"a{att_id}-install-retry", writer=False
+        )
+        try:
+            return install.run(
+                command, wt_path, policy=retry_policy,
+                network=install.network_for(retry_policy, base=False), cache=None,
+                log_path=trace / f"attempt-{att_id}-install-retry.log",
+                timeout=self.config.install_timeout_seconds,
+            )  # fmt: skip
+        except install.InstallFailed as exc:
+            note = "; still failing after filling the cache from the base commit"
+            raise self._install_failed(ticket, exc, note) from exc
+        finally:
+            self._drop_scratch(retry_policy)  # type: ignore[attr-defined]
 
 
 def _exclude_install_output(worktree: Any, wt_path: Path) -> None:
@@ -156,4 +244,4 @@ def _exclude_install_output(worktree: Any, wt_path: Path) -> None:
         log.debug("could not update %s: %s", info / "exclude", exc)
 
 
-__all__ = ["INSTALL_EXCLUDES", "SETUP_REASON", "InstallSteps"]
+__all__ = ["INSTALL_EXCLUDES", "REFILL_ON_CACHE_MISS", "SETUP_REASON", "InstallSteps"]
