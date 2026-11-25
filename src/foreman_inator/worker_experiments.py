@@ -416,6 +416,41 @@ def stop_split(store: Store, experiment_id: int) -> Experiment:
     return store.end_experiment(exp.id, "rejected", note)
 
 
+CANCEL_NOTE = "cancelled from the metrics page"
+
+
+def cancel_experiment(
+    store: Store, experiment_id: int, *, note: str = CANCEL_NOTE, home: Path | None = None
+) -> Experiment:
+    """End a running experiment as ``rejected`` without promoting anything (#67, the
+    metrics page's Cancel button). A split ends as ``split stop`` ends it. A replay or
+    seeded run is ended under the run lock, so no ``fman experiment run`` is replaying it
+    at that moment (refused while one runs: stop it first); ``run --all`` then skips it,
+    since it resumes only running experiments. Its stored comparison is kept in the note."""
+    exp = store.get_experiment(experiment_id)
+    if exp.status != "running":
+        raise ExperimentError(f"#{exp.id} is not running ({exp.status})")
+    if exp.mode == "split":
+        c = split_mod.score(store, exp.id)
+        j = split_mod.judge(c)
+        return store.end_experiment(
+            exp.id, "rejected", f"{note}\n{split_mod.comparison_note(c, j)}"
+        )
+    if exp.mode not in ("replay", "seeded"):
+        return store.end_experiment(exp.id, "rejected", f"{exp.result_note or ''}\n{note}".strip())
+    try:
+        with run_lock(home):
+            out = store.end_experiment(
+                exp.id, "rejected", f"{exp.result_note or ''}\n{note}".strip()
+            )
+    except ExperimentError:  # the lock is held: a run is replaying right now
+        raise ExperimentError(
+            f"an experiment run is in progress; stop it first, then cancel #{exp.id}"
+        ) from None
+    log.info("experiment %d: %s", exp.id, note)
+    return out
+
+
 def split_lines(store: Store, config: Config, experiment_id: int | None = None) -> list[str]:
     """``fman experiment split status [id]`` (reads only)."""
     exps = (
@@ -644,6 +679,7 @@ def run_command(
     mode: str = "replay",
     seed: int | None = None,
     kinds: list[str] | tuple[str, ...] | None = None,
+    cancel: threading.Event | None = None,
 ) -> int:
     """``fman experiment run``: its own proxy, its own mirrors, the run lock, clean stops.
     ``local_slots``: the worker proxy's ``slots`` when run inside the worker (#34).
@@ -651,7 +687,8 @@ def run_command(
     challenger side only; ``challenger`` may then be omitted (the champion's model and
     prompt). ``mode="seeded"`` (#35, ``--mode seeded``): a reviewer challenger against
     the champion on merged cases with a planted bug (``replay_runner.run_seeded``);
-    ``seed`` and ``kinds`` choose the mutations."""
+    ``seed`` and ``kinds`` choose the mutations. ``cancel`` (#67): an event that stops the
+    run cleanly when set, as SIGINT does on the CLI (the metrics page's Stop button)."""
     from foreman_inator import config as config_mod
     from foreman_inator.spend import Spend
 
@@ -688,6 +725,8 @@ def run_command(
 
         env = RunEnv(store, cfg, build_deps(store, cfg, proxy=proxy, spend=spend,
                                             driver=driver_factory()))  # fmt: skip
+        if cancel is not None:
+            env.cancel = cancel
         old = install_cancel_handlers(env.cancel) if _main_thread() else {}
         try:
             if all_:
@@ -768,6 +807,7 @@ __all__ = [
     "PromoteResult",
     "RunEnv",
     "build_deps",
+    "cancel_experiment",
     "champion_variant",
     "ensure_shadow",
     "install_cancel_handlers",
