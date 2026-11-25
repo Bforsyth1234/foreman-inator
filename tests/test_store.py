@@ -120,6 +120,8 @@ EXTRA_COLUMNS: dict[str, list[str]] = {
         "review_mode",
         # migration 010 (#49)
         "cloud",
+        # migration 012 (#60)
+        "chat_network",
     ],
     "champion_history": ["id", "role", "variant_id", "set_at", "note"],
     "poll_cursors": ["repo", "name", "value", "updated_at"],
@@ -132,9 +134,10 @@ EXTRA_COLUMNS: dict[str, list[str]] = {
         "attempt_id",
         "experiment_id",
         "created_at",
+        "chat_session_id",  # migration 012 (#60)
     ],
     "spend_approvals": ["id", "ticket_id", "approved_at", "consumed_at"],
-    "file_locks": ["repo", "path", "ticket_id", "acquired_at"],
+    "file_locks": ["repo", "path", "ticket_id", "acquired_at", "chat_session_id"],  # 012
     "schema_migrations": ["version", "name", "applied_at"],
     # migration 004 (#23)
     "ticket_embeddings": ["ticket_id", "model", "dims", "vector", "text_sha256", "created_at"],
@@ -217,6 +220,39 @@ EXTRA_COLUMNS: dict[str, list[str]] = {
         "decided_at",
         "experiment_id",
     ],  # fmt: skip
+    # migration 012 (#60)
+    "chat_sessions": [
+        "id",
+        "repo",
+        "base_branch",
+        "base_commit",
+        "branch",
+        "worktree",
+        "state",
+        "tier",
+        "model",
+        "opencode_session_id",
+        "trace_id",
+        "pr_number",
+        "end_reason",
+        "started_at",
+        "ended_at",
+    ],
+    "chat_turns": [
+        "id",
+        "session_id",
+        "seq",
+        "tier",
+        "model",
+        "status",
+        "tokens_in",
+        "tokens_out",
+        "cost_usd",
+        "tool_calls",
+        "edits",
+        "started_at",
+        "ended_at",
+    ],
 }
 
 # Enum values copied from SPEC.md "Data model".
