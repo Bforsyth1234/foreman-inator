@@ -59,6 +59,13 @@ Rules
   ``dropped`` are stale (a crash between the column change and the release); ``sweep``
   deletes them, and every ``acquire`` sweeps its repo first, so a leaked lock never
   blocks anyone.
+* **Dormant tickets** (#55, ``dormant``): an open ticket flagged with a reason that stops
+  all further work and that has no pull request (``DORMANT_FLAGS``) will not run again
+  until the user acts. Its lock rows are treated as absent: ``waiting`` ignores them,
+  ``acquire`` sweeps them (``_sweep_repo``), and it is neither a waiter nor a node in the
+  wait-for graph. Its ``owned_files`` are kept, so after ``clear_flag`` its next
+  ``may_start`` re-acquires them (or waits, if another ticket took them meanwhile). A
+  flagged ticket with an open pull request is never dormant: it keeps its locks.
 """
 
 from __future__ import annotations
@@ -70,6 +77,34 @@ from dataclasses import dataclass
 from foreman_inator.db.store import FileLock, Store, Ticket
 
 OPEN_COLUMNS = ("todo", "in_progress", "testing")
+
+# Flag reasons (the part before the first ":") that stop all further work on a ticket
+# with no pull request (#55). Literal strings, not imports: the flag constants live in
+# worker modules that import this one.
+DORMANT_FLAGS = frozenset(
+    {
+        "setup_failed",
+        "sandbox_unavailable",
+        "checks_failed",
+        "no_verify_command",
+        "attempt_budget",
+    }
+)
+
+
+def flag_kind(reason: str | None) -> str:
+    """``"setup_failed"`` for ``"setup_failed: install: ..."``; ``""`` for no flag."""
+    return (reason or "").split(":", 1)[0].strip()
+
+
+def dormant(t: Ticket) -> bool:
+    """An open ticket that will not run again until the user acts, and has no PR (#55)."""
+    return (
+        t.column in OPEN_COLUMNS
+        and t.pr_number is None
+        and flag_kind(t.flag_reason) in DORMANT_FLAGS
+    )
+
 
 # Extensions that make a bare token (no slash, no backticks) look like a file name.
 FILE_EXTENSIONS = frozenset(
@@ -383,10 +418,15 @@ class Locks:
         return _conflicts(t.id, [lock_key(p) for p in clean_paths(diff_files)], self._rows(t.repo))
 
     def waiting(self, repo: str) -> list[Waiter]:
-        """Open tickets in ``repo`` that are paused on someone else's locks."""
-        rows = self._rows(repo)
+        """Open tickets in ``repo`` that are paused on someone else's locks. Read-only:
+        a dormant ticket's rows count as released (the next ``acquire`` sweeps them)."""
+        tickets = self.store.list_tickets(column=OPEN_COLUMNS, repo=repo)
+        asleep = {t.id for t in tickets if dormant(t)}
+        rows = [r for r in self._rows(repo) if r.ticket_id not in asleep]
         out = []
-        for t in self.store.list_tickets(column=OPEN_COLUMNS, repo=repo):
+        for t in tickets:
+            if t.id in asleep:
+                continue
             cs = _conflicts(t.id, _missing(t, rows), rows)
             if cs:
                 out.append(Waiter(t.id, tuple(sorted({c.holder for c in cs})), cs))
@@ -407,7 +447,7 @@ class Locks:
             t = self.store.get_ticket(tid)
             if t.column not in OPEN_COLUMNS:
                 return LockResult(tid, self.held(tid), closed=True)
-            self._sweep_repo(t.repo)
+            self._sweep_repo(t.repo, keep=t.id)
             t = self._want(t, add)
             while True:
                 rows = self._rows(t.repo)
@@ -450,7 +490,7 @@ class Locks:
         return self.store.release_locks(_tid(ticket))
 
     def sweep(self) -> int:
-        """Delete lock rows of tickets that are done or dropped; return how many."""
+        """Delete lock rows of tickets that are done, dropped or dormant; return how many."""
         n = 0
         with self.store.transaction():
             for repo in {lk.repo for lk in self.store.list_locks()}:
@@ -471,10 +511,15 @@ class Locks:
             t = self.store.update_ticket(t.id, owned_files=wanted)
         return t
 
-    def _sweep_repo(self, repo: str) -> int:
+    def _sweep_repo(self, repo: str, keep: int | None = None) -> int:
+        """Release the rows of closed and dormant tickets in ``repo`` (never ``keep``'s)."""
         n = 0
-        open_ids = {t.id for t in self.store.list_tickets(column=OPEN_COLUMNS, repo=repo)}
-        for tid in sorted({lk.ticket_id for lk in self._rows(repo)} - open_ids):
+        live = {
+            t.id
+            for t in self.store.list_tickets(column=OPEN_COLUMNS, repo=repo)
+            if not dormant(t) or t.id == keep
+        }
+        for tid in sorted({lk.ticket_id for lk in self._rows(repo)} - live):
             n += self.store.release_locks(tid)
         return n
 
@@ -483,6 +528,8 @@ class Locks:
         rows = self._rows(start.repo)
         edges: dict[int, set[int]] = {}
         for t in self.store.list_tickets(column=OPEN_COLUMNS, repo=start.repo):
+            if dormant(t) and t.id != start.id:
+                continue
             edges[t.id] = {c.holder for c in _conflicts(t.id, _missing(t, rows), rows)}
         parent: dict[int, int] = {}
         frontier = [start.id]
