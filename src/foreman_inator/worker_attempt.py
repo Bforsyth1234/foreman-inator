@@ -151,6 +151,10 @@ class AttemptSteps:
             return self.driver.run(**kw, sandbox=policy)
         finally:
             self._drop_scratch(policy)  # type: ignore[attr-defined]
+            # #34: the writer run is over; its queue-wait total is no longer read.
+            forget = getattr(getattr(self, "proxy", None), "forget_queue_wait", None)
+            if forget is not None:
+                forget(kw["attempt_id"])
 
     def _launch_verify(
         self, cmd: verify_mod.VerifyCommand, cwd: Path, *, ticket: Ticket, attempt_id: int,

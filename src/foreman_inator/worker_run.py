@@ -158,12 +158,13 @@ def repo_count_warning(cfg: Config) -> str | None:
 def build_proxy_and_driver(cfg: Config, store: Store, spend: Spend) -> tuple[Any, Any]:
     """The worker's started model proxy and its OpenCode driver. The embedding model
     (#23) is served next to the writers but is never a rung. #34: one process-wide cap
-    (``max_local_inference``) on local-model calls; the driver adds the attempt's time
+    (``max_local_inference``) on local-model calls, shared across processes (lock files
+    under the foreman home); the driver adds the attempt's time
     queued for a slot to its writer timeout (``extra_time=proxy.queue_wait``)."""
-    from foreman_inator.proxy.server import LocalSlots, ModelProxy
+    from foreman_inator.proxy.server import ModelProxy, shared_local_slots
     from foreman_inator.runner.opencode import OpenCodeDriver
 
-    slots = LocalSlots(cfg.max_local_inference)
+    slots = shared_local_slots(cfg.max_local_inference)  # shared with `fman experiment run`
     proxy = ModelProxy(
         cfg.proxy_models(), store=store, spend_hook=spend.hook, local_slots=slots
     ).start()

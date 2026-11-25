@@ -79,17 +79,20 @@ and the recorder row's ``raw_content`` (``{"type": "error", "text": ...}``, ``te
 empty). The error body goes to the client unchanged, except that our own API key, should
 the provider echo it, is replaced with ``[redacted]``.
 
-Local inference cap (#34, todo 57): completion calls to ``kind == "local"`` endpoints hold
-one slot of ``LocalSlots`` (``max_local_inference``, default 1) from the moment they are
-sent until the reply (or stream) ends; cloud endpoints and embeddings (short, a
-small model, never a tier) are never limited. One
-``LocalSlots`` may be shared by several proxies (the worker's and an experiment run's), so
-the cap is global to the process. A request waits for its slot after the fail-closed
-checks and preflight; a client that disconnects while queued is dropped without reaching
-the upstream. The wait is the span's ``llm.queue_wait_s`` and is left out of its
-``latency_ms``. ``queue_wait(attempt_id)`` is the attempt's total wait so far, the time
-still being waited included; the OpenCode driver adds it to the writer timeout, so time in
-the queue never counts against an attempt. ``local_slots()`` is ``(in use, cap)``.
+Local inference cap (#34, todo 57): writer-run completion calls (``/a/<id>``, ``/x/<id>``
+and a replay's ``context(writer_run=...)``) to ``kind == "local"`` endpoints hold one slot
+of ``LocalSlots`` (``max_local_inference``, default 1) from the moment they are sent until
+the reply (or stream) ends. Cloud endpoints, embeddings (short, a small model, never a
+tier) and other calls (router, clarity check, reviews: short one-shots with their own
+wall-clock deadline that a long writer stream would otherwise eat) are never limited. The
+worker and ``fman experiment run`` use ``shared_local_slots``: lock files under
+``<home>/run``, so the cap is global across processes. A request waits for its slot
+after the fail-closed checks and preflight; a client that disconnects while queued is
+dropped without reaching the upstream. The wait is the span's ``llm.queue_wait_s`` and
+is left out of its ``latency_ms``. ``queue_wait(run_id)`` is the run's total wait so far,
+the time still being waited included; the OpenCode driver adds it to the writer timeout,
+so time in the queue never counts against an attempt; ``forget_queue_wait`` drops it once
+the run ends. ``local_slots()`` is ``(in use, cap)``.
 
 Running: `start()` runs uvicorn on a background thread, bound to 127.0.0.1 (port 0 picks a
 free port; `url` says which); `stop()` shuts it down. `proxy.app` is a plain ASGI app, so
@@ -102,9 +105,11 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import fcntl
 import ipaddress
 import json
 import logging
+import os
 import re
 import secrets
 import socket
@@ -114,6 +119,7 @@ from collections import deque
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 from typing import Any, Literal, Protocol
 from urllib.parse import urlparse
 
@@ -138,35 +144,49 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_MAX_OUT = 4096
 UPSTREAM_PATHS = {"chat/completions", "completions", "embeddings"}
 DEFAULT_MAX_LOCAL_INFERENCE = 1  # config `max_local_inference`: one local GPU
+LOCK_POLL_S = 0.05  # cross-process slots: how often a queued call retries the lock files
 DISCONNECT_POLL_S = 0.25  # while queued for a local slot, how often to check the client
 
 
 class LocalSlots:
-    """A process-wide cap on concurrent local-model calls (#34). First come, first served.
+    """A cap on concurrent local-model calls (#34). First come, first served.
 
-    Not bound to one event loop (``asyncio.Semaphore`` is): the proxy serves on its own
-    thread's loop, and one instance may be shared by several proxies, each on its own loop.
-    A released slot is handed straight to the oldest waiter."""
+    In-process mode (``lock_dir=None``, tests): not bound to one event loop
+    (``asyncio.Semaphore`` is): the proxy serves on its own thread's loop, and one instance
+    may be shared by several proxies, each on its own loop. A released slot is handed
+    straight to the oldest waiter.
 
-    def __init__(self, cap: int = DEFAULT_MAX_LOCAL_INFERENCE):
+    Cross-process mode (``lock_dir`` given; the worker and ``fman experiment run``): slot
+    ``i`` is an exclusive ``flock`` on ``<lock_dir>/local-slot-<i>.lock``. ``acquire`` tries
+    each file in turn (non-blocking) and polls every ``LOCK_POLL_S`` while all are held, so
+    every process using the same dir shares one cap. The OS drops a lock when its process
+    dies, so a crash never leaks a slot. ``in_use`` counts the slots this instance holds."""
+
+    def __init__(self, cap: int = DEFAULT_MAX_LOCAL_INFERENCE, *, lock_dir: Path | None = None):
         if int(cap) < 1:
             raise ValueError("max_local_inference must be at least 1")
         self.cap = int(cap)
+        self.lock_dir = Path(lock_dir) if lock_dir is not None else None
         self._lock = threading.Lock()
         self._in_use = 0
         self._waiters: deque[tuple[asyncio.AbstractEventLoop, asyncio.Future[None]]] = deque()
+        self._held: list[int] = []  # cross-process mode: fds holding a slot's flock
+        self._polling = 0  # cross-process mode: acquires waiting for a free file
 
     @property
     def in_use(self) -> int:
         with self._lock:
-            return self._in_use
+            return len(self._held) if self.lock_dir is not None else self._in_use
 
     @property
     def waiting(self) -> int:
         with self._lock:
-            return len(self._waiters)
+            return self._polling if self.lock_dir is not None else len(self._waiters)
 
     async def acquire(self) -> None:
+        if self.lock_dir is not None:
+            await self._acquire_file()
+            return
         loop = asyncio.get_running_loop()
         with self._lock:
             if self._in_use < self.cap and not self._waiters:
@@ -189,6 +209,12 @@ class LocalSlots:
             raise
 
     def release(self) -> None:
+        if self.lock_dir is not None:
+            with self._lock:
+                fd = self._held.pop() if self._held else None
+            if fd is not None:
+                _unlock_close(fd)
+            return
         with self._lock:
             while self._waiters:
                 loop, fut = self._waiters.popleft()
@@ -197,6 +223,53 @@ class LocalSlots:
                 loop.call_soon_threadsafe(_grant, fut)
                 return  # the slot moves to that waiter; in_use is unchanged
             self._in_use -= 1
+
+    async def _acquire_file(self) -> None:
+        if self._try_files():
+            return
+        with self._lock:
+            self._polling += 1
+        try:
+            while not self._try_files():
+                await asyncio.sleep(LOCK_POLL_S)
+        finally:
+            with self._lock:
+                self._polling -= 1
+
+    def _try_files(self) -> bool:
+        """Take the first free slot file. Synchronous, so a cancel never lands mid-way."""
+        assert self.lock_dir is not None
+        self.lock_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        for i in range(self.cap):
+            path = self.lock_dir / f"local-slot-{i}.lock"
+            fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                os.close(fd)
+                continue
+            except BaseException:
+                os.close(fd)
+                raise
+            with self._lock:
+                self._held.append(fd)
+            return True
+        return False
+
+
+def _unlock_close(fd: int) -> None:
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+def shared_local_slots(cap: int) -> LocalSlots:
+    """The cross-process slots under the foreman home (``<home>/run``): the worker and
+    every ``fman experiment run`` share one ``max_local_inference`` (#34)."""
+    from foreman_inator import paths
+
+    return LocalSlots(cap, lock_dir=paths.run_dir())
 
 
 def _grant(fut: asyncio.Future[None]) -> None:
@@ -240,11 +313,19 @@ class CallContext:
     recorder_role: str | None = None  # (attempt_id, role) for get_recorder; None = none
     token: str | None = None
     base_url: str | None = None  # set on contexts returned by ModelProxy.context()
+    writer_run: int | None = None  # a registered writer run (a replay) that queues (#34)
     _captured: contextvars.Context | None = field(default=None, repr=False, compare=False)
 
     @property
     def counts_toward_attempt(self) -> bool:
         return self.attempt_id is not None and self.review_id is None
+
+    @property
+    def slot_key(self) -> int | None:
+        """#34: the writer run whose local calls queue for a slot (its queue wait is kept
+        under this id): the attempt for ``/a/<id>``/``/x/<id>``, ``writer_run`` for a
+        registered writer context; None for one-shot calls, which never queue."""
+        return self.attempt_id if self.kind == "attempt" else self.writer_run
 
 
 @dataclass(frozen=True)
@@ -561,7 +642,7 @@ class ModelProxy:
     async def _wait_for_slot(self, request: Request, ctx: CallContext) -> tuple[bool, float]:
         """Queue for a local slot. ``(got it, seconds waited)``; False when the client
         disconnected first (then no slot is held)."""
-        key = ctx.attempt_id if ctx.counts_toward_attempt else None
+        key = ctx.slot_key
         t0 = time.monotonic()
         if key is not None:
             with self._wait_lock:
@@ -621,12 +702,15 @@ class ModelProxy:
         label: str | None = None,
         prompt_version: str | None = None,
         recorder_role: str | None = None,
+        writer_run: int | None = None,
     ) -> Iterator[CallContext]:
         """Register a call context; yields it with ``.base_url`` set. Captures the caller's
         current span and ticket (contextvars), so calls made through ``base_url`` while the
         block is open are parented to the span that was current here (e.g. ``route``).
         Recorder: ``(attempt_id, recorder_role)``; the role defaults to "review" when
-        ``review_id`` is given and "attempt" otherwise."""
+        ``review_id`` is given and "attempt" otherwise. ``writer_run``: the context is a
+        writer run's (a replay's), so its local calls queue for a slot (#34) and their wait
+        is ``queue_wait(writer_run)``."""
         token = secrets.token_urlsafe(12)
         if recorder_role is None and attempt_id is not None:
             recorder_role = "review" if review_id is not None else "attempt"
@@ -640,6 +724,7 @@ class ModelProxy:
             recorder_role=recorder_role,
             token=token,
             base_url=f"{self.url}/c/{token}/v1",
+            writer_run=writer_run,
             _captured=contextvars.copy_context(),
         )
         with self._ctx_lock:
@@ -795,7 +880,11 @@ class ModelProxy:
             headers["authorization"] = f"Bearer {key}"
         url = ep.base_url.rstrip("/") + "/" + rest
         call = _Call(self, ctx, ep, rest, body, t0_ns)
-        if ep.kind == "local" and rest != "embeddings":
+        # #34: only writer runs (/a/<id>, /x/<id>, a replay's writer context) queue for the
+        # local slot. Router, clarify, review and other one-shot calls carry their own
+        # short deadline, which would run out behind a long writer stream; they are brief,
+        # so they go straight on.
+        if ep.kind == "local" and rest != "embeddings" and ctx.slot_key is not None:
             got, waited = await self._wait_for_slot(request, ctx)
             call.queue_wait_s = waited
             if not got:
@@ -1259,4 +1348,5 @@ __all__ = [
     "SpendHook",
     "error_response",
     "no_spend_hook",
+    "shared_local_slots",
 ]

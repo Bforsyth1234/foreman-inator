@@ -427,3 +427,132 @@ def test_broken_extra_time_adds_nothing(tmp_path: Path, worktree):
     fake = FakeOpenCode(tmp_path / "oc", Script([sleep(3.0), say("done")]))
     result = drive(fake, worktree, timeout=1.0, extra_time=boom)
     assert result.status == "timed_out"
+
+
+# --------------------------------------------------------------------------- who queues
+
+
+@pytest.mark.anyio
+async def test_one_shot_calls_do_not_queue_behind_a_writer():
+    """Router / clarify / review contexts (registered, no writer run) and bare /v1 calls
+    skip the slot: their own short deadline would run out behind a writer stream.
+    Non-vacuity: with the `ctx.slot_key is not None` condition dropped from `_handle`,
+    neither call reaches Ollama while the writer holds the slot."""
+    gate = Gated(FakeModels())
+    proxy = ModelProxy(MODELS, transport=gate)
+    async with client_for(proxy) as c:
+        writer = asyncio.create_task(c.post("/a/1/v1/chat/completions", json=chat("qwen-small")))
+        assert await arrival(gate) == "qwen3.6:35b-a3b"
+        with proxy.context(label="route") as ctx:
+            path = ctx.base_url.removeprefix(proxy.url) + "/chat/completions"
+            routed = asyncio.create_task(c.post(path, json=chat("gemma")))
+            assert await arrival(gate) == "gemma4:27b"  # sent while the writer holds it
+            bare = asyncio.create_task(c.post("/v1/chat/completions", json=chat("gemma")))
+            assert await arrival(gate) == "gemma4:27b"
+            assert proxy.local_slots() == (1, 1) and proxy.slots.waiting == 0
+            for _ in range(3):
+                gate.open_one()
+            for t in (writer, routed, bare):
+                assert (await t).status_code == 200
+    assert proxy.local_slots() == (0, 1)
+
+
+@pytest.mark.anyio
+async def test_a_registered_writer_run_queues_and_its_wait_is_kept():
+    """A replay's writer context (`writer_run=`) queues like `/a/<id>` does. Non-vacuity:
+    with `slot_key` returning None for registered contexts, the replay call is sent at
+    once and `gate.arrived.empty()` fails."""
+    gate = Gated(FakeModels())
+    proxy = ModelProxy(MODELS, transport=gate)
+    async with client_for(proxy) as c:
+        holder = asyncio.create_task(c.post("/a/1/v1/chat/completions", json=chat("qwen-small")))
+        await arrival(gate)
+        with proxy.context(bucket="experiments", label="replay", writer_run=-5) as ctx:
+            path = ctx.base_url.removeprefix(proxy.url) + "/chat/completions"
+            replay = asyncio.create_task(c.post(path, json=chat("gemma")))
+            await asyncio.sleep(0.3)
+            assert gate.arrived.empty()
+            assert proxy.queue_wait(-5) >= 0.2
+            gate.open_one()
+            assert (await holder).status_code == 200
+            await arrival(gate)
+            gate.open_one()
+            assert (await replay).status_code == 200
+    proxy.forget_queue_wait(-5)
+    assert proxy.queue_wait(-5) == 0
+
+
+# --------------------------------------------------------------------------- cross-process
+
+
+@pytest.mark.anyio
+async def test_file_slots_on_one_dir_share_the_cap(tmp_path: Path):
+    """Two `LocalSlots` on the same lock dir (as the worker and `fman experiment run`
+    are): with cap 1 the second acquire blocks until the first releases. Non-vacuity:
+    with the `lock_dir` branch of `acquire` removed (each instance its own in-process
+    cap), `b.acquire()` returns at once and `assert not second.done()` fails."""
+    a = LocalSlots(1, lock_dir=tmp_path / "run")
+    b = LocalSlots(1, lock_dir=tmp_path / "run")
+    await a.acquire()
+    second = asyncio.create_task(b.acquire())
+    await asyncio.sleep(0.3)
+    assert not second.done()
+    assert b.waiting == 1 and a.in_use == 1 and b.in_use == 0
+    a.release()
+    await asyncio.wait_for(second, 2)
+    assert b.in_use == 1 and a.in_use == 0 and b.waiting == 0
+    b.release()
+    assert (tmp_path / "run" / "local-slot-0.lock").exists()
+    await asyncio.wait_for(a.acquire(), 1)  # free again
+    a.release()
+
+
+@pytest.mark.anyio
+async def test_file_slots_honour_a_cap_above_one_and_a_cancel(tmp_path: Path):
+    a = LocalSlots(2, lock_dir=tmp_path)
+    b = LocalSlots(2, lock_dir=tmp_path)
+    await a.acquire()
+    await asyncio.wait_for(b.acquire(), 1)  # the second file
+    third = asyncio.create_task(a.acquire())
+    await until(lambda: a.waiting == 1)
+    third.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await third
+    assert (a.in_use, a.waiting, b.in_use) == (1, 0, 1)
+    a.release()
+    b.release()
+    a.release()  # nothing held: a no-op
+    assert a.in_use == b.in_use == 0
+
+
+def test_file_slots_are_held_across_processes_and_dropped_when_one_dies(tmp_path: Path):
+    """A real second process holds slot 0; this process waits, then gets it once that
+    process exits (the OS drops its flock, so a crash never leaks a slot)."""
+    import subprocess
+    import sys
+    import time
+
+    code = (
+        "import fcntl, os, sys, time\n"
+        "fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o600)\n"
+        "fcntl.flock(fd, fcntl.LOCK_EX)\n"
+        "print('held', flush=True)\n"
+        "time.sleep(float(sys.argv[2]))\n"
+    )
+    tmp_path.mkdir(exist_ok=True)
+    child = subprocess.Popen(
+        [sys.executable, "-c", code, str(tmp_path / "local-slot-0.lock"), "0.8"],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert child.stdout is not None and child.stdout.readline().strip() == "held"
+        slots = LocalSlots(1, lock_dir=tmp_path)
+        t0 = time.monotonic()
+        asyncio.run(asyncio.wait_for(slots.acquire(), 5))
+        assert time.monotonic() - t0 >= 0.3  # waited for the other process
+        assert slots.in_use == 1
+        slots.release()
+    finally:
+        child.kill()
+        child.wait()

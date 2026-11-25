@@ -20,7 +20,7 @@ from typer.testing import CliRunner
 from fakes.opencode import Script, edit, say
 from fakes.worker_env import REPO, Env, passing
 from foreman_inator import config as config_mod
-from foreman_inator import routing, tracing, worker_run
+from foreman_inator import paths, routing, tracing, worker_run
 from foreman_inator import worker_experiments as wx
 from foreman_inator.cli import app
 from foreman_inator.config import Config, ConfigError
@@ -117,9 +117,54 @@ def test_worker_proxy_and_driver_share_the_cap_and_the_queue_wait(tmp_path: Path
     try:
         assert proxy.local_slots() == (0, 3)
         assert driver.extra_time == proxy.queue_wait
+        # #34: the cap is the lock files under the home, shared with `fman experiment run`
+        assert proxy.slots.lock_dir == paths.run_dir()
     finally:
         proxy.stop()
         store.close()
+
+
+def test_worker_and_experiment_run_share_one_cross_process_cap(tmp_path: Path) -> None:
+    """Non-vacuity: with `make_proxy` building `LocalSlots(cap)` (in-process) again,
+    its `lock_dir` is None and this fails; so does reverting `build_proxy_and_driver`."""
+    store = Store(tmp_path / "db.sqlite")
+    cfg = Config(max_local_inference=1)
+    spend = Spend(store, cfg)
+    worker_proxy, _driver = worker_run.build_proxy_and_driver(cfg, store, spend)
+    replay_proxy = wx.make_proxy(cfg, store, spend)
+    try:
+        assert worker_proxy.slots is not replay_proxy.slots
+        assert worker_proxy.slots.lock_dir == replay_proxy.slots.lock_dir == paths.run_dir()
+        assert replay_proxy.local_slots() == (0, 1)
+    finally:
+        worker_proxy.stop()
+        replay_proxy.stop()
+        store.close()
+
+
+def test_launch_writer_forgets_the_attempts_queue_wait(tmp_path: Path) -> None:
+    """P2: `ModelProxy._waits` must not grow per attempt. Non-vacuity: without the
+    `forget_queue_wait` call in `_launch_writer`'s `finally`, `forgotten` stays empty."""
+    from foreman_inator.worker_attempt import AttemptSteps
+
+    forgotten: list[int] = []
+
+    def boom(**kw: Any) -> Any:
+        raise RuntimeError("writer crashed")
+
+    stub = SimpleNamespace(
+        config=Config(),
+        driver=SimpleNamespace(run=lambda **kw: "ran"),
+        proxy=SimpleNamespace(forget_queue_wait=forgotten.append),
+        _sandbox_policy=lambda *a, **k: None,
+        _drop_scratch=lambda policy: None,
+    )
+    run = AttemptSteps._launch_writer
+    assert run(stub, ticket=None, worktree=tmp_path, attempt_id=9, prompt="p") == "ran"
+    stub.driver = SimpleNamespace(run=boom)
+    with pytest.raises(RuntimeError):
+        run(stub, ticket=None, worktree=tmp_path, attempt_id=10, prompt="p")
+    assert forgotten == [9, 10]  # on every path
 
 
 def test_experiment_proxy_shares_the_workers_slots(tmp_path: Path) -> None:

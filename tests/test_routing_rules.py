@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import secrets
+import threading
 import time
 
 import httpx
@@ -213,6 +214,47 @@ def test_timeout_falls_back_quickly(fake):
     assert (r.tier, r.source) == (2, "fallback")
     assert "timed out" in r.reason
     assert elapsed < 2.5  # gave up at the timeout; margin for a loaded (parallel) run
+
+
+def test_route_is_not_queued_behind_a_long_writer_stream(fake, proxy):
+    """#34: a writer attempt streaming from the local model holds the local slot; the
+    router's call must still finish inside its own deadline instead of queueing behind
+    it and falling back. Non-vacuity: with the `ctx.slot_key is not None` condition
+    dropped from `ModelProxy._handle`, the route call waits for the slot and falls back
+    with "timed out"."""
+    fake.hold_stream = threading.Event()
+    fake.queue_reply("a b c d e")  # the writer's stream (held after its first chunk)
+    fake.queue_reply("small")  # the router's answer
+    body = {
+        "model": TIER1.name,
+        "stream": True,
+        "messages": [{"role": "user", "content": "write the code"}],
+    }
+
+    def writer() -> None:
+        url = proxy.base_url(41) + "/chat/completions"
+        with httpx.stream("POST", url, json=body, timeout=30) as r:
+            for _ in r.iter_bytes():
+                pass
+
+    t = threading.Thread(target=writer, daemon=True)
+    t.start()
+    try:
+        for _ in range(500):
+            if proxy.local_slots()[0] == 1:
+                break
+            time.sleep(0.01)
+        assert proxy.local_slots() == (1, 1)  # the writer holds the only slot
+        t0 = time.monotonic()
+        r = route(FakeTicket(), config=CONFIG, proxy=proxy, timeout=1.5)
+        elapsed = time.monotonic() - t0
+        assert proxy.local_slots() == (1, 1)  # the stream is still going
+    finally:
+        fake.hold_stream.set()
+        t.join(10)
+    assert (r.tier, r.source) == (1, "classifier"), r.reason
+    assert elapsed < 1.5
+    assert proxy.local_slots() == (0, 1)
 
 
 def test_proxy_down_falls_back():

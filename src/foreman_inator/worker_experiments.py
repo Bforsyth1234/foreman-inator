@@ -294,15 +294,17 @@ class RunEnv:
 
 def make_proxy(config: Config, store: Store, spend: Any, local_slots: Any = None) -> Any:
     """The experiment process's own model proxy (a free loopback port). #34: its local
-    calls are capped at ``max_local_inference``; a run inside the worker's process passes
-    the worker proxy's ``slots`` so the cap is shared."""
-    from foreman_inator.proxy.server import ModelProxy
+    calls are capped at ``max_local_inference`` through the cross-process slot files the
+    worker also uses, so a replay and the worker never run two local inferences past the
+    cap; a run inside the worker's process may pass the worker proxy's ``slots``."""
+    from foreman_inator.proxy.server import ModelProxy, shared_local_slots
 
+    if local_slots is None:
+        local_slots = shared_local_slots(int(config.max_local_inference))
     return ModelProxy(
         config.proxy_models(),
         store=store,
         spend_hook=spend.hook,
-        max_local_inference=int(config.max_local_inference),
         local_slots=local_slots,
     ).start()
 
@@ -337,6 +339,7 @@ def build_deps(
         endpoint_for=config.model,
         spend=spend,
         recordings_dir=rec,
+        config=config,
     )
 
 

@@ -67,6 +67,11 @@ def recordings_dir() -> Path:
     return _ensure_dir(home() / "recordings")
 
 
+def run_dir() -> Path:
+    """Folder for cross-process lock files, e.g. the local-inference slots (mode 700)."""
+    return _ensure_dir(home() / "run")
+
+
 def worktrees_dir() -> Path:
     """Folder holding one git worktree per attempt (mode 700)."""
     return _ensure_dir(home() / "worktrees")
