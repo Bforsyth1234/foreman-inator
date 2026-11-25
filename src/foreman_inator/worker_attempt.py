@@ -143,6 +143,7 @@ class AttemptSteps:
         )
         try:
             sandbox.ensure_available(policy)
+            kw.setdefault("timeout", float(self.config.writer_timeout_seconds))  # type: ignore[attr-defined]
             return self.driver.run(**kw, sandbox=policy)
         finally:
             self._drop_scratch(policy)  # type: ignore[attr-defined]

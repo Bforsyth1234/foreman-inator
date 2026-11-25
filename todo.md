@@ -65,7 +65,7 @@ in the item, and put the shape you rely on behind one small adapter so a
 change touches one file.
 ============================================================ -->
 
-Next ID: #70
+Next ID: #77
 Legend: `[ ]` todo · `[~]` in progress · `[~] live` built, waiting on its live check · `[x]` done (move to DONE.md)
 
 ## Wave plan
@@ -448,6 +448,7 @@ Why: the experiment machinery (replays, shadow reviewer, promotion rule) exists,
 Idea: `fman experiment propose --role writer|reviewer`. It groups recent kickbacks by failure step (and reviewer catch / false-kickback misses for the reviewer role), and a tier 3 model reads the current champion prompt plus the top patterns and drafts the next prompt version (`pkg/prompts/<role>-vN.md`, plus a short rationale naming the patterns it targets). The draft goes out as a PR or draft for the user to approve; only after approval is it registered as a challenger through the existing `run_command`. Model choice stays human (the list is short and known); the LLM writes prompts only. Promotion stays the existing rule-based gate (`promote`: wins on replay AND holds live); the LLM never promotes.
 Safety: (1) Overfitting: the proposer reads only kickbacks older than a cutoff, and the replay that scores the challenger uses only cases after that cutoff, so it is never scored on tickets it was written from; record the cutoff on the experiment. (2) Volume: at most one LLM-proposed challenger running per role, and the proposer call counts toward `spend_caps.experiments_monthly_usd`. (3) Independence: the proposer model is not the reviewer that scores the challenger (same idea as the reviewer-independence invariant). (4) Consent: nothing runs or changes until the user approves the prompt change, same idea as #51's sub-issues. Kickback text and issue bodies are untrusted input to the proposer: `defuse` them as in the writer prompt.
 Verify: with fake kickbacks clustered on one failure step, `propose` drafts a prompt whose rationale names that step and registers nothing until approval; a second `propose` while one LLM challenger is running for the role exits without a model call; the replay for a proposed challenger contains no case at or before the cutoff; `promote` behaves identically for proposed and hand-written challengers. Non-vacuous: drop the cutoff filter and the no-overlap test fails.
+UI (user, 2026-11-25: "ok can we have a button that has a tier 3 llm generate an expirment too"): a "Propose an experiment" button on `/experiments`, next to #67's "new experiment" form. Pick the role (writer or reviewer), press the button, and it runs the same code as `fman experiment propose`. The page then shows the drafted prompt, its rationale (the kickback patterns it targets), the cutoff and the estimated proposer cost, with "Approve and start" (registers the challenger through `run_command`, as #67's form does) and "Discard". Nothing starts without that approve click. The button is disabled with the reason shown when an LLM challenger is already running for that role or the experiments spend cap is reached. Uses #67's POST protection. Build after #67 and the CLI part of this item.
 SPEC change needed: one paragraph under "Experiments" saying challengers may be LLM-drafted, with the cutoff and the one-at-a-time rule.
 Estimate: about half a day with tests, assuming `run_command` and the replay path are reused unchanged. Related: #66, #67.
 
@@ -463,3 +464,47 @@ Decide with data first: before changing the default, run tier 1 local and GLM on
 Verify: default config lists tiers 1/2/3 as local/cloud/cloud; an existing config.toml with qwen at tier 2 loads unchanged; escalation from tier 1 goes to GLM; a GLM writer gets a non-GLM reviewer; a `cloud = false` repo never calls a cloud endpoint (once #49 lands). Non-vacuous: put GLM in both writer and reviewer slots and the independence test fails.
 SPEC change needed: the tier table in SPEC.md and README.md (tier 2 "Local, Ollama" → "Cloud, pay per use"), and the spend-cap note, since tier 2 now spends money.
 Estimate: about 30 minutes for config and docs, about 2 hours with tests. Related: #46, #49, #57.
+
+#71 — Chat feature: interactive coding sessions through the same tiers and spend caps [ ] · Added: 2026-11-25 · Source: user
+Ask: after "the main goal of this app is to cancel my max plan at 100 a month", the user said Max also covers interactive Claude Code sessions, then: "yeah ill have to add a chat feature later".
+Why: the worker handles only labeled issues. Interactive coding work also runs on Max today, so canceling Max needs a replacement for that too, or that work moves to pay-per-use API calls with no cap.
+Idea (not designed yet): a chat entry point (`fman chat` or similar) that drives OpenCode in a worktree, using the same model ladder, proxy and spend caps as tickets. It starts on a cheap tier, a command moves it up, and its spend shows next to ticket spend in metrics. Decide later: its own spend cap vs. a share of `monthly_usd`, and whether chat sessions feed the router's data.
+Estimate: not estimated; needs a design pass first. Related: #70.
+
+#72 — Cheapest-first cross-family reviewer [ ] · Added: 2026-11-25 · Source: user
+Ask: "having different families of models reviewing code should help raise the quality of the code", then "yes, add it" to cheapest-first reviewer picking.
+Why: the family rule (invariant 7f, `review/reviewer.py:322`) already makes the reviewer independent. But `pick_reviewer` → `config.reviewer_for` takes the first entry of `reviewer_models` from a different family, and the default order is `("claude-opus", "glm")`. So every Inkling, Qwen or GLM writer gets Claude Opus as its reviewer, at Opus prices on even the smallest ticket. Against the goal in #70 (cancel the $100/month Max plan), review is likely the largest cloud cost.
+Idea: pick the cheapest reviewer from a different family, with Opus last. Local/Qwen writer → GLM; GLM writer → a cheap cloud model of a third family (DeepSeek or Kimi; needs a new endpoint and Keychain key); Claude writer → GLM. Opus reviews only tier 3 work, or when the cheap reviewer's verdict is low confidence (a second review, at most one per attempt). Keep `reviewer_models` as an override for users who want a fixed order.
+Measure first: run the cheap reviewer as a shadow reviewer (`experiments/shadow.py`) next to Opus on live tickets, and compare catch rate and false kickbacks before changing the default.
+Verify: a local writer gets GLM; a GLM writer gets the third-family model, never GLM; with only Opus and GLM configured, behaviour matches today; a low-confidence cheap verdict triggers exactly one Opus review; review cost per ticket shows in metrics. Non-vacuous: drop the family check and the GLM-writer test picks GLM and fails.
+SPEC change needed: reviewer selection paragraph (cost order, family rule unchanged, the one-escalation limit).
+Estimate: about half a day with tests, plus a week of shadow data before switching the default. Related: #70, #46.
+
+### Unscheduled (web UI, 2026-11-25)
+
+Asked by the user: "Would it be useful to add a ui to this app? I want users to be able to change models and providers in tiers easily. and the chat feature needs a ui. The user could also change settings as well in it.", then "add all three pages as todos and open matching github issues. also i think a page where the user can see what is being actively worked on by the agents would be helpful". All four pages grow the existing local metrics app (`metrics/web.py`, Starlette, served by `fman metrics`, loopback only) instead of a separate app. A native Mac app is out of scope until this proves out.
+Shared rules for every page that writes: the POST protection designed in #67 (per-process CSRF token in each form, `Origin` / `Host` must be the page's own loopback origin, 403 and no change otherwise); config writes go through `config.load` / `config.save` so validation is the same as the CLI; API keys go straight to the Keychain (same path as `fman config set-key`) and are never rendered back; everything from GitHub or the database stays HTML-escaped. Build the shared POST layer once, in whichever of #67 / #73 lands first.
+
+#73 — Settings page: edit config from the browser [ ] · Added: 2026-11-25 · Source: user
+Why: every setting is changed today by hand-editing `~/.foreman-inator/config.toml` or a CLI command, and a typo is found only when the worker next loads it.
+Idea: `/settings`: spend caps (`daily_usd`, `monthly_usd`, `experiments_monthly_usd`), `writer_timeout_seconds`, `max_parallel_per_repo`, `allowed_users`, watched repos, and per-repo settings (verify command; the #51 profile and #49 `cloud = false` once they exist). Plain HTML form, no JavaScript. On save: validate, write, and show what changed. The running worker picks the change up on its next pass (re-read config when the file's mtime changes) instead of needing a restart; say so on the page.
+Verify: an invalid value (negative cap, unknown repo) is refused with the same message as `config.load` and the file is unchanged; a valid save round-trips through `config.load`; a POST without the token or with a foreign `Origin` is refused with 403; the worker sees a changed cap without restarting. Non-vacuous: skip validation and the negative-cap test writes the file and fails.
+Estimate: about 1 day with tests.
+
+#74 — Tiers page: models and providers per tier [ ] · Added: 2026-11-25 · Source: user
+Why: changing the ladder (for example #70's GLM at tier 2, or #72's reviewer order) means editing `ModelEndpoint` entries by hand: tier, kind, model id, base URL, family, key reference. That is the main setting the user wants to change easily.
+Idea: `/tiers`: one card per tier listing its endpoints in order, with add / remove / reorder; an endpoint form with provider presets (Ollama, GLM, Anthropic, an OpenAI-compatible URL) that fill in base URL, wire format and family; an API key field that writes to the Keychain and shows only "key set". A "test" button sends one tiny request through the proxy and shows the reply or the provider's error text. The reviewer order (`reviewer_models`) is edited on the same page, and the page warns when a tier has no reviewer from another family (invariant 7f) or when a local-only repo (#49) would have no tier left.
+Verify: added, reordered and removed endpoints round-trip through `config.load`; a key entered on the page lands in the Keychain and never appears in the HTML or the config file; the test button reports a refused key as an error, not success; a config whose writers all share the only reviewer's family shows the warning. Non-vacuous: render the key into the form's value and the "never appears in the HTML" test fails.
+Estimate: about 1 day with tests. Related: #70, #72.
+
+#75 — Chat page: the UI for #71 [ ] · Added: 2026-11-25 · Source: user
+Why: #71's chat feature needs a place to type, and the rest of the UI lives on this local page.
+Idea: `/chat`: pick a repo, start a session in its own worktree, send messages and see streamed replies (the one page that needs JavaScript: a small inline script reading server-sent events, no external scripts). Shows the current tier and model, a "move up a tier" button, and the running cost against the spend cap. Ends with "open as PR" or "discard worktree". Design depends on #71; do not build before #71's design pass.
+Verify: (after #71's design) a session's messages stream in order; moving up a tier switches the model for the next message only; cost shown matches the spend table; a POST without the token is refused.
+Estimate: several days; re-estimate after #71's design. Related: #71.
+
+#76 — Activity page: what the agents are working on right now [ ] · Added: 2026-11-25 · Source: user
+Why: `fman status` (`worker_status.render_status`) shows the queue only in a terminal and only when run. There is no view that stays open and shows live work: which ticket each agent is on, which model, which step, and for how long.
+Idea: `/activity`: read-only, same data as `render_status` (tickets by state, locks, spend approvals, needs-info, CI waits, flags) plus, for each running attempt, the repo and issue link, model and tier, current step (writing, verify, review, CI), elapsed time against `writer_timeout_seconds`, tokens and cost so far, and a link to its trace (`/traces`). Show loaded local models and memory once #58 / #59 exist. Refresh with a `<meta http-equiv="refresh">` every few seconds so the page needs no JavaScript. Optional later: pause or cancel buttons through the shared POST layer.
+Verify: with fake running attempts in a test store, the page lists each with its model, step and elapsed time, and matches `render_status`'s ticket states; a finished attempt leaves the running list; issue titles are escaped. Non-vacuous: drop the escape and the `<script>`-in-title test fails.
+Estimate: about half a day with tests (read-only). Related: #58, #59, #60.

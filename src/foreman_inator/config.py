@@ -17,6 +17,7 @@ Layout (every key optional; missing keys take the defaults below)::
     reviewer_models = ["claude-opus", "glm"]
     max_parallel_per_repo = 1   # tickets worked at once per repo (file locks permit)
     router_timeout_seconds = 30
+    writer_timeout_seconds = 1200  # one writer session; raise it for large repos
     sandbox = "on"       # on | off: model-written code runs under sandbox-exec (#40)
     clarify = true       # ask on a vague issue before working on it (#44)
     embedding_model = "embeddinggemma"   # kNN router (#23); local, never a writer rung
@@ -296,6 +297,9 @@ class Config:
     #: #56: `fman prune` and the worker's daily prune remove an unmerged ticket's
     #: recordings and traces, and ended attempts' scratch, older than this many days.
     retention_days: float = DEFAULT_RETENTION_DAYS
+    #: Bound on one writer session (OpenCode). A large repo on local models can need more
+    #: than the old fixed 20 minutes just to read its way in (live run 2026-11-24).
+    writer_timeout_seconds: float = 1200.0
     #: #44: before a ticket is routed, a small local model checks the issue can be worked
     #: on as written; if not, the worker asks on the issue (``needs-info``) and waits for
     #: an allowed user. False turns the check off.
@@ -422,6 +426,8 @@ def _validate(cfg: Config) -> None:
             raise ConfigError(f"{key} must be at least 1")
     if not cfg.retention_days >= 1:
         raise ConfigError("retention_days must be at least 1")
+    if not 0 < cfg.writer_timeout_seconds <= 24 * 3600:
+        raise ConfigError("writer_timeout_seconds must be > 0 and <= 86400")
     _validate_learning(cfg)
     names = [m.name for m in cfg.models]
     if len(set(names)) != len(names):
@@ -621,6 +627,10 @@ def from_dict(data: Mapping[str, Any]) -> Config:
         kw["install_timeout_seconds"] = float(
             _typed(data["install_timeout_seconds"], (int, float), "install_timeout_seconds")
         )
+    if "writer_timeout_seconds" in data:
+        kw["writer_timeout_seconds"] = float(
+            _typed(data["writer_timeout_seconds"], (int, float), "writer_timeout_seconds")
+        )
     _learning_from_dict(data, kw)
     if "spend_caps" in data:
         caps = _typed(data["spend_caps"], dict, "spend_caps")
@@ -694,6 +704,7 @@ def to_dict(cfg: Config) -> dict[str, Any]:
     out["attempt_max_input_tokens_cloud"] = cfg.attempt_max_input_tokens_cloud
     out["attempt_max_input_tokens_local"] = cfg.attempt_max_input_tokens_local
     out["retention_days"] = cfg.retention_days
+    out["writer_timeout_seconds"] = cfg.writer_timeout_seconds
     for key in _LEARNING_TYPES:
         if getattr(cfg, key) is not None:
             out[key] = getattr(cfg, key)
