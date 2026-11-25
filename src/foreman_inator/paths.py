@@ -19,6 +19,7 @@ SECRET_FILE_MODE = 0o600
 APP_KEY_NAME = "app.pem"
 CONFIG_NAME = "config.toml"
 DB_NAME = "foreman-inator.db"
+RULES_NAME = "AGENTS.md"
 
 
 def _ensure_dir(path: Path) -> Path:
@@ -48,6 +49,12 @@ def config_path() -> Path:
 def db_path() -> Path:
     """Path of the SQLite database (the file itself may not exist yet)."""
     return home() / DB_NAME
+
+
+def rules_path() -> Path:
+    """Path of the user's global rules for every repo, ``AGENTS.md`` (#38). The file may
+    not exist; when it does it should be mode 600 (``write_secret_file`` writes it so)."""
+    return home() / RULES_NAME
 
 
 def traces_dir() -> Path:
