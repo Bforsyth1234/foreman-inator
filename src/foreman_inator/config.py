@@ -16,6 +16,7 @@ Layout (every key optional; missing keys take the defaults below)::
     poll_interval_seconds = 45
     reviewer_models = ["claude-opus", "glm"]
     max_parallel_per_repo = 1   # tickets worked at once per repo (file locks permit)
+    max_open_prs_per_repo = 5   # open fman/ PRs per repo before a new PR waits; 0 = no cap (#77)
     router_timeout_seconds = 30
     writer_timeout_seconds = 1200  # one writer session; raise it for large repos
     sandbox = "on"       # on | off: model-written code runs under sandbox-exec (#40)
@@ -52,7 +53,7 @@ Layout (every key optional; missing keys take the defaults below)::
 
     [[models]]           # one table per model; order inside a tier = try order
     name = "glm"
-    tier = 3
+    tier = 2             # #70: tier 2 is open-weights cloud by default
     kind = "cloud"       # local | cloud
     model = "glm-5.3"
     base_url = "https://api.z.ai/api/coding/paas/v4"
@@ -68,7 +69,7 @@ import ipaddress
 import re
 import tomllib
 from collections.abc import Mapping
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlparse
@@ -84,6 +85,9 @@ KEY_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 TIERS = (1, 2, 3)
 MIN_POLL_SECONDS = 5
 MAX_PARALLEL_PER_REPO = 16
+#: #77: open ``fman/`` PRs per repo before publishing waits (0 = no cap), and its bound.
+DEFAULT_MAX_OPEN_PRS_PER_REPO = 5
+MAX_OPEN_PRS_PER_REPO = 100
 SANDBOX_MODES = ("on", "off")
 SANDBOX_NETWORKS = ("none", "allow")
 SANDBOX_INSTALLS = ("on", "off")
@@ -197,7 +201,7 @@ class ModelEndpoint:
 
 @dataclass(frozen=True)
 class SpendCaps:
-    """Cloud spend caps in USD. When one is hit, tier 3 waits for the user."""
+    """Cloud spend caps in USD. When one is hit, cloud attempts wait for the user."""
 
     daily_usd: float = 5.0
     monthly_usd: float = 50.0
@@ -227,26 +231,30 @@ OLLAMA_URL = "http://127.0.0.1:11434/v1"
 DEFAULT_EMBEDDING_MODEL = "embeddinggemma"
 
 
+GLM_URL = "https://api.z.ai/api/coding/paas/v4"
+ANTHROPIC_URL = "https://api.anthropic.com/v1"
+
+
+def qwen_27b_local(tier: int = 2) -> ModelEndpoint:
+    """#70: the opt-in local tier 2 (Qwen3.8 27B on Ollama). Not in the default ladder
+    since tier 2 became open-weights cloud; add it as a ``[[models]]`` table (or list it
+    before ``glm`` in tier 2) to keep tier 2 on this Mac. docs/setup.md shows the table."""
+    return ModelEndpoint("qwen3.8-27b", tier, "local", "qwen3.8:27b", OLLAMA_URL, "qwen")
+
+
 def default_models() -> tuple[ModelEndpoint, ...]:
-    """The default tier picks. Tier 3 is tried in this order: GLM, Claude Opus, Claude Fable."""
+    """The default ladder (#70): tier 1 Inkling 2 Mini (local), tier 2 GLM (open-weights
+    cloud, pay per use), tier 3 Claude Opus then Claude Fable. ``qwen_27b_local()`` is the
+    opt-in local tier 2."""
     return (
         ModelEndpoint("inkling-2-mini", 1, "local", "inkling-2-mini", OLLAMA_URL, "inkling"),
-        ModelEndpoint("qwen3.8-27b", 2, "local", "qwen3.8:27b", OLLAMA_URL, "qwen"),
-        ModelEndpoint(
-            "glm",
-            3,
-            "cloud",
-            "glm-5.3",
-            "https://api.z.ai/api/coding/paas/v4",
-            "glm",
-            key_ref("glm"),
-        ),
+        ModelEndpoint("glm", 2, "cloud", "glm-5.3", GLM_URL, "glm", key_ref("glm")),
         ModelEndpoint(
             "claude-opus",
             3,
             "cloud",
             "claude-opus-5-5",
-            "https://api.anthropic.com/v1",
+            ANTHROPIC_URL,
             "claude",
             key_ref("anthropic"),
             wire="anthropic",
@@ -256,12 +264,20 @@ def default_models() -> tuple[ModelEndpoint, ...]:
             3,
             "cloud",
             "claude-fable-5-2",
-            "https://api.anthropic.com/v1",
+            ANTHROPIC_URL,
             "claude",
             key_ref("anthropic"),
             wire="anthropic",
         ),
     )
+
+
+def local_tier2_models() -> tuple[ModelEndpoint, ...]:
+    """#70's opt-in ladder (and the default before it): tier 2 stays on this Mac with
+    Qwen3.8 27B, and GLM moves back to tier 3 ahead of Claude Opus and Fable. A config
+    that lists these models as ``[[models]]`` tables keeps working unchanged."""
+    inkling, glm, opus, fable = default_models()
+    return (inkling, qwen_27b_local(2), replace(glm, tier=3), opus, fable)
 
 
 @dataclass(frozen=True)
@@ -280,6 +296,9 @@ class Config:
     #: Tickets of one repo worked at the same time, as far as file locks permit (#21).
     #: 1 (the default) suits one local GPU.
     max_parallel_per_repo: int = 1
+    #: #77: open ``fman/`` PRs one repo may have before the worker waits to open another
+    #: (attempts still run; only the draft PR waits). 0 = no cap.
+    max_open_prs_per_repo: int = DEFAULT_MAX_OPEN_PRS_PER_REPO
     #: Whole-call bound for the router's classification (#15); a cold local model load
     #: can take longer than the router's own 10 s default.
     router_timeout_seconds: float = 30.0
@@ -366,7 +385,7 @@ class Config:
         raise ConfigError(f"no model named {name!r} in config")
 
     def models_for_tier(self, tier: int) -> tuple[ModelEndpoint, ...]:
-        """Models of ``tier`` in try order (tier 3: GLM first, then Claude)."""
+        """Models of ``tier`` in try order (default tier 3: Claude Opus, then Fable)."""
         return tuple(m for m in self.models if m.tier == tier)
 
     def reviewer_for(self, writer: ModelEndpoint) -> ModelEndpoint | None:
@@ -426,6 +445,10 @@ def _validate(cfg: Config) -> None:
         raise ConfigError(f"poll_interval_seconds must be >= {MIN_POLL_SECONDS}")
     if not 1 <= cfg.max_parallel_per_repo <= MAX_PARALLEL_PER_REPO:
         raise ConfigError(f"max_parallel_per_repo must be between 1 and {MAX_PARALLEL_PER_REPO}")
+    if not 0 <= cfg.max_open_prs_per_repo <= MAX_OPEN_PRS_PER_REPO:
+        raise ConfigError(
+            f"max_open_prs_per_repo must be between 0 (no cap) and {MAX_OPEN_PRS_PER_REPO}"
+        )
     if not 0 < cfg.router_timeout_seconds <= 600:
         raise ConfigError("router_timeout_seconds must be > 0 and <= 600")
     for cap in fields(SpendCaps):
@@ -665,6 +688,7 @@ def from_dict(data: Mapping[str, Any]) -> Config:
         "attempt_max_input_tokens_cloud",
         "attempt_max_input_tokens_local",
         "max_local_inference",
+        "max_open_prs_per_repo",
     ):
         if key in data:
             kw[key] = _typed(data[key], int, key)
@@ -742,6 +766,7 @@ def to_dict(cfg: Config) -> dict[str, Any]:
     out["poll_interval_seconds"] = cfg.poll_interval_seconds
     out["reviewer_models"] = list(cfg.reviewer_models)
     out["max_parallel_per_repo"] = cfg.max_parallel_per_repo
+    out["max_open_prs_per_repo"] = cfg.max_open_prs_per_repo
     out["router_timeout_seconds"] = cfg.router_timeout_seconds
     out["sandbox"] = cfg.sandbox
     out["clarify"] = cfg.clarify
@@ -823,9 +848,11 @@ __all__ = [
     "ModelEndpoint",
     "SpendCaps",
     "default_models",
+    "qwen_27b_local",
     "from_dict",
     "key_ref",
     "listing_requests_per_hour",
+    "local_tier2_models",
     "load",
     "parse_key_ref",
     "resolve_key",

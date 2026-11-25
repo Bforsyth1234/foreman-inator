@@ -116,8 +116,10 @@ Each ticket starts on the cheapest tier that seems likely to work and moves up o
 | Tier | Model (initial pick) | Where | Use for |
 | --- | --- | --- | --- |
 | 1 | Inkling 2 Mini (26B, 5.4B active) | Local | Small, mechanical changes |
-| 2 | Qwen3.8-27B dense | Local | Normal features and bug fixes |
-| 3 | GLM plan first, then Claude API | Cloud, pay per use | Large refactors, anything that failed twice locally |
+| 2 | GLM (open weights) | Cloud, pay per use | Normal features and bug fixes |
+| 3 | Claude Opus, then Claude Fable | Cloud, pay per use | Large refactors, anything that failed twice on tier 2 |
+
+Tier 2 is open-weights cloud by default (todo #70, 2026-11-25): a 27B model on a Mac is slow on agent loops, and a failed local attempt that escalates costs more in time than a GLM attempt costs in money. Qwen3.8-27B stays available as an opt-in local tier 2. The test is total monthly cost at an acceptable merge rate, not the share of tickets run locally.
 
 **Start rule** (gets smarter as data grows):
 
@@ -136,7 +138,7 @@ A `tier:N` label on the issue overrides the router for that ticket, and the over
 
 **Exploration:** on about 10% of tickets, start one tier lower than the router picked, so the data covers cheaper models too. These attempts are marked `explore` and never count against a model in the metrics if they fail.
 
-**Spend limits:** a daily and monthly cap on cloud spend. When the cap is hit, tier 3 attempts wait for your approval.
+**Spend limits:** a daily and monthly cap on cloud spend. When the cap is hit, cloud attempts (tiers 2 and 3 with the default ladder) wait for your approval.
 
 **AI review** (on by default; `review:skip` label turns it off for trivial changes). After checks pass, a tier 3 model from a different family than the writer reviews the change, cheapest and most objective checks first:
 
@@ -272,13 +274,13 @@ flowchart LR
     W["foreman-inator worker<br/>GitHub App auth, polls<br/>router + escalation<br/>attempts in SQLite<br/>metrics on localhost"]
     OC["OpenCode (serve)<br/>one session per attempt<br/>git worktree per attempt<br/>runs verify command"]
     MS["Local model server<br/>Ollama / MLX, shared"]
-    CL["Cloud API<br/>GLM first, then Claude API"]
+    CL["Cloud API<br/>GLM (tier 2), Claude API (tier 3)"]
     BI["bot-inator (optional)<br/>PR-ready cards, iPhone"]
     W <-- "polls / opens PRs" --> GH
     W <-- "HTTP" --> OC
     W -- "routing model" --> MS
-    OC -- "tiers 1–2" --> MS
-    OC -- "tier 3" --> CL
+    OC -- "tier 1" --> MS
+    OC -- "tiers 2–3" --> CL
     BI -. "opens issues" .-> GH
     BI -. "models" .-> MS
 ```
@@ -402,8 +404,9 @@ Milestones 1–2 make the GitHub add-on useful on its own. Bot-inator is optiona
 
 - **Verify command:** detected from the repo (package.json scripts, pytest, `swift typecheck`, Makefile). If nothing is found, the ticket is flagged once and the command you enter is saved for that repo.
 - **Web UI:** GitHub is the board. The worker serves only a local metrics page.
-- **Tier 1 (2026-11-23):** Inkling 2 Mini (Thinking Machines, open weights, about 20 GB on Ollama 0.40.17 or newer) replaces Qwen3.6 35B-A3B. Its maker reports coding scores level with Qwen3.8-27B at a fraction of the time per task, and it puts a second model family on the local tiers, so a move from tier 1 to tier 2 changes family. Tier 2 stays Qwen3.8-27B until the metrics say otherwise.
-- **Tier 3:** both. The GLM plan is tried first because it's a flat fee; the Claude API is used on escalation from GLM, or from the start for ticket types where GLM's accept rate is low.
+- **Tier 1 (2026-11-23):** Inkling 2 Mini (Thinking Machines, open weights, about 20 GB on Ollama 0.40.17 or newer) replaces Qwen3.6 35B-A3B. Its maker reports coding scores level with Qwen3.8-27B at a fraction of the time per task, and it puts a second model family on the local tiers, so a move from tier 1 to tier 2 changes family. Tier 2 stayed Qwen3.8-27B until 2026-11-25 (see the next entry).
+- **Tier 2 (2026-11-25, todo #70):** GLM, open-weights cloud, pay per use. Qwen3.8-27B on Ollama is the opt-in local tier 2. A GLM writer is reviewed by Claude Opus (`reviewer_models` order), so the family rule holds.
+- **Tier 3:** the Claude API, Opus then Fable. (Until 2026-11-25 GLM was tried first at tier 3; it now sits at tier 2.)
 - **todo.md:** for the repos foreman-inator works on, the board replaces task tracking and the rules header moves to `AGENTS.md`. foreman-inator's own build is tracked in this repo's `todo.md` until it can run its own tickets.
 - **Name:** foreman-inator (renamed from Agent Board, then Foreman, on 2026-11-23), matching bot-inator. Repo and package foreman-inator, command foreman-inator with alias fman, bot account foreman-inator[bot]; confirm the names are free before the first release.
 - **Open source (2026-11-23):** yes, from day one, MIT license. Each user registers their own GitHub App; secrets and data stay in `~/.foreman-inator/`.

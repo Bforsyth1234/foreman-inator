@@ -149,10 +149,29 @@ The defaults:
 | `name` | `tier` | `kind` | `model` | `base_url` | `family` | `api_key_ref` |
 | --- | --- | --- | --- | --- | --- | --- |
 | `inkling-2-mini` | 1 | local | `inkling-2-mini` | `http://127.0.0.1:11434/v1` | inkling | |
-| `qwen3.8-27b` | 2 | local | `qwen3.8:27b` | `http://127.0.0.1:11434/v1` | qwen | |
-| `glm` | 3 | cloud | `glm-5.3` | `https://api.z.ai/api/coding/paas/v4` | glm | `keychain:foreman-inator/glm` |
+| `glm` | 2 | cloud | `glm-5.3` | `https://api.z.ai/api/coding/paas/v4` | glm | `keychain:foreman-inator/glm` |
 | `claude-opus` | 3 | cloud | `claude-opus-5-5` | `https://api.anthropic.com/v1` | claude | `keychain:foreman-inator/anthropic` |
 | `claude-fable` | 3 | cloud | `claude-fable-5-2` | `https://api.anthropic.com/v1` | claude | `keychain:foreman-inator/anthropic` |
+
+Tier 2 is GLM, open-weights cloud, since todo #70 (it was `qwen3.8-27b`, local,
+before). A config file that lists its own `[[models]]` keeps its ladder as
+written, so a file with Qwen at tier 2 loads unchanged. To keep tier 2 local,
+list Qwen as tier 2 (and, if you like, GLM back at tier 3 ahead of Claude):
+
+```toml
+[[models]]
+name = "qwen3.8-27b"
+tier = 2
+kind = "local"
+model = "qwen3.8:27b"
+base_url = "http://127.0.0.1:11434/v1"
+family = "qwen"
+```
+
+Because `[[models]]` replaces the whole list, add the other tiers' tables too.
+With the defaults, the AI reviewer of a GLM writer is Claude Opus and of a
+Claude writer is GLM (`reviewer_models`), so the reviewer is always of another
+family.
 
 The default Claude models have `wire = "anthropic"`: the writer reaches them on
 the proxy's Anthropic Messages route, so prompt caching works and cached input

@@ -30,8 +30,13 @@ and the live checks are listed in [todo.md](todo.md#live-checks).
 | Tier | Default model | Where | Used for |
 | --- | --- | --- | --- |
 | 1 | Inkling 2 Mini | Local, Ollama | Small, mechanical changes |
-| 2 | Qwen3.8 27B | Local, Ollama | Normal features and bug fixes |
-| 3 | GLM first, then Claude Opus, then Claude Fable | Cloud, pay per use | Large refactors, anything that failed locally |
+| 2 | GLM (open weights) | Cloud, pay per use | Normal features and bug fixes |
+| 3 | Claude Opus, then Claude Fable | Cloud, pay per use | Large refactors, anything that failed on tier 2 |
+
+Tier 2 used to be Qwen3.8 27B on Ollama; it is still supported as an opt-in
+local tier 2 (see [docs/setup.md](docs/setup.md#keeping-tier-2-local)). A
+cloud tier 2 attempt costs a few cents, which is cheaper in time than a slow
+local attempt that escalates anyway.
 
 ## Install and first run
 
@@ -42,7 +47,6 @@ The package is not on PyPI; install it from GitHub:
 ```bash
 uv tool install git+https://github.com/Bforsyth1234/foreman-inator
 ollama pull inkling-2-mini
-ollama pull qwen3.8:27b
 fman setup
 ```
 
@@ -55,7 +59,7 @@ merged; until they are, install from a checkout as described in
 you to install it on the repos it may work on, checks the dependencies, and
 installs a launchd agent that starts the worker at login.
 
-For tier 3 and the AI review, store the cloud API keys in the Keychain:
+For tiers 2 and 3 and the AI review, store the cloud API keys in the Keychain:
 
 ```bash
 fman config set-key glm
@@ -74,7 +78,8 @@ review, is [docs/setup.md](docs/setup.md).
   `allowed_users` applied it. Code from forks and other people's PRs is never run.
 - **Local by default, with spend caps.** Code, traces and recordings stay on
   your Mac. Cloud models are called only for tiers configured as cloud, and
-  only inside a daily and monthly cap ($5 and $50 by default).
+  only inside a daily and monthly cap ($5 and $50 by default). With the
+  default ladder tiers 2 and 3 are cloud, so tier 2 work spends money too.
 - **Secrets stay outside the repo.** The App key and config live in
   `~/.foreman-inator/` (mode 700); API keys live in the macOS Keychain.
 - **Every loop is capped.** Retries, escalations and rebases have fixed limits

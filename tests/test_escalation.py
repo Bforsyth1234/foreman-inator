@@ -13,7 +13,7 @@ from datetime import UTC, datetime
 import pytest
 
 from foreman_inator import worker_policy
-from foreman_inator.config import default_models
+from foreman_inator.config import local_tier2_models
 from foreman_inator.db.store import Attempt, Kickback, Review
 from foreman_inator.routing import escalation as esc
 from foreman_inator.routing.escalation import (
@@ -28,7 +28,7 @@ from foreman_inator.routing.escalation import (
 
 T0 = datetime(2026, 11, 23, tzinfo=UTC)
 # tier 1 inkling, tier 2 qwen, then tier 3 in order: glm, claude opus, claude fable
-LADDER = build_ladder(default_models())
+LADDER = build_ladder(local_tier2_models())  # #70: the opt-in local tier 2 ladder
 Q1, Q2, GLM, CLAUDE, FABLE = LADDER
 
 

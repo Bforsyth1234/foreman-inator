@@ -99,9 +99,10 @@ def test_missing_file_gives_spec_defaults() -> None:
     assert cfg.poll_interval_seconds == 45
     assert [m.tier for m in cfg.models_for_tier(1)] == [1]
     assert cfg.models_for_tier(1)[0].kind == "local"
-    assert cfg.models_for_tier(2)[0].kind == "local"
-    assert [m.name for m in cfg.models_for_tier(3)] == ["glm", "claude-opus", "claude-fable"]
-    assert all(m.kind == "cloud" and m.api_key_ref for m in cfg.models_for_tier(3))
+    # #70: tier 2 is open-weights cloud (GLM); tier 3 Claude Opus then Fable.
+    assert [m.name for m in cfg.models_for_tier(2)] == ["glm"]
+    assert [m.name for m in cfg.models_for_tier(3)] == ["claude-opus", "claude-fable"]
+    assert all(m.kind == "cloud" and m.api_key_ref for t in (2, 3) for m in cfg.models_for_tier(t))
     assert cfg.allowed_users == ()
     assert cfg.spend_caps.daily_usd > 0
 
@@ -350,7 +351,6 @@ def test_wire_defaults_parses_validates_and_round_trips(tmp_path):
     defaults = {m.name: m.wire for m in config.default_models()}
     assert defaults == {
         "inkling-2-mini": "openai",
-        "qwen3.8-27b": "openai",
         "glm": "openai",
         "claude-opus": "anthropic",
         "claude-fable": "anthropic",
