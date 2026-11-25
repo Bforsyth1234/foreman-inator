@@ -142,6 +142,7 @@ from foreman_inator.worker_attempt import AttemptSteps
 from foreman_inator.worker_background import BackgroundSteps
 from foreman_inator.worker_install import InstallSteps
 from foreman_inator.worker_pause import PauseSteps
+from foreman_inator.worker_prune import PruneSteps
 from foreman_inator.worker_publish import PublishSteps
 from foreman_inator.worker_queue import JOIN_TIMEOUT, Job, QueueSteps
 from foreman_inator.worker_rebase import RebaseSteps
@@ -166,6 +167,7 @@ class Worker(
     QueueSteps,
     SandboxSteps,
     BackgroundSteps,
+    PruneSteps,
 ):
     def __init__(
         self,
@@ -214,6 +216,7 @@ class Worker(
         self.ladder = escalation.build_ladder(config.models)
         self.policy: Policy = policy or escalation.make_policy(self.ladder)
         self.clock = clock
+        self._recovered = False  # set by recover(); gates the daily prune (#56)
         self.attempt_timeout = attempt_timeout
         self.verify_timeout = verify_timeout
         self.review_timeout = review_timeout
@@ -270,6 +273,7 @@ class Worker(
         self._sweep.update(self.repos)
         self._ensure_variants()
         self.requeue_unlabeled()
+        self._recovered = True  # #56: the daily prune may run from now on
         return fixed
 
     def run_once(self) -> None:
@@ -369,6 +373,8 @@ class Worker(
             for repo, exc in result.errors.items():
                 log.warning("poll of %s failed: %s: %s", repo, type(exc).__name__, exc)
         self.queue_backfill()  # #23: at most one small embedding batch per poll, in the back
+        if self._recovered:  # #56: after recover(), so a dead process's attempts are ended
+            self.maybe_prune()
 
     def after_commit(self, ticket: Ticket, name: str, fn: Callable[[], Any]) -> None:
         """Run ``fn`` once the poll event's transaction has committed (now, outside one).

@@ -69,6 +69,7 @@ from datetime import UTC, date, datetime, timedelta, tzinfo
 from typing import Literal
 from zoneinfo import ZoneInfo
 
+from foreman_inator import config as config_defaults
 from foreman_inator.config import Config, ModelEndpoint, SpendCaps
 from foreman_inator.db.store import NotFoundError, SpendApproval, SpendEntry, Store, Ticket
 
@@ -84,11 +85,12 @@ FLAG_SPEND_CAP = "spend_cap"
 DEFAULT_RESERVATION_TTL = timedelta(minutes=15)
 #: Flag reason prefix for a ticket handed over after an attempt reached its budget (#58).
 FLAG_ATTEMPT_BUDGET = "attempt_budget"
-#: Per-attempt limits (#58); the wiring step passes the config's values. The live run
-#: that prompted #58 spent $4.78 and 3.34M input tokens in one tier 3 attempt.
-DEFAULT_ATTEMPT_BUDGET_USD = 1.50
-DEFAULT_ATTEMPT_MAX_INPUT_TOKENS_CLOUD = 1_500_000
-DEFAULT_ATTEMPT_MAX_INPUT_TOKENS_LOCAL = 4_000_000
+#: Per-attempt limits (#58), defined in ``config`` (whose keys default to them) and
+#: re-exported here. The live run that prompted #58 spent $4.78 and 3.34M input tokens
+#: in one tier 3 attempt.
+DEFAULT_ATTEMPT_BUDGET_USD = config_defaults.DEFAULT_ATTEMPT_BUDGET_USD
+DEFAULT_ATTEMPT_MAX_INPUT_TOKENS_CLOUD = config_defaults.DEFAULT_ATTEMPT_MAX_INPUT_TOKENS_CLOUD
+DEFAULT_ATTEMPT_MAX_INPUT_TOKENS_LOCAL = config_defaults.DEFAULT_ATTEMPT_MAX_INPUT_TOKENS_LOCAL
 _EPS = 1e-9  # float slack so 4.0 + 1.0 <= 5.0 holds after summing ledger REALs
 
 

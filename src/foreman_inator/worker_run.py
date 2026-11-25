@@ -180,7 +180,13 @@ def run_worker(*, once: bool = False) -> int:
     tracing.init(traces_dir=paths.traces_dir())
     api = build_github(cfg, key_path)
     bot = f"{cfg.app_slug}[bot]" if cfg.app_slug else "foreman-inator[bot]"
-    spend = Spend(store, cfg)
+    spend = Spend(
+        store,
+        cfg,
+        attempt_budget_usd=cfg.attempt_budget_usd,
+        attempt_max_input_tokens_cloud=cfg.attempt_max_input_tokens_cloud,
+        attempt_max_input_tokens_local=cfg.attempt_max_input_tokens_local,
+    )
     # The embedding model (#23) is served next to the writers but is never a rung.
     proxy = ModelProxy(cfg.proxy_models(), store=store, spend_hook=spend.hook).start()
     driver = OpenCodeDriver()

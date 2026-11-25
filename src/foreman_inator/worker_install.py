@@ -50,11 +50,8 @@ SETUP_REASON = "dependency_install"
 DETAIL_TAIL = 300
 
 #: #57: refill an empty cache from the base commit when an offline install misses it.
-#: Default for ``config.install_refill_cache`` until that key is wired. Off for now: the
-#: existing ``test_install.py::test_after_a_model_edit_the_install_is_offline`` asserts
-#: the old behaviour (cold cache + model edit -> flagged, the index never reached) and
-#: must be updated in the same step that turns this on.
-REFILL_ON_CACHE_MISS = False
+#: Fallback for a config object without ``install_refill_cache`` (Config defaults to True).
+REFILL_ON_CACHE_MISS = True
 
 
 def _setup_failed() -> type[Exception]:

@@ -65,7 +65,7 @@ in the item, and put the shape you rely on behind one small adapter so a
 change touches one file.
 ============================================================ -->
 
-Next ID: #69
+Next ID: #70
 Legend: `[ ]` todo · `[~]` in progress · `[~] live` built, waiting on its live check · `[x]` done (move to DONE.md)
 
 ## Wave plan
@@ -98,6 +98,7 @@ Package root below is `src/foreman_inator/` (written `pkg/`).
 | 8 | A: #23 · B: #24 · C: #25 · D: #26 · E: #27 · F: #28 | A `pkg/routing/knn.py`, `pkg/routing/explore.py` · B `pkg/experiments/variants.py`, `pkg/experiments/__init__.py`, `pkg/prompts/__init__.py` · C `pkg/experiments/replay_sets.py`, `pkg/experiments/replay_runner.py` · D `pkg/experiments/shadow.py` · E `pkg/tracing/failure_label.py`, `pkg/prompts/failure-label-v1.md` · F `pkg/tracing/replay.py`, `pkg/metrics/trace_view.py`, `tests/recordings/` (+ own tests). Runner at close: `pyproject.toml` deps | [x] |
 | 9 | A: #29 (alone: wiring) | `pkg/worker.py`, `pkg/cli.py` (`experiment`, `replay`), `pkg/metrics/web.py` (new routes and failure-step columns), `tests/test_worker_v3.py` | [x] built; live check open for #29 |
 | 10 | A: #30 · B: #31 · C: #32 | A `pkg/export.py` · B `pyproject.toml` (metadata, entry points), `.github/workflows/release.yml`, `docs/releasing.md` · C `README.md`, `docs/setup.md`, `docs/how-it-works.md`, `docs/demo.gif` (+ own tests). Runner at close: `cli.py` (`export`) | [x] built; live checks open for #31, #32 |
+| 13 | A1: GH #50, #55 · A2: GH #51 · A3: GH #57 · A4: GH #58 · A5: GH #56 · A6: todo #58 (GH #35) | A1 `pkg/worker_status.py`, `pkg/locks.py` · A2 `pkg/setup/deps.py`, `pkg/routing/knn.py`, `pkg/worker_background.py` · A3 `pkg/runner/install.py`, `pkg/worker_install.py` · A4 `pkg/spend.py`, `pkg/worker_attempt.py`, `pkg/routing/escalation.py`, `pkg/pr/summary.py`, `pkg/db/store.py`, `007_attempt_budget.sql` · A5 `pkg/prune.py`, `pkg/worker_prune.py`, `pkg/tracing/recorder.py`, `docs/setup.md`, `docs/how-it-works.md` · A6 `pkg/resources/` (+ own tests). Runner at close: config keys `attempt_budget_usd`, `attempt_max_input_tokens_cloud/_local`, `retention_days`, `install_refill_cache`; `PruneSteps` + daily prune in the poll; `fman prune`; budget in status/summary/export | [x] built |
 | — | #33–#39 | unscheduled (SPEC milestone 5) | open |
 | — | #45–#50 | unscheduled (gap review, 2026-11-23) | open |
 | — | #51 | unscheduled (user request, 2026-11-23); proposed as its own wave after 6b | open |
@@ -377,9 +378,7 @@ Asked by the user: "should we add the ability for the app to track gpu / memory 
 Why: `max_parallel_per_repo` (default 1, "one local GPU") is counted per repo, and nothing limits local work across repos. Three watched repos can send three tickets to Ollama at once, each loading `qwen3.8:27b` or `inkling-2-mini`: models get evicted and reloaded, the machine swaps, and attempts slow down or time out. Those runs are then recorded as model failures in the metrics and the kNN router's data.
 Idea: a `max_local_inference` config setting (default 1). The proxy holds one shared semaphore for requests to `local` tier endpoints; cloud tiers are not limited. Time spent waiting for a slot is recorded on the `llm.call` span and not counted against the attempt's timeout. Estimate: about 2 hours with tests.
 
-#58 — Poll Ollama for loaded models [ ] · Added: 2026-11-23 · Source: user
-Why: there is no way to see how many local models are running right now. Ollama's `GET /api/ps` returns each loaded model with `size`, `size_vram` and `expires_at`, which answers that directly with no GPU tooling.
-Idea: a small poller (reuse `setup.deps.ollama_host` for the host) that the worker status and the metrics view read. If Ollama is unreachable, report that instead of zero models. Estimate: about 1 hour.
+#58 — Poll Ollama for loaded models [x] · done 2026-11-25, wave 13, see DONE.md · Added: 2026-11-23 · Source: user
 
 #59 — Record memory state on each attempt [ ] · Added: 2026-11-23 · Source: user
 Why: a slow or failed local attempt can't be told apart from a starved machine. Without this, resource contention looks like model quality in the metrics and replay sets.
@@ -439,3 +438,28 @@ Safety: a plugin is code running inside the worker with its keys. Load only inst
 Verify: with no plugin installed every existing test passes unchanged; a fake plugin registered in a test is loaded, listed in status and its hook is called; a plugin that raises on load is skipped and the worker still starts; each hook's default gives today's behaviour. Non-vacuous: make the loader ignore the entry-point group and the fake-plugin test fails.
 SPEC change needed: a short "Plugins" section naming the group, the hooks and the one-way dependency.
 Estimate: about half a day with the first hook and tests.
+
+### Unscheduled (LLM-proposed experiments, 2026-11-24)
+
+Asked by the user: "does it make sense for the llm to create experiments?", then "yes add it as a todo and open a github issue". Today every challenger is written by hand: someone has to notice a pattern in kickbacks, write `writer-vN.md` / `reviewer-vN.md`, then run `fman experiment run --challenger`.
+
+#69 — An LLM drafts challenger prompts from labeled kickbacks; promotion is unchanged [ ] · Added: 2026-11-24 · Source: user
+Why: the experiment machinery (replays, shadow reviewer, promotion rule) exists, but nothing proposes the next variant, so experiments only happen when someone thinks one up. Kickbacks already carry a failure step (`kickbacks.failure_step`, #27), which is exactly what a prompt author needs to know.
+Idea: `fman experiment propose --role writer|reviewer`. It groups recent kickbacks by failure step (and reviewer catch / false-kickback misses for the reviewer role), and a tier 3 model reads the current champion prompt plus the top patterns and drafts the next prompt version (`pkg/prompts/<role>-vN.md`, plus a short rationale naming the patterns it targets). The draft goes out as a PR or draft for the user to approve; only after approval is it registered as a challenger through the existing `run_command`. Model choice stays human (the list is short and known); the LLM writes prompts only. Promotion stays the existing rule-based gate (`promote`: wins on replay AND holds live); the LLM never promotes.
+Safety: (1) Overfitting: the proposer reads only kickbacks older than a cutoff, and the replay that scores the challenger uses only cases after that cutoff, so it is never scored on tickets it was written from; record the cutoff on the experiment. (2) Volume: at most one LLM-proposed challenger running per role, and the proposer call counts toward `spend_caps.experiments_monthly_usd`. (3) Independence: the proposer model is not the reviewer that scores the challenger (same idea as the reviewer-independence invariant). (4) Consent: nothing runs or changes until the user approves the prompt change, same idea as #51's sub-issues. Kickback text and issue bodies are untrusted input to the proposer: `defuse` them as in the writer prompt.
+Verify: with fake kickbacks clustered on one failure step, `propose` drafts a prompt whose rationale names that step and registers nothing until approval; a second `propose` while one LLM challenger is running for the role exits without a model call; the replay for a proposed challenger contains no case at or before the cutoff; `promote` behaves identically for proposed and hand-written challengers. Non-vacuous: drop the cutoff filter and the no-overlap test fails.
+SPEC change needed: one paragraph under "Experiments" saying challengers may be LLM-drafted, with the cutoff and the one-at-a-time rule.
+Estimate: about half a day with tests, assuming `run_command` and the replay path are reused unchanged. Related: #66, #67.
+
+### Unscheduled (tier order, 2026-11-25)
+
+Asked by the user: "do local llms make sense in this app or should the first tier be open source cloud llms then more expensive ones like claude etc", then "yes, add it". Today `config.py:208-217` gives tier 1 `inkling-2-mini` (local), tier 2 `qwen3.8-27b` (local), tier 3 `glm-5.3` then Claude.
+
+#70 — Tier 2 default becomes open-weights cloud (GLM); local 27B becomes optional [ ] · Added: 2026-11-25 · Source: user
+Goal (user, 2026-11-25): "the main goal of this app is to cancel my max plan at 100 a month." So the test is total monthly cost (cloud spend, with the $50 default `spend_caps.monthly_usd` well under $100) at an acceptable merge rate, not the share of tickets that run locally.
+Why: a 27B model on a Mac is slow on agent loops, which resend long prompts every turn (the writer timeout had to become configurable). Local runs also compete for memory (#57–#59), and those slowdowns get recorded as model failures. An open-weights cloud attempt costs a few cents, so a failed 15-minute local attempt that escalates anyway costs more in time than the cloud call costs in money. Tier 1 stays local: small mechanical changes are where small local models pass, and it keeps the v1 goal (replace Max usage with local models) and "local by default" for the easy work.
+Idea: default ladder becomes tier 1 `inkling-2-mini` (local), tier 2 `glm-5.3` (cloud), tier 3 Claude Opus then Fable. `qwen3.8-27b` stays in the code as an opt-in local tier 2 for users who want it (documented in docs/setup.md). Check that reviewer independence still holds: a GLM tier 2 writer must get `claude-opus` as reviewer, which `reviewer_models` order already gives. #49 (`cloud = false`) must still work: with no local tier 2, a local-only repo stops at tier 1 and flags the user, or uses the opt-in qwen tier if configured.
+Decide with data first: before changing the default, run tier 1 local and GLM on the same mix of tickets for about a week and compare accept rate and attempt minutes per accepted PR (needs #46). If qwen 27B matches GLM's accept rate within a reasonable time, keep it.
+Verify: default config lists tiers 1/2/3 as local/cloud/cloud; an existing config.toml with qwen at tier 2 loads unchanged; escalation from tier 1 goes to GLM; a GLM writer gets a non-GLM reviewer; a `cloud = false` repo never calls a cloud endpoint (once #49 lands). Non-vacuous: put GLM in both writer and reviewer slots and the independence test fails.
+SPEC change needed: the tier table in SPEC.md and README.md (tier 2 "Local, Ollama" → "Cloud, pay per use"), and the spend-cap note, since tier 2 now spends money.
+Estimate: about 30 minutes for config and docs, about 2 hours with tests. Related: #46, #49, #57.
