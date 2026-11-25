@@ -11,7 +11,8 @@ attempt only; escalation after that is #16's job. The order:
 3. Anything that goes wrong (no local classifier, a cloud classifier not explicitly
    allowed, an HTTP error, a timeout, an answer that is not exactly one of the three
    labels) gives tier 2 with a reason starting ``router fallback:`` and saying what
-   happened. ``route`` never raises and never waits longer than ``timeout`` seconds.
+   happened. ``route`` never raises and never waits longer than ``timeout`` seconds (plus the
+   cold-load allowance below, when it applies).
 
 Tiers with no model configured are skipped upward (tier 1 missing -> tier 2, ...). If no
 tier at or above the wanted one has a model, the highest configured tier below it is used.
@@ -30,6 +31,15 @@ The issue text is untrusted: it is fenced between BEGIN/END markers with look-al
 markers defused, and cut to a character budget. The answer is parsed strictly
 (``parse_label``).
 
+Cold loads (issue #52): Ollama unloads an idle model, and the next call waits for it to
+load, which can take longer than ``timeout``. Given ``watch`` (a
+``resources.ollama.OllamaWatch``), a local classifier that Ollama reports as not loaded
+gets ``timeout + cold_load_allowance`` seconds, and the log says "waiting for cold load
+of <model>". A timeout on a model that was not seen loaded before the call, which is
+loaded now, is retried once (with the allowance): the load finished during the call.
+Without ``watch``, or when Ollama cannot be asked, the call has ``timeout`` and no retry.
+So the longest wait is ``2 * (timeout + cold_load_allowance)``.
+
 Later routers (#23 nearest neighbours) fall back to ``route`` below their threshold;
 ``resolve_tier`` and ``Override`` are shared so they skip tiers and honour overrides the
 same way.
@@ -42,7 +52,7 @@ import json
 import logging
 import re
 import threading
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from importlib import resources
 from string import Template
@@ -55,6 +65,8 @@ from fde_kit.prompts import PromptRef, load_prompt
 from foreman_inator import tracing
 from foreman_inator.config import Config, ModelEndpoint
 from foreman_inator.proxy.server import upstream_error_message
+from foreman_inator.resources.ollama import LoadedModel, Unreachable
+from foreman_inator.resources.ollama import _same_model as _ollama_same_model
 from foreman_inator.tickets import lifecycle
 from foreman_inator.tickets.prompt import clip_head, defuse
 
@@ -65,6 +77,9 @@ LABEL_TIERS: Mapping[str, int] = {"small": 1, "normal": 2, "large": 3}
 TIERS = (1, 2, 3)
 FALLBACK_TIER = 2
 DEFAULT_TIMEOUT = 10.0  # seconds, the whole classification call
+# Extra seconds for a call to a local model Ollama has not loaded (issue #52); the
+# worker passes cold_load_timeout_seconds.
+DEFAULT_COLD_LOAD_ALLOWANCE = 120.0
 
 # Budgets. A small local model needs only the gist of the issue to judge its size.
 TITLE_BUDGET = 300
@@ -154,8 +169,21 @@ class ProxyLike(Protocol):
     def context(self, **kw: Any) -> Any: ...
 
 
+class ModelWatch(Protocol):
+    """What the cold-load check needs from ``resources.ollama.OllamaWatch``."""
+
+    def models(self) -> list[LoadedModel] | Unreachable: ...
+
+
+LoadState = Literal["loaded", "cold", "unknown"]
+
+
 class RouterError(Exception):
     """Classification failed; the message says how (it goes into the fallback reason)."""
+
+
+class RouterTimeout(RouterError):
+    """The call ran out of time (an httpx timeout or the wall-clock deadline)."""
 
 
 def _prompt_version(name: str | None, digest: str | None) -> str | None:
@@ -306,7 +334,7 @@ def _post(url: str, body: dict[str, Any], headers: dict[str, str], timeout: floa
                     raise RouterError(f"response larger than {MAX_RESPONSE_BYTES} bytes")
             status = resp.status_code
     except httpx.TimeoutException as exc:
-        raise RouterError(f"timed out ({type(exc).__name__})") from exc
+        raise RouterTimeout(f"timed out ({type(exc).__name__})") from exc
     except httpx.HTTPError as exc:
         raise RouterError(f"proxy unreachable ({type(exc).__name__})") from exc
     try:
@@ -355,10 +383,60 @@ def _post_with_deadline(
     t.start()
     t.join(timeout)
     if t.is_alive():
-        raise RouterError(f"timed out after {timeout:g}s")
+        raise RouterTimeout(f"timed out after {timeout:g}s")
     if "error" in out:
         raise out["error"]
     return out["data"]
+
+
+def load_state(watch: ModelWatch | None, clf: ModelEndpoint) -> LoadState:
+    """Whether Ollama holds ``clf`` in memory: "loaded", "cold" (Ollama answered and it
+    is not there) or "unknown" (no watch, a cloud model, Ollama unreachable, any error)."""
+    if watch is None or clf.kind != "local":
+        return "unknown"
+    try:
+        current = watch.models()  # one read: "is it up" and "is it there" must agree
+        if isinstance(current, Unreachable):
+            return "unknown"
+        loaded = any(_ollama_same_model(clf.model, m.name) for m in current)  # Ollama's id
+        return "loaded" if loaded else "cold"
+    except Exception:  # the check is advisory; never let it fail the call
+        return "unknown"
+
+
+def post_classifier(
+    url: str,
+    body: dict[str, Any],
+    headers: dict[str, str],
+    *,
+    classifier: ModelEndpoint,
+    timeout: float,
+    watch: ModelWatch | None = None,
+    cold_load_allowance: float = DEFAULT_COLD_LOAD_ALLOWANCE,
+    post: Callable[[str, dict[str, Any], dict[str, str], float], Any] | None = None,
+) -> Any:
+    """``_post_with_deadline`` with the cold-load allowance and the one retry described
+    in the module docstring (issue #52)."""
+    send = post or _post_with_deadline
+    before = load_state(watch, classifier)
+    long = timeout + max(0.0, cold_load_allowance)
+    if before == "cold":
+        log.info("waiting for cold load of %s (up to %gs)", classifier.model, long)
+        budget = long
+    else:
+        budget = timeout
+    try:
+        return send(url, body, headers, budget)
+    except RouterTimeout:
+        if before == "loaded" or load_state(watch, classifier) != "loaded":
+            raise
+    log.info(
+        "%s loaded during a timed-out call; waiting for cold load of %s once more (up to %gs)",
+        classifier.model,
+        classifier.model,
+        long,
+    )
+    return send(url, body, headers, long)
 
 
 def _answer_text(data: Any) -> str:
@@ -378,6 +456,8 @@ def classify(
     messages: list[dict[str, str]],
     prompt_version: str | None,
     timeout: float,
+    watch: ModelWatch | None = None,
+    cold_load_allowance: float = DEFAULT_COLD_LOAD_ALLOWANCE,
 ) -> str:
     """One chat-completions call to ``url`` (a proxy ``.../v1`` base); returns the raw
     answer text. Raises RouterError on anything but a 200 with a text answer."""
@@ -393,7 +473,15 @@ def classify(
     headers = {"content-type": "application/json"}
     if prompt_version:
         headers[PROMPT_VERSION_HEADER] = prompt_version
-    data = _post_with_deadline(url.rstrip("/") + "/chat/completions", body, headers, timeout)
+    data = post_classifier(
+        url.rstrip("/") + "/chat/completions",
+        body,
+        headers,
+        classifier=classifier,
+        timeout=timeout,
+        watch=watch,
+        cold_load_allowance=cold_load_allowance,
+    )
     return _answer_text(data)
 
 
@@ -411,6 +499,8 @@ def route(
     allow_cloud_classifier: bool = False,
     timeout: float = DEFAULT_TIMEOUT,
     template: PromptRef | None = None,
+    watch: ModelWatch | None = None,
+    cold_load_allowance: float = DEFAULT_COLD_LOAD_ALLOWANCE,
 ) -> Route:
     """Pick the start tier for ``ticket`` (anything with ``title``, ``request``, ``repo``,
     e.g. ``db.store.Ticket``). Never raises; see the module docstring.
@@ -442,6 +532,8 @@ def route(
             allow_cloud_classifier=allow_cloud_classifier,
             timeout=timeout,
             template=template,
+            watch=watch,
+            cold_load_allowance=cold_load_allowance,
         )
         _annotate(span, result)
     return result
@@ -496,6 +588,8 @@ def _classify_route(
     allow_cloud_classifier: bool,
     timeout: float,
     template: PromptRef | None,
+    watch: ModelWatch | None = None,
+    cold_load_allowance: float = DEFAULT_COLD_LOAD_ALLOWANCE,
 ) -> Route:
     name: str | None = None
     digest: str | None = None
@@ -544,13 +638,21 @@ def _classify_route(
                     messages=messages,
                     prompt_version=pv,
                     timeout=timeout,
+                    watch=watch,
+                    cold_load_allowance=cold_load_allowance,
                 )
         elif base_url is not None:
             host = urlparse(base_url).hostname or ""
             if not _is_loopback(host):
                 return fallback("base_url is not the local model proxy; refusing to send")
             raw = classify(
-                url=base_url, classifier=clf, messages=messages, prompt_version=pv, timeout=timeout
+                url=base_url,
+                classifier=clf,
+                messages=messages,
+                prompt_version=pv,
+                timeout=timeout,
+                watch=watch,
+                cold_load_allowance=cold_load_allowance,
             )
         else:
             return fallback("no model proxy given")
