@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -390,3 +391,59 @@ async def test_proxy_refuses_cloud_call_at_cap_before_sending(store):
         r = await c.post(f"/a/{aid}/v1/chat/completions", json=dict(body, model="qwen"))
         assert r.status_code == 200
     assert ledger_rows(store) == 2
+
+
+# --------------------------------------------------------------------------- flat-fee plans
+
+PLAN = replace(Config().model("glm"), plan_usd_month=18.0)
+
+
+def make_plan_spend(store: Store, **kw) -> Spend:
+    caps = SpendCaps(daily_usd=5.0, monthly_usd=50.0, experiments_monthly_usd=0.0)
+    models = tuple(PLAN if m.name == "glm" else m for m in Config().models)
+    return Spend(store, Config(spend_caps=caps, models=models), tz=NY, **kw)
+
+
+def test_plan_calls_skip_the_caps_but_are_logged_at_list_price(store):
+    spend = make_plan_spend(store)
+    assert call(spend, 4.0, ctx())  # metered: today 4 of 5
+    assert call(spend, 3.0, ctx(), PLAN)  # past the daily cap: a plan call is not capped
+    assert call(spend, 2.0, ctx(bucket="experiments"), PLAN)  # experiments budget is 0
+    assert not call(spend, 1.5, ctx())  # metered still sees 4 of 5, not 7
+    s = spend.summary()
+    assert s.live_today_usd == pytest.approx(4.0)
+    assert s.experiments_month_usd == 0.0
+    (glm,) = s.plans
+    assert (glm.model, glm.fee_usd_month, glm.calls) == ("glm", 18.0, 2)
+    assert glm.list_usd == pytest.approx(5.0)
+    assert glm.saved_usd == pytest.approx(-13.0)
+    assert "glm plan $18.00/month, not capped: 2 calls this month, $5.00" in s.status_line()
+    assert spend.blocked() is None  # plan spend does not fill the cap
+    assert call(spend, 1.0, ctx())
+    assert spend.blocked() is not None  # metered spend still does
+
+
+def test_plan_call_reserves_nothing(store):
+    spend = make_plan_spend(store)
+    assert spend.hook(PLAN, 100.0, ctx(), phase="estimate")  # never settled
+    assert spend.allow(5.0)
+
+
+def test_plan_skips_attempt_usd_budget_but_not_token_limit(store):
+    spend = make_plan_spend(store, attempt_budget_usd=1.0, attempt_max_input_tokens_cloud=1_000)
+    _, aid = ticket_attempt(store)
+    store.add_attempt_usage(aid, tokens_in=10, cost_usd=5.0)  # list price, over $1
+    assert spend.hook(PLAN, 2.0, ctx(aid), phase="estimate")
+    assert not spend.hook(CLOUD, 2.0, ctx(aid), phase="estimate")  # metered: budget applies
+    store.add_attempt_usage(aid, tokens_in=1_000)
+    assert not spend.hook(PLAN, 0.1, ctx(aid), phase="estimate")
+    assert spend.budget_stop(aid).token_limit == 1_000
+
+
+def test_plan_call_is_refused_for_a_local_only_repo(store):
+    spend = make_plan_spend(store)
+    _, aid = ticket_attempt(store)
+    store.set_cloud("me/toy", False)
+    assert not spend.hook(PLAN, 0.1, ctx(aid), phase="estimate")
+    assert spend.refusal_for_attempt(aid).cap == "local_only"
+    assert ledger_rows(store) == 0

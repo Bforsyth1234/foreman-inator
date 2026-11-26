@@ -213,7 +213,7 @@ class AttemptSteps:
         template = None
         if split_pick is not None:
             endpoint, template = split_pick.endpoint, split_pick.template
-        if endpoint.is_cloud:
+        if endpoint.metered:  # a flat-fee plan model (plan_usd_month) is never capped
             # #51: a thrifty repo's cloud writer attempt also waits for an approval.
             refusal = self.spend.writer_gate(
                 ticket.id,
