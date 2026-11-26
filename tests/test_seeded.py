@@ -239,7 +239,7 @@ def test_seeded_run_reports_the_catch_rate_per_variant(world: World) -> None:
 
     def rule(model: str, text: str) -> str:
         reviewed.append(text)
-        if model == "glm-5.3":  # the challenger spots any change to the merged lines
+        if model == "glm-5.4":  # the challenger spots any change to the merged lines
             return "approve" if _intact(text) else "request_changes"
         return "approve"  # the champion approves everything
 

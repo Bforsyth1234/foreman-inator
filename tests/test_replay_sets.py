@@ -727,7 +727,7 @@ def test_reviewer_replay_scores_catches_and_false_kickbacks(world: World) -> Non
     champ, chall = reviewer_pair(w)
 
     def rule(model: str, text: str) -> str:
-        if model == "glm-5.3":  # the challenger reads the diff and spots the TODO
+        if model == "glm-5.4":  # the challenger reads the diff and spots the TODO
             return "request_changes" if "TODO" in text else "approve"
         return "approve"  # the champion approves everything
 
@@ -752,7 +752,7 @@ def test_reviewer_replay_scores_catches_and_false_kickbacks(world: World) -> Non
 
     # a challenger that also kicks back a change the user merged does not win
     def eager(model: str, text: str) -> str:
-        if model == "glm-5.3":
+        if model == "glm-5.4":
             return "request_changes" if ("TODO" in text or "b-ok" in text) else "approve"
         return "approve"
 
