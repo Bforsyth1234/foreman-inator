@@ -52,13 +52,14 @@ from typing import Any
 from foreman_inator import locks
 from foreman_inator.config import Config
 from foreman_inator.db.store import Store
+from foreman_inator.runner.worktree import parse_fman_branch
 
 AGENT_LABEL = "agent"  # github/poller.AGENT_LABEL (not imported: keeps sweep light)
 GH_LOGIN_HINT = "gh auth login --hostname github.com --git-protocol https --web"
 DEFAULT_PACE_SECONDS = 1.0  # between label calls: well under GitHub's secondary limits
 LIST_LIMIT = 1000  # issues and PRs fetched per listing
 FALLBACK_TIER = 2  # routing.rules.FALLBACK_TIER: what the router gives when not asked
-_FMAN_HEAD = re.compile(r"^fman/issue-([0-9]{1,18})/")
+_FMAN_HEAD = parse_fman_branch  # fman/issue-<n>/... and ab:pair side B fman/issue-<n>-b/...
 _TIER_LABEL = re.compile(r"^tier:([123])$")
 _AUTH_ERROR = re.compile(
     r"HTTP 401|Bad credentials|authentication|not logged in|gh auth login|"
@@ -120,16 +121,17 @@ class Gh:
         return [Issue.from_gh(raw) for raw in json.loads(self._call(*args) or "[]")]
 
     def fman_pr_issues(self, repo: str) -> set[int]:
-        """Issue numbers that already have an open ``fman/issue-<n>/`` PR."""
+        """Issue numbers that already have an open ``fman/issue-<n>/`` PR (or a side-B
+        ``fman/issue-<n>-b/`` one, #16)."""
         out = self._call(
             "pr", "list", "-R", repo, "--state", "open", "--limit", str(LIST_LIMIT),
             "--json", "number,headRefName",
         )  # fmt: skip
         found: set[int] = set()
         for raw in json.loads(out or "[]"):
-            m = _FMAN_HEAD.match(str(raw.get("headRefName") or ""))
-            if m:
-                found.add(int(m.group(1)))
+            parsed = _FMAN_HEAD(str(raw.get("headRefName") or ""))
+            if parsed is not None:
+                found.add(parsed[0])
         return found
 
     def add_label(self, repo: str, number: int, label: str = AGENT_LABEL) -> None:

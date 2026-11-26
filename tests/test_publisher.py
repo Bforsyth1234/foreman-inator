@@ -188,7 +188,7 @@ def test_pr_closed_by_a_person_is_left_closed(gh, store, pub, tmp_path):
     a1 = _attempt(store, t)
     gh.push_branch(REPO, pr_head_branch(t))
     r1 = pub.open_or_update_draft(t, a1, verify=_verify(tmp_path), diff=DIFF)
-    gh.close_pr(REPO, r1.pr.number)
+    gh.close_pr_as(REPO, r1.pr.number)
     before = list(gh.writes)
 
     a2 = _attempt(store, t, trigger="kickback")
@@ -216,7 +216,7 @@ def test_new_ticket_for_same_issue_ignores_earlier_tickets_closed_pr(gh, store, 
     a1 = _attempt(store, t1)
     gh.push_branch(REPO, pr_head_branch(t1))
     old = pub.open_or_update_draft(t1, a1, verify=_verify(tmp_path), diff=DIFF).pr
-    gh.close_pr(REPO, old.number)
+    gh.close_pr_as(REPO, old.number)
     store.set_column(t1.id, "dropped")
 
     t2 = store.create_ticket(
@@ -273,7 +273,7 @@ def test_mark_ready_only_with_a_reason_and_an_open_pr(gh, store, pub, tmp_path):
     pub.mark_ready(t, reason="handover")  # already ready: no second write
     assert len(gh.writes_named("mark_ready_for_review")) == 1
 
-    gh.close_pr(REPO, r.pr.number)
+    gh.close_pr_as(REPO, r.pr.number)
     with pytest.raises(PublishError, match="closed"):
         pub.mark_ready(t, reason="reviewer_approved")
 
