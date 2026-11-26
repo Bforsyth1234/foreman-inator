@@ -48,6 +48,27 @@ Rules as implemented:
 * **Resume.** A paused ticket can resume when it has an open approval, or when the live
   caps have headroom again (a new local day or month, or a raised cap):
   ``resume_reason``.
+* **A carried approval** (#82, migration 015). An approval is a budget of
+  ``approval_usd`` (its ``limit_usd``, fixed at its first use), not a single attempt
+  start. A used approval remembers how (``kind``: ``attempt`` for the thrifty gate,
+  ``grant`` for an over-cap grant) and which attempt holds it; every settled call under
+  it adds to its ``spent_usd`` in the store, not only in memory. A thrifty approval is
+  used before its attempt row exists, so it is bound at that attempt's first cloud call
+  and from then on every metered live call of the attempt (its review's too) counts
+  against it: one past its room is refused (cap ``approval``). When the attempt ends
+  ``superseded`` (killed by a restart, cancelled, set aside) the approval is not closed:
+  it opens again with ``limit_usd - spent_usd`` left and the ticket's next attempt
+  continues it with no new ``fman approve-spend``. It closes only when used up (a call
+  refused for want of room closes it, so a paused ticket never loops on scraps) or when
+  its attempt ends any other way (passed, failed checks, flagged). The cap stays hard:
+  spend under one approval never passes its ``limit_usd``, over all its attempts.
+  ``fman status`` shows a carried one ("approval #2: $4.59 of $5.00 left").
+  ``reopen_unspent_approvals`` judges every ended attempt's approval (the worker's
+  startup recovery calls it); the gates and ``resume_reason`` also judge a ticket's
+  approvals before they look for an open one, so a cancel mid-run is covered too. A
+  call still in flight in this process defers the judgement. Limit: a call the killed
+  process had sent whose cost never reached the store counts as $0 (at most one call:
+  an attempt's writer calls run one at a time).
 * **Per-attempt budget** (#58). One writer attempt (live calls with an ``attempt_id`` and
   no ``review_id``) may spend at most ``attempt_budget_usd`` on cloud models, and may
   send at most ``attempt_max_input_tokens_cloud`` / ``_local`` input tokens (by the
@@ -133,6 +154,7 @@ if TYPE_CHECKING:
     from collections.abc import Iterable, Iterator
 
     from foreman_inator.chat import ChatSession, Rung
+    from foreman_inator.metrics.queries import ChatStatus
     from foreman_inator.proxy.zai_quota import QuotaHit
 
 log = logging.getLogger(__name__)
@@ -302,6 +324,10 @@ class SpendSummary:
     open_approvals: int
     plans: tuple[PlanUse, ...] = ()
     credits: tuple[PlanCredits, ...] = ()  # #85: estimated Coding Plan credits
+    # #82: (ticket id, "approval #2: $4.59 of $5.00 left") per carried approval
+    approval_notes: tuple[tuple[int, str], ...] = ()
+    #: #71 (wave 21): chat vs ticket spend today and this month, against the chat sub-cap.
+    chat: ChatStatus | None = None
 
     def as_dict(self) -> dict[str, object]:
         out = asdict(self)
@@ -336,6 +362,10 @@ class SpendSummary:
                 line += f" (paused: z.ai code {c.paused.code}" + (
                     f", until {until:%Y-%m-%d %H:%M} UTC)" if until else ", until renewed)"
                 )
+        for ticket_id, note in self.approval_notes:
+            line += f"; ticket {ticket_id}: {note}"
+        if self.chat is not None:
+            line += "; " + self.chat.line()
         return line
 
 
@@ -346,6 +376,7 @@ class _Reservation:
     attempt_id: int | None
     chat: tuple[int, int] | None = None  # (chat session id, turn) of a chat call
     chat_grant: bool = False  # let through on the chat turn's approval
+    thrifty: int | None = None  # #82: attempt id whose thrifty approval holds this
 
 
 @dataclass
@@ -379,6 +410,18 @@ class _Grant:
     reserved_usd: float = 0.0
 
 
+@dataclass(frozen=True)
+class ApprovalOutcome:
+    """#82: what ``reopen_unspent_approvals`` decided for one used approval."""
+
+    approval_id: int
+    ticket_id: int
+    attempt_id: int | None
+    reopened: bool  # carried to the ticket's next attempt (False: closed)
+    spent_usd: float
+    left_usd: float
+
+
 @dataclass
 class _Who:
     ticket_id: int | None
@@ -390,6 +433,8 @@ class _Who:
 class _State:
     reservations: dict[tuple, deque[_Reservation]] = field(default_factory=dict)
     grants: dict[int, _Grant] = field(default_factory=dict)  # attempt_id -> grant
+    # #82: attempt_id -> its thrifty approval's room (None: the attempt has none)
+    thrifty: dict[int, _Grant | None] = field(default_factory=dict)
 
 
 # =========================================================================== Spend
@@ -424,7 +469,7 @@ class Spend:
             approval_usd = self.caps.daily_usd if self.caps.daily_usd > 0 else SpendCaps.daily_usd
         self.approval_usd = float(approval_usd)
         self.reservation_ttl = reservation_ttl
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()  # #82: _try_grant judges approvals under it
         self._state = _State()
         self._attempt_ticket: dict[int, int | None] = {}
         self._refusals_by_attempt: dict[int, Refusal] = {}
@@ -482,6 +527,7 @@ class Spend:
             while q and q[0].at < cutoff:
                 stale = q.popleft()
                 self._release_grant(stale)
+                self._release_thrifty(stale)
                 self._release_chat_grant(stale)
                 log.warning("spend: reservation of $%.4f expired unsettled", stale.amount)
             if not q:
@@ -666,6 +712,9 @@ class Spend:
             granted = False
             if refusal is not None and bucket == "live" and who.attempt_id is not None:
                 refusal, granted = self._try_grant(refusal, who, estimate)
+            thrifty = None
+            if refusal is None and not granted and bucket == "live" and who.attempt_id:
+                refusal, thrifty = self._thrifty_room(who, estimate, now)
             if refusal is not None:
                 refusal = _with_who(refusal, who, ep.name)
                 if who.attempt_id is not None:
@@ -675,7 +724,7 @@ class Spend:
                 log.info("spend: refused %s call (%s cap)", ep.name, refusal.cap)
                 return False
             key = self._key(ep, ctx, bucket)
-            res = _Reservation(estimate, now, who.attempt_id if granted else None)
+            res = _Reservation(estimate, now, who.attempt_id if granted else None, thrifty=thrifty)
             self._state.reservations.setdefault(key, deque()).append(res)
             return True
 
@@ -838,8 +887,10 @@ class Spend:
     def _try_grant(
         self, refusal: Refusal, who: _Who, estimate: float
     ) -> tuple[Refusal | None, bool]:
-        """Past the cap: let the call through on the attempt's approval grant, consuming
-        the ticket's open approval when the attempt has no grant or has used it up."""
+        """Past the cap: let the call through on the attempt's approval grant, using the
+        ticket's open approval (a carried one with what it has left, #82) when the
+        attempt has no grant or has used it up. A grant without room for the call is
+        closed, so the next pass asks the user."""
         assert who.attempt_id is not None and who.ticket_id is not None
         grant = self._state.grants.get(who.attempt_id)
         if grant is not None and _fits(
@@ -847,24 +898,92 @@ class Spend:
         ):
             grant.reserved_usd += estimate
             return None, True
+        if grant is not None:
+            self.store.settle_spend_approval(grant.approval_id)  # used up
         over_grant = replace(
             refusal,
             cap="approval",
-            cap_usd=self.approval_usd,
+            cap_usd=grant.limit_usd if grant else self.approval_usd,
             spent_usd=grant.spent_usd if grant else 0.0,
             reserved_usd=grant.reserved_usd if grant else 0.0,
             resets_at=None,
         )
-        if not _fits(0.0, estimate, self.approval_usd):
-            return over_grant, False  # one call bigger than a whole approval: never consume
+        self._judge_approvals(who.ticket_id)
         approval = self.store.open_spend_approval(who.ticket_id)
-        if approval is None or not self.store.consume_spend_approval(approval.id):
+        if approval is None:
             return (over_grant if grant is not None else refusal), False
-        log.info("spend: approval %s used for attempt %s", approval.id, who.attempt_id)
+        limit = _limit(approval, self.approval_usd)
+        spent = float(approval.spent_usd or 0.0)
+        if not _fits(spent, estimate, limit):
+            if spent <= _EPS:
+                return over_grant, False  # one call bigger than a whole approval: never consume
+            # #82: a carried approval without room for this call: close it, ask again
+            if self.store.consume_spend_approval(
+                approval.id, kind="grant", attempt_id=who.attempt_id, limit_usd=limit
+            ):
+                self.store.settle_spend_approval(approval.id)
+            return replace(over_grant, cap_usd=limit, spent_usd=spent, reserved_usd=0.0), False
+        if not self.store.consume_spend_approval(
+            approval.id, kind="grant", attempt_id=who.attempt_id, limit_usd=limit
+        ):
+            return (over_grant if grant is not None else refusal), False
+        log.info(
+            "spend: approval %s used for attempt %s ($%.2f of $%.2f left)",
+            approval.id,
+            who.attempt_id,
+            limit - spent,
+            limit,
+        )
         self._state.grants[who.attempt_id] = _Grant(
-            approval.id, who.ticket_id, self.approval_usd, reserved_usd=estimate
+            approval.id, who.ticket_id, limit, spent_usd=spent, reserved_usd=estimate
         )
         return None, True
+
+    def _thrifty_room(
+        self, who: _Who, estimate: float, now: datetime
+    ) -> tuple[Refusal | None, int | None]:
+        """#82: a call of an attempt holding a thrifty approval must fit what the
+        approval has left. (None, attempt id): reserved under it; (None, None): the
+        attempt holds none; (Refusal, None): no room, and the approval is closed."""
+        assert who.attempt_id is not None
+        if who.attempt_id not in self._state.thrifty:
+            self._state.thrifty[who.attempt_id] = self._bind_thrifty(who)
+        tg = self._state.thrifty[who.attempt_id]
+        if tg is None:
+            return None, None
+        if _fits(tg.spent_usd + tg.reserved_usd, estimate, tg.limit_usd):
+            tg.reserved_usd += estimate
+            return None, who.attempt_id
+        self.store.settle_spend_approval(tg.approval_id)  # used up: the next pass asks
+        refusal = Refusal(
+            "live", "approval", tg.limit_usd, tg.spent_usd, tg.reserved_usd, estimate, None, now
+        )
+        return refusal, None
+
+    def _bind_thrifty(self, who: _Who) -> _Grant | None:
+        """The thrifty approval the attempt's gate used, bound to it now (first call)."""
+        assert who.attempt_id is not None and who.ticket_id is not None
+        mine = [
+            a
+            for a in self.store.unsettled_spend_approvals(who.ticket_id)
+            if a.kind == "attempt" and a.attempt_id in (None, who.attempt_id)
+        ]
+        if not mine:
+            return None
+        ap = next((a for a in mine if a.attempt_id == who.attempt_id), mine[-1])
+        if ap.attempt_id is None:
+            self.store.bind_spend_approval(ap.id, who.attempt_id)
+        return _Grant(
+            ap.id, who.ticket_id, _limit(ap, self.approval_usd), float(ap.spent_usd or 0.0)
+        )
+
+    def _release_thrifty(self, res: _Reservation) -> _Grant | None:
+        if res.thrifty is None:
+            return None
+        tg = self._state.thrifty.get(res.thrifty)
+        if tg is not None:
+            tg.reserved_usd = max(0.0, tg.reserved_usd - res.amount)
+        return tg
 
     def _release_grant(self, res: _Reservation) -> _Grant | None:
         if res.attempt_id is None:
@@ -883,9 +1002,11 @@ class Spend:
             res = q.popleft() if q else None
             if q is not None and not q:
                 del self._state.reservations[key]
-            grant = self._release_grant(res) if res else None
-            if grant is not None:
-                grant.spent_usd += max(cost, 0.0)
+            for grant in (self._release_grant(res), self._release_thrifty(res)) if res else ():
+                if grant is not None:
+                    grant.spent_usd += max(cost, 0.0)
+                    if cost > 0:  # #82: kept with the approval, so a restart still knows it
+                        self.store.add_spend_approval_spend(grant.approval_id, cost)
             who = self._who(ctx)
         self.record(cost, bucket, model=ep.name, ticket_id=who.ticket_id, attempt_id=who.attempt_id)
 
@@ -1209,8 +1330,10 @@ class Spend:
                     break
         if refusal is None:
             return None
-        if ticket_id is not None and self.store.open_spend_approval(ticket_id) is not None:
-            return None
+        if ticket_id is not None:
+            self._judge_approvals(ticket_id)
+            if self.store.open_spend_approval(ticket_id) is not None:
+                return None
         return _with_who(refusal, _Who(ticket_id, None, None), None)
 
     def writer_gate(self, ticket_id: int, *, approval_required: bool = False) -> Refusal | None:
@@ -1221,11 +1344,14 @@ class Spend:
         if not approval_required:
             return self.blocked(ticket_id)
         capped = self.blocked(None)
+        self._judge_approvals(ticket_id)
         approval = self.store.open_spend_approval(ticket_id)
         if approval is None:
             now = self.now()
             return Refusal("live", "thrifty", 0.0, 0.0, 0.0, 0.0, None, now, ticket_id=ticket_id)
-        if capped is None and self.store.consume_spend_approval(approval.id):
+        if capped is None and self.store.consume_spend_approval(
+            approval.id, kind="attempt", limit_usd=_limit(approval, self.approval_usd)
+        ):
             log.info("spend: approval %s used for a thrifty cloud attempt", approval.id)
         return None
 
@@ -1239,13 +1365,21 @@ class Spend:
         if ticket.column in ("done", "dropped"):
             raise SpendError(f"ticket {ticket_id} is {ticket.column}; nothing to approve")
         existing = self.store.open_spend_approval(ticket_id)
-        return existing if existing is not None else self.store.approve_spend(ticket_id)
+        if existing is not None and existing.spent_usd <= _EPS:
+            return existing
+        if existing is not None:
+            # #82: a carried approval with part of it spent: the user asked for a new
+            # one, so close the leftover and give a fresh full approval (the leftover
+            # may be too small for the next call, which would flag the ticket again).
+            self.store.close_spend_approval(existing.id)
+        return self.store.approve_spend(ticket_id)
 
     def resume_reason(self, ticket: Ticket) -> Literal["approved", "cap_clear"] | None:
         """For a ticket paused at the cap: why it may run again now, or None to keep
         waiting. Tickets not flagged ``spend_cap`` return None."""
         if not (ticket.flag_reason or "").startswith(FLAG_SPEND_CAP):
             return None
+        self._judge_approvals(ticket.id)
         approval = self.store.open_spend_approval(ticket.id)
         if approval is not None:
             if (m := _PLAN_QUOTA_MODEL.match(ticket.flag_reason or "")) is not None:
@@ -1301,6 +1435,85 @@ class Spend:
             "If z.ai's dashboard shows quota left before then, run on the worker's Mac:\n\n"
             f"    fman approve-spend {ticket.id}"
         )
+
+    # ------------------------------------------------------------------ cut short (#82)
+
+    def reopen_unspent_approvals(
+        self, attempt_ids: Iterable[int] | None = None
+    ) -> list[ApprovalOutcome]:
+        """Judge used approvals whose attempt has ended: one cut short (``superseded``)
+        with room left opens again for the ticket's next attempt, keeping its spend; any
+        other is closed. ``attempt_ids``: only these attempts' tickets (the worker's
+        startup recovery passes the attempts it marked superseded); None: every ticket.
+        Approvals of a running (or not yet started) attempt wait."""
+        if attempt_ids is None:
+            tickets: set[int | None] = {None}
+        else:
+            tickets = set()
+            for aid in attempt_ids:
+                try:
+                    tickets.add(self.store.get_attempt(aid).ticket_id)
+                except NotFoundError:
+                    continue
+        out: list[ApprovalOutcome] = []
+        for tid in sorted(tickets, key=lambda t: -1 if t is None else t):
+            out.extend(self._judge_approvals(tid))
+        return out
+
+    def _judge_approvals(self, ticket_id: int | None) -> list[ApprovalOutcome]:
+        out: list[ApprovalOutcome] = []
+        for ap in self.store.unsettled_spend_approvals(ticket_id):
+            done = self._judge(ap)
+            if done is not None:
+                out.append(done)
+        return out
+
+    def _judge(self, ap: SpendApproval) -> ApprovalOutcome | None:
+        attempt_id = ap.attempt_id
+        if attempt_id is None and ap.consumed_at is not None:  # thrifty, no call made
+            att = self.store.first_attempt_since(ap.ticket_id, ap.consumed_at)
+            attempt_id = att.id if att is not None else None
+        if attempt_id is None:
+            return None  # its attempt has not started yet
+        try:
+            att = self.store.get_attempt(attempt_id)
+        except NotFoundError:
+            return None
+        if att.ended_at is None:
+            return None  # still running
+        with self._lock:
+            held = [self._state.grants.get(attempt_id), self._state.thrifty.get(attempt_id)]
+            if any(g is not None and g.reserved_usd > _EPS for g in held):
+                return None  # a call this process let through has not settled: judge later
+        ap = self.store.get_spend_approval(ap.id)  # its spend, as settled
+        limit = _limit(ap, self.approval_usd)
+        spent = float(ap.spent_usd or 0.0)
+        left = max(0.0, limit - spent)
+        carry = att.outcome == "superseded" and left > _EPS
+        if carry and not self.store.reopen_spend_approval(ap.id):
+            return None
+        if not carry:
+            self.store.settle_spend_approval(ap.id, attempt_id=attempt_id)
+        with self._lock:
+            self._state.grants.pop(attempt_id, None)
+            self._state.thrifty.pop(attempt_id, None)
+        if carry:
+            log.info(
+                "spend: approval %s carried on: attempt %s was cut short; $%.2f of $%.2f left",
+                ap.id,
+                attempt_id,
+                left,
+                limit,
+            )
+        kept = left if carry else 0.0
+        return ApprovalOutcome(ap.id, ap.ticket_id, attempt_id, carry, spent, kept)
+
+    def approval_note(self, ticket_id: int) -> str | None:
+        """#82: "approval #2: $4.59 of $5.00 left" for the ticket's carried approval."""
+        for ap in self.store.carried_spend_approvals():
+            if ap.ticket_id == ticket_id:
+                return _carried_text(ap, self.approval_usd)
+        return None
 
     def approval_comment(self, ticket: Ticket, refusal: Refusal) -> str:
         """The issue comment asking for approval. Amounts and commands only."""
@@ -1364,6 +1577,15 @@ class Spend:
         open_approvals = self.store.query(
             "SELECT COUNT(*) AS n FROM spend_approvals WHERE consumed_at IS NULL"
         )[0]["n"]
+        notes = tuple(
+            (a.ticket_id, _carried_text(a, self.approval_usd))
+            for a in self.store.carried_spend_approvals()
+        )
+        from foreman_inator.metrics import queries  # lazy: metrics imports spend's peers
+
+        chat = queries.chat_status(
+            self.store, day=day, month=month, chat_monthly_usd=self.chat_monthly_usd
+        )
         return SpendSummary(
             now=now,
             day_start=day[0],
@@ -1386,7 +1608,20 @@ class Spend:
             open_approvals=int(open_approvals),
             plans=plans,
             credits=credits,
+            approval_notes=notes,
+            chat=chat,
         )
+
+
+def _limit(ap: SpendApproval, default: float) -> float:
+    """#82: an approval's room: fixed at its first use, else the current approval cap."""
+    return float(ap.limit_usd) if ap.limit_usd is not None else default
+
+
+def _carried_text(ap: SpendApproval, default: float) -> str:
+    limit = _limit(ap, default)
+    left = max(0.0, limit - float(ap.spent_usd or 0.0))
+    return f"approval #{ap.id}: ${left:.2f} of ${limit:.2f} left"
 
 
 def _fits(used: float, estimate: float, cap: float) -> bool:
@@ -1445,6 +1680,7 @@ def _with_who(refusal: Refusal, who: _Who, model: str | None) -> Refusal:
 
 
 __all__ = [
+    "ApprovalOutcome",
     "BUCKETS",
     "DEFAULT_CHAT_MONTHLY_USD",
     "DEFAULT_CHAT_TURN_BUDGET_USD",

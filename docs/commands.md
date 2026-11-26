@@ -11,6 +11,7 @@ current text. `fman --version` prints the version.
 | [`fman run`](#fman-run) | Run the worker: poll GitHub, work labeled issues, open PRs. |
 | [`fman status`](#fman-status) | Tickets by column with their current attempt, flags and PR numbers. |
 | [`fman metrics`](#fman-metrics) | Serve the metrics page on 127.0.0.1. |
+| [`fman chat`](#fman-chat) | Interactive coding sessions through the same tiers, caps and sandbox as tickets. |
 | [`fman approve-spend`](#fman-approve-spend) | Allow one more cloud attempt (and its review) of a ticket past the spend caps. |
 | [`fman repo add`](#fman-repo-add) | Add repos to the list the worker polls. |
 | [`fman repo remove`](#fman-repo-remove) | Take repos out of the list the worker polls. |
@@ -79,6 +80,13 @@ then the repo count, spend and sandbox lines, the Ollama line (`Ollama: N loaded
 installed plugin (or `Plugins: none`). Read-only; works with the worker stopped.
 What each line means: [setup.md](setup.md#6-reading-fman-status).
 
+The spend line ends with the chat figure: `chat $x today, $y of $z this month
+(tickets $a today, $b this month)`, with `[chat sub-cap reached]` once chat has
+used `chat_monthly_usd`. A ticket whose spend approval was cut short (a restart
+or cancel mid-attempt) shows `SPEND: approval #N: $left of $limit left (carried
+to the next attempt)` under its line: the worker's startup recovery carries an
+approval with room left to the ticket's next attempt instead of asking again.
+
 | Option | Meaning |
 | --- | --- |
 | `--closed <n>` | How many done and dropped tickets to list. Default 5. |
@@ -97,13 +105,65 @@ queue, and a **Retry** button on each flagged ticket that does what
 `config.load` and the running worker picks it up on its next poll, except the
 fields listed under [configuration.md](configuration.md)) and `/tiers` (models
 and providers per tier, reviewer order, a Test button per endpoint; API keys go
-to the Keychain and are never shown). Every page lists all the others in its
-nav. Buttons are the only writes, each behind a form token and a loopback
-check.
+to the Keychain and are never shown) and `/chat` (start, follow and finish chat
+sessions; see [`fman chat`](#fman-chat)). The main page has a "Spend: tickets ·
+chat · experiments" block for the range, with chat's share of this month against
+`chat_monthly_usd`. Every page lists all the others in its nav. Buttons are the
+only writes, each behind a form token and a loopback check.
+
+`/chat` is the one page with a script: a small inline one (per-response nonce,
+strict `Content-Security-Policy`) that streams the reply over server-sent events
+(`/chat/<id>/events`) and inserts model text as plain text. Every button is a
+plain form too, so the page works with JavaScript off. The page's chat session
+lives in the `fman metrics` process: stopping the page ends it (locks released,
+worktree kept; `fman chat resume <id>` or the page continues it).
 
 | Option | Meaning |
 | --- | --- |
 | `--port <port>` | Local port. Default 8642. |
+
+## `fman chat`
+
+```bash
+fman chat <owner/name> [--tier N] [--base BRANCH]
+fman chat list
+fman chat resume <id>
+fman chat pr <id> [--title TITLE]
+fman chat discard <id> [--yes]
+```
+
+An interactive coding session in its own worktree on branch `fman/chat/<id>`,
+cut from the watched repo's base branch (never a ticket's `fman/` branch). It
+runs OpenCode through the same model ladder, proxy, spend caps and sandbox as a
+ticket, and starts on tier 1 (local) unless `--tier` or `chat_start_tier` says
+otherwise. Each line you type is one message (one turn); lines starting with `/`
+are commands:
+
+| Command | Meaning |
+| --- | --- |
+| `/tier up`, `/tier down`, `/tier N` | Move the session's tier; the next message uses it. |
+| `/model`, `/status`, `/cost` | The current model, the session's state, and `session $x · chat this month $y of $z · month $m of $M`. |
+| `/approve` | After a cap refusal: allow the refused message once, up to one approval's worth. |
+| `/verify` | Run the repo's verify command in the verify sandbox. |
+| `/pr [title]` | Verify (a failure leads the PR body, it does not block), push the branch and open a **draft** PR (no AI review; nothing merges). |
+| `/discard` | Delete the worktree and branch; nothing is pushed (asks to confirm). |
+| `/abort` | Stop the running turn (Ctrl-C in the terminal does the same). |
+| `/help`, `/quit` | Help; end the session here (worktree kept). |
+
+Spend: chat counts toward `monthly_usd` and at most `chat_monthly_usd` of it may
+be chat; one message may spend at most `chat_turn_budget_usd`. A chat turn goes
+ahead of queued ticket calls for the local GPU; if it would wait more than
+`chat_local_wait_seconds`, that turn uses the first cloud model at or above the
+session's tier (never for a local-only repo) and says so. Chat sessions take
+file locks on the files they edit, so tickets wait instead of conflicting;
+`/pr`, `/discard` and the end of the session release them. One open session at
+a time (`chat_max_sessions`). Chats never feed the router or replays.
+
+`fman chat list` shows every session with its state, tier, model and cost;
+`resume` reopens an ended one in its kept worktree with its history; `pr` and
+`discard` do what `/pr` and `/discard` do. The `/chat` page of
+[`fman metrics`](#fman-metrics) is the same engine in the browser. Whatever you
+paste goes to the model and the session's recording on this Mac.
 
 ## `fman approve-spend`
 
@@ -208,8 +268,8 @@ reviews, replays with a cloud model and the failure labeler leave it out.
 fman repo set-chat-network <owner/name> on|off
 ```
 
-Chat sessions (#71; the chat itself is not usable yet) run sandboxed with no
-network by default. `on` gives that repo's chat sandbox the same outbound policy
+Chat sessions ([`fman chat`](#fman-chat)) run sandboxed with no network by
+default. `on` gives that repo's chat sandbox the same outbound policy
 as a first-attempt dependency install (ports 443/80), never your credentials or
 Keychain. Tickets are unaffected. `off` (the default) closes it again. The
 `/settings` page has the same switch per repo.

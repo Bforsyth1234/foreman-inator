@@ -25,6 +25,7 @@ and live judgment). All read-only, escaped, no JavaScript, behind the same loopb
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import html
 import ipaddress
 import logging
@@ -32,7 +33,7 @@ import socket
 import sqlite3
 import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import asdict, is_dataclass, replace
 from datetime import date
 from pathlib import Path
@@ -41,6 +42,7 @@ from urllib.parse import urlencode
 
 import uvicorn
 from starlette.applications import Starlette
+from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
 from starlette.routing import BaseRoute, Route
@@ -573,6 +575,43 @@ def _recent(rep: q.Report) -> str:
     )
 
 
+def _spend_block(rep: q.Report) -> str:
+    """#60/#71: ledger spend in the range split tickets · chat · experiments, chat's
+    activity, and this month's chat sub-cap (option C: chat counts toward
+    ``monthly_usd``, at most ``chat_monthly_usd`` of it)."""
+    sp = rep.spend
+    if sp is None:
+        return ""
+    sub = sp.chat_subcap
+    share = f" ({sub.share * 100:.0f}%)" if sub.share is not None else ""
+    statuses = ", ".join(f"{n} {k}" for k, n in sorted(sp.chat_turns_by_status.items()))
+    rows = (
+        ("Tickets (live)", format_cost(sp.tickets_usd), ""),
+        (
+            "Chat (live)",
+            format_cost(sp.chat_usd),
+            f"{sp.chat_sessions} session(s), {sp.chat_turns} message(s)"
+            + (f": {statuses}" if statuses else "")
+            + f"; {sp.chat_fallback_turns} used the cloud fallback (local slot busy)",
+        ),
+        ("Experiments", format_cost(sp.experiments_usd), ""),
+        ("Live total (what the daily and monthly caps count)", format_cost(sp.live_usd), ""),
+        (
+            "Chat sub-cap this month",
+            f"{format_cost(sub.used_usd)} of {format_cost(sub.cap_usd)}{share}",
+            f"{format_cost(sub.remaining_usd)} left",
+        ),
+    )
+    body = "".join(
+        f'<tr><td>{e(a)}</td><td>{e(b)}</td><td class="muted">{e(c)}</td></tr>' for a, b, c in rows
+    )
+    return (
+        '<section class="card"><h2>Spend: tickets · chat · experiments</h2>'
+        '<div class="scroll"><table><tr><th>Who</th><th>Spend in range</th><th>Notes</th>'
+        f"</tr>{body}</table></div></section>"
+    )
+
+
 def render_report(
     rep: q.Report,
     opts: q.FilterOptions,
@@ -596,6 +635,7 @@ def render_report(
         + _form(rep.filter, rep.bucket, opts)
         + headline
         + (render_resources_block(resources) if resources is not None else "")
+        + _spend_block(rep)
         + "<h2>Writers</h2>"
         + _writer_table(rep)
         + "<h2>AI reviewers</h2>"
@@ -634,15 +674,28 @@ def metrics_routes(
     *,
     nav: Sequence[tuple[str, str]] = (),
     resources_path: str | Path | None = None,
+    config: Any = None,
 ) -> list[BaseRoute]:
     """``GET /`` and ``GET /api/metrics``. With ``resources_path`` the page shows the
-    short resource block (#60) read from that snapshot file."""
+    short resource block (#60) read from that snapshot file. ``config`` (default
+    ``Config()``) gives the spend block its chat sub-cap and the caps' local month."""
+    from foreman_inator.config import Config
+    from foreman_inator.spend import Spend
+
+    cfg = config if config is not None else Config()
 
     def load(request: Request) -> tuple[q.Report, q.FilterOptions]:
         filt, bucket = parse_filter(request.query_params)
         store = open_store(store_path)
         try:
-            return q.report(store, filt, bucket=bucket), q.filter_options(store)  # type: ignore[arg-type]
+            rep = q.report(
+                store,
+                filt,
+                bucket=bucket,  # type: ignore[arg-type]
+                chat_monthly_usd=cfg.spend_caps.chat_monthly_usd,
+                month=Spend(store, cfg).month_window(),  # the month the caps count
+            )
+            return rep, q.filter_options(store)
         finally:
             store.close()
 
@@ -676,11 +729,27 @@ def create_app(
     extra_routes: Sequence[BaseRoute] = (),
     nav: Sequence[tuple[str, str]] = (),
     resources_path: str | Path | None = None,
+    config: Any = None,
+    on_shutdown: Sequence[Callable[[], Any]] = (),
 ) -> ASGIApp:
     """The metrics app. ``extra_routes`` and ``nav`` are for later pages (#29);
-    ``resources_path`` adds the resource block to the main page (#60)."""
-    routes = metrics_routes(store_path, nav=nav, resources_path=resources_path)
-    app = Starlette(routes=[*routes, *extra_routes])
+    ``resources_path`` adds the resource block to the main page (#60); ``config`` is for
+    the spend block's chat sub-cap; ``on_shutdown`` runs when the server stops (the chat
+    manager's ``shutdown``, wave 21)."""
+    routes = metrics_routes(store_path, nav=nav, resources_path=resources_path, config=config)
+
+    @contextlib.asynccontextmanager
+    async def lifespan(_app: Starlette) -> AsyncIterator[None]:
+        try:
+            yield
+        finally:
+            for fn in on_shutdown:
+                try:
+                    await run_in_threadpool(fn)
+                except Exception:  # noqa: BLE001 - one failing hook must not skip the rest
+                    log.exception("metrics shutdown hook failed")
+
+    app = Starlette(routes=[*routes, *extra_routes], lifespan=lifespan)
     return LoopbackHostOnly(app)
 
 
@@ -868,15 +937,22 @@ def full_app(
     traces_dir: str | Path | None,
     config: Any = None,
     resources_path: str | Path | None = None,
+    chat_manager: ChatManagerFactory | None = None,
 ) -> ASGIApp:
     """The page ``fman metrics`` serves: the metrics page, the trace view (#28), the
     failure-step and experiment pages and ``/resources`` (#60, from ``resources_path``,
-    default ``<home>/run/resources.json``), ``/settings`` (#73), ``/tiers`` (#74) and
-    ``/activity`` (#76) with its Retry button (#79), all behind the loopback guard and all
-    sharing one nav."""
+    default ``<home>/run/resources.json``), ``/settings`` (#73), ``/tiers`` (#74),
+    ``/activity`` (#76) with its Retry button (#79) and ``/chat`` (#75, wave 21), all
+    behind the loopback guard and all sharing one nav.
+
+    ``/chat``'s one ``ChatManager`` is built on first use by ``chat_manager()`` (a
+    context manager; default ``chat_cli.default_manager(store_path)``, the same builder
+    ``fman chat`` uses, over a writable store) and shut down (locks released, worktrees
+    kept) when the app shuts down."""
     from foreman_inator.config import Config
     from foreman_inator.metrics import (
         activity_ui,
+        chat_page,
         experiments_ui,
         settings_ui,
         tiers_ui,
@@ -891,7 +967,9 @@ def full_app(
         activity_ui.NAV_ENTRY,
         settings_ui.NAV_ENTRY,
         tiers_ui.NAV_ENTRY,
+        chat_page.NAV_ENTRY,  # wave 21: #75
     )
+    chats = _ChatHolder(chat_manager or _default_chat_manager(store_path))
     res_path = resources_path if resources_path is not None else res.default_path()
     ladder = escalation.build_ladder(cfg.models)
     plain = trace_view.store_rows_for(
@@ -945,8 +1023,52 @@ def full_app(
             traces_dir=traces_dir,
             api_factory=retry_github,
         ),
+        # #75 (wave 21): the chat page; its manager is built on first use (FormGuard POSTs).
+        *chat_page.routes(store_path, manager_factory=chats.get, nav=nav),
     ]  # fmt: skip
-    return create_app(store_path, extra_routes=routes, nav=nav, resources_path=res_path)
+    return create_app(
+        store_path, extra_routes=routes, nav=nav, resources_path=res_path, config=cfg,
+        on_shutdown=(chats.close,),
+    )  # fmt: skip
+
+
+#: Builds the ``/chat`` page's ``ChatManager`` as a context manager (exit = shutdown).
+ChatManagerFactory = Callable[[], contextlib.AbstractContextManager[Any]]
+
+
+def _default_chat_manager(store_path: str | Path) -> ChatManagerFactory:
+    def build() -> contextlib.AbstractContextManager[Any]:
+        from foreman_inator.chat_cli import default_manager
+
+        return default_manager(store_path)
+
+    return build
+
+
+class _ChatHolder:
+    """The metrics process's one chat manager: entered on first ``get``, exited (its
+    ``shutdown``) by ``close`` when the app shuts down. A failed build is not kept, so
+    the next request tries again (the page shows "chat is unavailable" meanwhile)."""
+
+    def __init__(self, factory: ChatManagerFactory) -> None:
+        self._factory = factory
+        self._stack: contextlib.ExitStack | None = None
+        self._manager: Any = None
+        self._lock = threading.Lock()
+
+    def get(self) -> Any:
+        with self._lock:
+            if self._stack is None:
+                stack = contextlib.ExitStack()
+                self._manager = stack.enter_context(self._factory())
+                self._stack = stack
+            return self._manager
+
+    def close(self) -> None:
+        with self._lock:
+            stack, self._stack, self._manager = self._stack, None, None
+        if stack is not None:
+            stack.close()
 
 
 def _per_request_config(startup: Any) -> Any:
@@ -1028,7 +1150,7 @@ class MetricsServer:
         cfg = uvicorn.Config(
             self.app,
             log_level="warning",
-            lifespan="off",
+            lifespan="on",  # wave 21: the app's shutdown ends the chat manager
             access_log=False,
             timeout_graceful_shutdown=2,
         )

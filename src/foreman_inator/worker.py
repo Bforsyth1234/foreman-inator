@@ -307,6 +307,9 @@ class Worker(
                     self.store.finish_attempt(a.id, "superseded")
                     fixed.append(a.id)
                     log.info("ticket %d: attempt %d was interrupted; marked superseded", t.id, a.id)
+        # #82 (GH #80): an approval those attempts were using carries over to the
+        # ticket's next attempt with what it has left; a spent one is closed.
+        self.spend.reopen_unspent_approvals(fixed)
         swept = self.locks.sweep()
         if swept:
             log.info("swept %d stale file lock(s)", swept)

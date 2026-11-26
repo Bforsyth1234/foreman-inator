@@ -38,6 +38,15 @@ local tier 2 (see [docs/setup.md](docs/setup.md#keeping-tier-2-local)). A
 cloud tier 2 attempt costs a few cents, which is cheaper in time than a slow
 local attempt that escalates anyway.
 
+## Chat sessions
+
+For work you want to steer yourself, `fman chat <owner/name>` (or the `/chat`
+page of `fman metrics`) opens an interactive coding session in its own
+worktree, through the same tiers, spend caps and sandbox as a ticket. It starts
+on the local tier 1, `/tier up` moves it to a stronger model, its spend shows
+next to ticket spend in `fman status`, and `/pr` opens a draft PR (nothing
+merges). See [docs/commands.md](docs/commands.md#fman-chat).
+
 ## Install and first run
 
 You need macOS, git 2.31 or newer, [uv](https://docs.astral.sh/uv/),
@@ -98,7 +107,7 @@ review, is [docs/setup.md](docs/setup.md).
 - [docs/commands.md](docs/commands.md): every `fman` command and option
 - [docs/publishing.md](docs/publishing.md): letting other people use it (their own App, or `fman setup --public`)
 - [docs/releasing.md](docs/releasing.md): how a release is cut; [docs/homebrew.md](docs/homebrew.md): the Homebrew tap (`brew install` once the tap is live)
-- [docs/chat-design.md](docs/chat-design.md): what's next: the chat feature's design (not built yet)
+- [docs/chat-design.md](docs/chat-design.md): the chat feature's design and decisions (built; live checks pending)
 - [SPEC.md](SPEC.md): the full design; [DONE.md](DONE.md): what was built and where it differs
 
 This is a personal project with no promised support. It is MIT licensed.

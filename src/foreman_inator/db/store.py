@@ -326,6 +326,15 @@ class SpendApproval:
     ticket_id: int
     approved_at: datetime
     consumed_at: datetime | None
+    # migration 015 (#82): the attempt using it, how ('attempt': the thrifty writer gate;
+    # 'grant': an over-cap grant; None: neither, never carried), its room, the spend
+    # under it so far (every attempt that carried it), when it closed, times carried on.
+    attempt_id: int | None = None
+    kind: str | None = None
+    limit_usd: float | None = None
+    spent_usd: float = 0.0
+    settled_at: datetime | None = None
+    reopened: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -1676,14 +1685,114 @@ class Store:
         )
         return _row_to(SpendApproval, row) if row else None
 
-    def consume_spend_approval(self, approval_id: int) -> bool:
-        """Use an approval once. False if it was already consumed or does not exist."""
+    def consume_spend_approval(
+        self,
+        approval_id: int,
+        *,
+        kind: str | None = None,
+        attempt_id: int | None = None,
+        limit_usd: float | None = None,
+    ) -> bool:
+        """Use an approval once. False if it was already consumed or does not exist.
+        ``kind`` / ``attempt_id`` / ``limit_usd`` (migration 015, #82): how, by which
+        attempt, and its room (set at its first use only; a carried approval keeps its
+        room and its spend). Only an approval with a ``kind`` is carried."""
+        sql = "UPDATE spend_approvals SET consumed_at = ?"
+        params: list[Any] = [_ts(self.now())]
+        if kind is not None:  # only then: a store migrated part-way (before 015) has no column
+            sql += ", kind = ?, attempt_id = ?, limit_usd = COALESCE(limit_usd, ?)"
+            params += [kind, attempt_id, limit_usd]
+        with self.transaction() as conn:
+            sql += " WHERE id = ? AND consumed_at IS NULL"
+            cur = conn.execute(sql, [*params, approval_id])
+            return cur.rowcount == 1
+
+    def get_spend_approval(self, approval_id: int) -> SpendApproval:
+        row = self._one("SELECT * FROM spend_approvals WHERE id = ?", (approval_id,))
+        if row is None:
+            raise NotFoundError(f"no spend approval {approval_id}")
+        return _row_to(SpendApproval, row)
+
+    def add_spend_approval_spend(self, approval_id: int, cost_usd: float) -> None:
+        """#82: cloud spend under an approval, kept with it (a restart still knows it)."""
+        with self.transaction() as conn:
+            conn.execute(
+                "UPDATE spend_approvals SET spent_usd = spent_usd + ? WHERE id = ?",
+                (max(float(cost_usd), 0.0), approval_id),
+            )
+
+    def bind_spend_approval(self, approval_id: int, attempt_id: int) -> None:
+        """#82: a thrifty approval's attempt made its first cloud call."""
+        with self.transaction() as conn:
+            conn.execute(
+                "UPDATE spend_approvals SET attempt_id = ? WHERE id = ?", (attempt_id, approval_id)
+            )
+
+    def unsettled_spend_approvals(self, ticket_id: int | None = None) -> list[SpendApproval]:
+        """#82: used approvals (with a ``kind``) not closed yet."""
+        sql = (
+            "SELECT * FROM spend_approvals WHERE consumed_at IS NOT NULL"
+            " AND kind IS NOT NULL AND settled_at IS NULL"
+        )
+        params: list[Any] = []
+        if ticket_id is not None:
+            sql += " AND ticket_id = ?"
+            params.append(ticket_id)
+        return [_row_to(SpendApproval, r) for r in self.query(sql + " ORDER BY id", params)]
+
+    def first_attempt_since(self, ticket_id: int, at: datetime) -> Attempt | None:
+        """The ticket's first attempt started at or after ``at`` (lowest id)."""
+        row = self._one(
+            "SELECT * FROM attempts WHERE ticket_id = ? AND started_at >= ? ORDER BY id LIMIT 1",
+            (ticket_id, _ts(at)),
+        )
+        return _row_to(Attempt, row) if row else None
+
+    def settle_spend_approval(self, approval_id: int, *, attempt_id: int | None = None) -> bool:
+        """#82: close a used approval (used up, or its attempt finished normally)."""
         with self.transaction() as conn:
             cur = conn.execute(
-                "UPDATE spend_approvals SET consumed_at = ? WHERE id = ? AND consumed_at IS NULL",
-                (_ts(self.now()), approval_id),
+                "UPDATE spend_approvals SET settled_at = ?, attempt_id = COALESCE(?, attempt_id)"
+                " WHERE id = ? AND consumed_at IS NOT NULL AND settled_at IS NULL",
+                (_ts(self.now()), attempt_id, approval_id),
             )
             return cur.rowcount == 1
+
+    def close_spend_approval(self, approval_id: int) -> bool:
+        """#82: close an approval whether or not it is in use (a carried one the user
+        replaces with a fresh approval). False if it was already closed."""
+        with self.transaction() as conn:
+            now = _ts(self.now())
+            cur = conn.execute(
+                "UPDATE spend_approvals SET consumed_at = COALESCE(consumed_at, ?),"
+                " settled_at = ? WHERE id = ? AND settled_at IS NULL",
+                (now, now, approval_id),
+            )
+            return cur.rowcount == 1
+
+    def reopen_spend_approval(self, approval_id: int) -> bool:
+        """#82: its attempt was cut short with room left: open again for the ticket's
+        next attempt, keeping its room and its spend. False if closed meanwhile."""
+        with self.transaction() as conn:
+            cur = conn.execute(
+                "UPDATE spend_approvals SET consumed_at = NULL, kind = NULL, attempt_id = NULL,"
+                " reopened = reopened + 1"
+                " WHERE id = ? AND consumed_at IS NOT NULL AND settled_at IS NULL",
+                (approval_id,),
+            )
+            return cur.rowcount == 1
+
+    def carried_spend_approvals(self) -> list[SpendApproval]:
+        """#82: approvals of open tickets, not closed, with spend under them already."""
+        marks = ", ".join("?" for _ in OPEN_COLUMNS)
+        rows = self.query(
+            "SELECT a.* FROM spend_approvals a JOIN tickets t ON t.id = a.ticket_id"
+            f' WHERE a.settled_at IS NULL AND a.spent_usd > 0 AND t."column" IN ({marks})'
+            " AND (a.consumed_at IS NULL OR a.kind IS NOT NULL)"
+            " ORDER BY a.ticket_id, a.id",
+            list(OPEN_COLUMNS),
+        )
+        return [_row_to(SpendApproval, r) for r in rows]
 
     # -- file locks --
 

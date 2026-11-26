@@ -1,9 +1,10 @@
 # Chat sessions: design (todo #71 / GH #60, page todo #75 / GH #64)
 
-Status: **foundations built** (wave 19: store, proxy, OpenCode chat server, spend, locks,
-config keys; all inert until a chat session exists). No chat engine or front end yet. `src/foreman_inator/chat.py`
-holds the types, the settled pure helpers and the `ChatManager` signatures (they raise
-`NotImplementedError`). The open questions at the end need the user before wave C2 starts.
+Status: **built** (waves 19-21: foundations, the `ChatManager` engine, `fman chat`, the
+`/chat` page, chat spend in `fman status` and on the metrics page, and the wave C4 wiring,
+folded into wave 21). Waiting on the live checks at the end of section 14. The user's
+answers to the open questions are under "Decisions (user, 2026-11-25)" and override
+any earlier recommendation here.
 
 ## Goal
 
