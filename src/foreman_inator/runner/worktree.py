@@ -4,6 +4,7 @@ On-disk layout, under the worktrees root (normally ``~/.foreman-inator/worktrees
 
     <root>/<owner>/<repo>/.mirror                 bare clone; remote refs in refs/remotes/origin/*
     <root>/<owner>/<repo>/issue-<n>-a<attempt>    worktree on branch fman/issue-<n>/a<attempt>
+    <root>/<owner>/<repo>/issue-<n>-b-a<attempt>  ab:pair side B (#16): fman/issue-<n>-b/a<attempt>
     <root>/<owner>/<repo>/scratch-<name>          scratch worktree at any commit, never pushes
     <root>/<owner>/<repo>/chat-<id>               chat session worktree on fman/chat/<id> (#71)
     <root>/<owner>/<repo>/.mirror.lock            cross-process lock around mirror changes
@@ -61,6 +62,10 @@ LOCAL_TIMEOUT = 120.0
 
 _REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+#: ab:pair (#16): side A keeps the unpaired names; side B adds ``-b`` after the issue number.
+PAIR_SIDES = ("a", "b")
+_FMAN_BRANCH_RE = re.compile(r"^fman/issue-([0-9]{1,18})(-b)?/(?:a([0-9]{1,18})$)?")
+_ATTEMPT_DIR_RE = re.compile(r"^issue-([0-9]{1,18})(-b)?-a([0-9]{1,18})$")
 # Inherited variables that would point git at another repo or inject config.
 _SCRUBBED_ENV = (
     "GIT_DIR",
@@ -118,11 +123,52 @@ class DiffStats:
         return self.insertions + self.deletions
 
 
-def branch_name(issue: int, attempt: int) -> str:
-    """The branch for one attempt: ``fman/issue-<n>/a<attempt>``."""
+def _side_tag(side: str | None) -> str:
+    """``""`` for an unpaired ticket or pair side A, ``"-b"`` for side B (#16)."""
+    if side is None or side == "a":
+        return ""
+    if side == "b":
+        return "-b"
+    raise ValueError(f"pair side must be None, 'a' or 'b', got {side!r}")
+
+
+def branch_name(issue: int, attempt: int, side: str | None = None) -> str:
+    """The branch for one attempt: ``fman/issue-<n>/a<attempt>``; ab:pair side ``"b"``
+    (#16) gets ``fman/issue-<n>-b/a<attempt>`` (side ``"a"`` keeps the unpaired name)."""
+    tag = _side_tag(side)
     if issue < 1 or attempt < 1:
         raise ValueError("issue and attempt must be positive")
-    return f"{BRANCH_PREFIX}issue-{issue}/a{attempt}"
+    return f"{BRANCH_PREFIX}issue-{issue}{tag}/a{attempt}"
+
+
+def attempt_dir_name(issue: int, attempt: int, side: str | None = None) -> str:
+    """The worktree directory for one attempt: ``issue-<n>-a<k>`` (side B: ``issue-<n>-b-a<k>``)."""
+    tag = _side_tag(side)
+    if issue < 1 or attempt < 1:
+        raise ValueError("issue and attempt must be positive")
+    return f"issue-{issue}{tag}-a{attempt}"
+
+
+def parse_fman_branch(name: str) -> tuple[int, str | None, int | None] | None:
+    """``(issue, side, attempt)`` for a worker issue branch, else None (#16).
+
+    ``fman/issue-<n>/a<k>`` -> ``(n, None, k)``; ``fman/issue-<n>-b/a<k>`` -> ``(n, "b", k)``.
+    Any other ``fman/issue-<n>[-b]/...`` tail gives ``attempt`` None, so a head branch is
+    still tied to its issue (as ``sweep`` always did). Chat and other branches give None."""
+    m = _FMAN_BRANCH_RE.match(name or "")
+    if m is None:
+        return None
+    attempt = int(m.group(3)) if m.group(3) else None
+    return int(m.group(1)), ("b" if m.group(2) else None), attempt
+
+
+def parse_attempt_dir(name: str) -> tuple[int, str | None, int] | None:
+    """``(issue, side, attempt)`` for a worktree directory name from :func:`attempt_dir_name`,
+    else None (scratch, chat, mirror)."""
+    m = _ATTEMPT_DIR_RE.match(name or "")
+    if m is None:
+        return None
+    return int(m.group(1)), ("b" if m.group(2) else None), int(m.group(3))
 
 
 def chat_branch_name(session_id: int) -> str:
@@ -559,8 +605,8 @@ class RepoMirror:
 
     # -- worktrees --------------------------------------------------------------
 
-    def attempt_path(self, issue: int, attempt: int) -> Path:
-        return self.repo_dir / f"issue-{issue}-a{attempt}"
+    def attempt_path(self, issue: int, attempt: int, *, side: str | None = None) -> Path:
+        return self.repo_dir / attempt_dir_name(issue, attempt, side)
 
     @_locked
     def create(
@@ -572,19 +618,21 @@ class RepoMirror:
         token: str | None = None,
         fetch: bool = True,
         start_point: str | None = None,
+        side: str | None = None,
     ) -> Worktree:
-        """A fresh worktree on ``fman/issue-<n>/a<attempt>`` from ``origin/<base_branch>``.
+        """A fresh worktree on ``fman/issue-<n>/a<attempt>`` from ``origin/<base_branch>``
+        (ab:pair ``side="b"``: ``fman/issue-<n>-b/a<attempt>``, #16).
 
         ``start_point`` (a commit or ``origin/fman/...``) starts the branch from earlier
         work instead, while diffs stay measured against the base branch's commit. A stale
         worktree or branch for the same attempt is replaced.
         """
-        branch = check_branch(branch_name(issue, attempt))
+        branch = check_branch(branch_name(issue, attempt, side))
         if fetch or not self._mirror_ok():
             self.ensure(token)
         base_sha = self.resolve(base_branch)
         start_sha = self.resolve(start_point) if start_point else base_sha
-        path = self.attempt_path(issue, attempt)
+        path = self.attempt_path(issue, attempt, side=side)
         self._remove_path(path)
         self._delete_local_branch(branch)
         _git(
@@ -604,6 +652,7 @@ class RepoMirror:
         previous: str,
         token: str | None = None,
         fetch: bool = True,
+        side: str | None = None,
     ) -> Replay:
         """#43: a fresh worktree for ``attempt`` on ``origin/<base_branch>`` (the moved base)
         with the change of ``previous`` (the PR head: a commit or ``origin/fman/...``)
@@ -618,7 +667,7 @@ class RepoMirror:
         if fetch or not self._mirror_ok():
             self.ensure(token)
         prev_sha = self.resolve(previous)
-        wt = self.create(base_branch, issue, attempt, token=token, fetch=False)
+        wt = self.create(base_branch, issue, attempt, token=token, fetch=False, side=side)
         ident = self.identity
         env = {
             "GIT_AUTHOR_NAME": ident.name,
@@ -656,13 +705,13 @@ class RepoMirror:
         _write_base(path, sha)
         return Worktree(self, path, branch, sha, can_push=False)
 
-    def open(self, issue: int, attempt: int) -> Worktree:
+    def open(self, issue: int, attempt: int, *, side: str | None = None) -> Worktree:
         """Reattach to an existing attempt worktree (after a worker restart)."""
-        path = self.attempt_path(issue, attempt)
+        path = self.attempt_path(issue, attempt, side=side)
         base = _read_base(path)
         if base is None:
             raise WorktreeError(f"no worktree for issue {issue} attempt {attempt}")
-        return Worktree(self, path, branch_name(issue, attempt), base, can_push=True)
+        return Worktree(self, path, branch_name(issue, attempt, side), base, can_push=True)
 
     def worktrees(self) -> list[Path]:
         """Paths of the worktrees git knows about for this mirror (excluding the mirror)."""
@@ -674,13 +723,21 @@ class RepoMirror:
         return [p for p in paths if p.resolve() != mirror]
 
     @_locked
-    def cleanup_issue(self, issue: int) -> None:
+    def cleanup_issue(self, issue: int, side: str | None = None) -> None:
         """Remove every attempt worktree and local branch for an issue (after merge or drop).
-        Remote branches are left alone."""
-        for path in sorted(self.repo_dir.glob(f"issue-{issue}-a*")):
-            self._remove_path(path)
+        Remote branches are left alone.
+
+        ab:pair (#16): only ``side``'s names are touched. ``None``/``"a"`` is the unpaired
+        layout (``issue-<n>-a*``, ``fman/issue-<n>/``), so cleaning side A or an unpaired
+        ticket never removes side B's worktrees, and ``"b"`` never removes side A's."""
+        tag = _side_tag(side)
+        want_side = "b" if tag else None
+        for path in sorted(self.repo_dir.glob(f"issue-{issue}{tag}-a*")):
+            parsed = parse_attempt_dir(path.name)
+            if parsed is not None and parsed[0] == issue and parsed[1] == want_side:
+                self._remove_path(path)
         self.prune()
-        for branch in self._local_branches(f"{BRANCH_PREFIX}issue-{issue}/"):
+        for branch in self._local_branches(f"{BRANCH_PREFIX}issue-{issue}{tag}/"):
             self._delete_local_branch(branch)
 
     # -- chat sessions (#71) -----------------------------------------------------
@@ -827,10 +884,11 @@ class WorktreeManager:
         clone_url: str,
         token: str | None = None,
         start_point: str | None = None,
+        side: str | None = None,
     ) -> Worktree:
         """Fetch and create the worktree for attempt ``attempt`` of issue ``ticket``."""
         return self.mirror(repo, clone_url).create(
-            base_branch, ticket, attempt, token=token, start_point=start_point
+            base_branch, ticket, attempt, token=token, start_point=start_point, side=side
         )
 
     def repos(self) -> Iterator[str]:
