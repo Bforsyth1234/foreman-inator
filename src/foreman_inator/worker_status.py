@@ -12,6 +12,8 @@ running worker picks them up on its next pass. #51: one ``Profile <repo>: ...`` 
 repo whose profile is not ``default``, and ``set_profile`` for ``fman repo set-profile``.
 Wave 15: with ``ollama_host`` the "Ollama: N loaded (X GB)" / "Ollama: unreachable (...)"
 line (#35, ``resources.ollama``), and with ``plugins`` one line per plugin (#45).
+Wave 21: the spend line carries chat spend (#71) and a ticket with a carried spend
+approval shows what it still allows (#82, ``Spend.approval_note``).
 """
 
 from __future__ import annotations
@@ -68,6 +70,7 @@ def _line(
     budget_usd: float | None = None,
     open_pr_cap: int | None = None,
     chat_waits: dict[int, tuple[int, ...]] | None = None,
+    spend: Spend | None = None,
 ) -> str:
     title = " ".join(t.title.split())
     if len(title) > TITLE_WIDTH:
@@ -87,6 +90,9 @@ def _line(
         )
     elif t.flag_reason:
         line += f"\n         FLAGGED: {t.flag_reason}"
+    note = spend.approval_note(t.id) if spend is not None else None
+    if note:  # #82: a paused or cut-short ticket's carried approval: what it still allows
+        line += f"\n         SPEND: {note} (carried to the next attempt)"
     blockers = (waits or {}).get(t.id)
     if blockers:
         held = ", ".join(f"#{b}" for b in blockers)
@@ -168,6 +174,7 @@ def render_status(
     chat_waits = {w.ticket_id: w.chats for w in waiters if w.chats}
     budget = config.attempt_budget_usd if config is not None else None
     cap = int(config.max_open_prs_per_repo) if config is not None else None
+    spend = Spend(store, config) if config is not None else None
     by_col: dict[str, list[Ticket]] = {c: [] for c in COLUMNS}
     for t in tickets:
         by_col[t.column].append(t)
@@ -182,7 +189,7 @@ def render_status(
             header += f", latest {len(shown)}"
         out.append(header)
         out.extend(
-            _line(t, store.list_attempts(t.id), waits, store, budget, cap, chat_waits)
+            _line(t, store.list_attempts(t.id), waits, store, budget, cap, chat_waits, spend)
             for t in shown
         )
         if not items:
@@ -209,9 +216,9 @@ def render_status(
     out.extend(_champion_lines(store))
     out.extend(profile_lines(store, sorted({t.repo for t in tickets})))
     out.extend(local_only_lines(store))
-    if config is not None:
+    if config is not None and spend is not None:
         out.append(repos_line(config))
-        out.append(Spend(store, config).summary().status_line())
+        out.append(spend.summary().status_line())  # wave 21: with the chat figure
         line = sandbox.describe(
             config.sandbox, dict(config.sandbox_network), dict(config.sandbox_install)
         )  # type: ignore[arg-type]

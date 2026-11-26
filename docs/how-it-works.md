@@ -188,6 +188,41 @@ default `max_parallel_per_repo = 1`, one ticket per repo runs at a time, so
 locks matter only when you raise it. An issue that names no files holds
 nothing until its first diff.
 
+## Chat sessions
+
+`fman chat <owner/name>` (a terminal REPL) and the `/chat` page of `fman
+metrics` are two front ends on one engine, `chat.ChatManager`, which lives in
+the process that shows the chat, not in the worker: a crash in one never takes
+the other down. A session is a worktree on `fman/chat/<id>` cut from the repo's
+base branch, an `opencode serve` running under the writer's sandbox policy, and
+its own model proxy and spend checker. One message is one turn.
+
+* **Tiers.** A session starts on tier 1 (local) by default; `/tier up` moves
+  the next message to the next rung. For the local GPU a chat turn goes ahead of
+  queued ticket calls; if the slot stays busy past `chat_local_wait_seconds`,
+  that one turn uses the first cloud model at or above the session's tier and
+  says so (never for a local-only repo, never past a cap).
+* **Spend.** Chat counts toward the live caps (`daily_usd`, `monthly_usd`) and
+  at most `chat_monthly_usd` of the month may be chat; one message may spend at
+  most `chat_turn_budget_usd`. At a cap the turn is refused and nothing is sent;
+  `/approve` (or the page's button) allows that one message. `fman status` and
+  the metrics page show chat spend next to ticket spend.
+* **Locks.** A session locks the files it edits, so tickets wait instead of
+  producing conflicting PRs; the page warns when a ticket holds a file the chat
+  edits. `/pr`, `/discard` and the end of the session release them.
+* **Ending.** `/pr` verifies, pushes the branch (only the manager can: the model
+  has no token) and opens a **draft** PR with no AI review; nothing merges.
+  `/discard` deletes the worktree and branch and pushes nothing. An idle session
+  ends after `chat_idle_minutes` with its worktree kept (`fman chat resume`).
+* **Network.** None but the proxy, as for tickets, unless the repo opts in with
+  `fman repo set-chat-network <repo> on`.
+* **Learning.** Chats never feed the router, replays or experiments: a chat has
+  no acceptance label. Each session is recorded under `recordings/chat/` and
+  traced (`chat` and `chat.turn` spans).
+
+The full design and the decisions behind it are in
+[chat-design.md](chat-design.md).
+
 ## Architecture
 
 ```mermaid
@@ -304,9 +339,7 @@ Not built yet (SPEC milestone 5): seeded-bug reviewer tests, traffic split and
 head-to-head writer experiments, and restarting a recorded run from its
 failure step.
 
-Next after that: interactive chat sessions through the same tiers and spend
-caps. The design and its open questions are in [chat-design.md](chat-design.md);
-nothing of it is wired yet.
+Interactive chat sessions are described under [Chat sessions](#chat-sessions).
 
 ## Metrics and the trace viewer
 
@@ -349,6 +382,8 @@ they decided then (exit 1 on any difference).
 | The change itself, on `fman/...` branches | GitHub | Each attempt that passes its checks |
 | Prompts: the issue, files the writer reads, check output, earlier notes; for the reviewer, the issue and the diff | The cloud API of that model | Only for a model with `kind = "cloud"` (tier 3, or a cloud reviewer), only inside the spend caps; each call is an `llm.call` span |
 | Anything the repo's checks send | Anywhere | Only for a repo with `sandbox_network = "allow"` |
+| A chat session's messages and the files its model reads | The cloud API of that model | Only on a cloud tier (or the local-slot fallback), inside the caps and the chat sub-cap; never for a local-only repo |
+| A chat session's branch, as a draft PR | GitHub | Only when you run `/pr` |
 | Issue text, for embeddings | A cloud embedding service | Only if you point `embedding_base_url` at one and set `allow_cloud_embedder = true` |
 
 Not sent anywhere: traces, recordings, the database, the App key and the

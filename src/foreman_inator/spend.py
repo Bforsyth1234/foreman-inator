@@ -154,6 +154,7 @@ if TYPE_CHECKING:
     from collections.abc import Iterable, Iterator
 
     from foreman_inator.chat import ChatSession, Rung
+    from foreman_inator.metrics.queries import ChatStatus
     from foreman_inator.proxy.zai_quota import QuotaHit
 
 log = logging.getLogger(__name__)
@@ -325,6 +326,8 @@ class SpendSummary:
     credits: tuple[PlanCredits, ...] = ()  # #85: estimated Coding Plan credits
     # #82: (ticket id, "approval #2: $4.59 of $5.00 left") per carried approval
     approval_notes: tuple[tuple[int, str], ...] = ()
+    #: #71 (wave 21): chat vs ticket spend today and this month, against the chat sub-cap.
+    chat: ChatStatus | None = None
 
     def as_dict(self) -> dict[str, object]:
         out = asdict(self)
@@ -361,6 +364,8 @@ class SpendSummary:
                 )
         for ticket_id, note in self.approval_notes:
             line += f"; ticket {ticket_id}: {note}"
+        if self.chat is not None:
+            line += "; " + self.chat.line()
         return line
 
 
@@ -1569,6 +1574,11 @@ class Spend:
             (a.ticket_id, _carried_text(a, self.approval_usd))
             for a in self.store.carried_spend_approvals()
         )
+        from foreman_inator.metrics import queries  # lazy: metrics imports spend's peers
+
+        chat = queries.chat_status(
+            self.store, day=day, month=month, chat_monthly_usd=self.chat_monthly_usd
+        )
         return SpendSummary(
             now=now,
             day_start=day[0],
@@ -1592,6 +1602,7 @@ class Spend:
             plans=plans,
             credits=credits,
             approval_notes=notes,
+            chat=chat,
         )
 
 

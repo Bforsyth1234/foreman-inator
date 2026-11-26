@@ -35,6 +35,7 @@ import re
 import sys
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager
+from pathlib import Path
 from typing import Annotated, Any, TextIO
 
 import typer
@@ -355,10 +356,12 @@ def run_session(
 
 
 @contextlib.contextmanager
-def default_manager() -> Iterator[Any]:
-    """The real ``ChatManager``: config, the writable store, traces, the App's GitHub
-    client (None when ``fman setup`` has not run), worktrees under the bot's identity.
-    The manager builds and owns its proxy and ``Spend`` (the config's chat caps)."""
+def default_manager(db_path: str | Path | None = None) -> Iterator[Any]:
+    """The real ``ChatManager``: config, the writable store (``db_path``, default the
+    home's database), traces, the App's GitHub client (None when ``fman setup`` has not
+    run), worktrees under the bot's identity. The manager builds and owns its proxy and
+    ``Spend`` (the config's chat caps). ``fman chat`` and the ``/chat`` page (wave 21
+    wiring, ``web.full_app``) both build theirs here."""
     from foreman_inator import config as config_mod
     from foreman_inator import paths, tracing
     from foreman_inator.chat import ChatManager
@@ -369,7 +372,7 @@ def default_manager() -> Iterator[Any]:
         cfg = config_mod.load()
     except config_mod.ConfigError as exc:
         raise ChatError(f"config.toml: {exc}") from exc
-    store = Store(paths.db_path())
+    store = Store(Path(db_path) if db_path is not None else paths.db_path())
     try:
         tracing.init(traces_dir=paths.traces_dir())
         github = None
