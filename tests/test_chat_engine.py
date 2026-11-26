@@ -85,7 +85,8 @@ class FakeTurn:
     """One turn of the fake server: an iterator of DriverEvents, ``result`` at the end.
 
     Steps: ("say", text[, part]), ("llm",) one model call through the proxy,
-    ("edit", path, content), ("hang",) until aborted, ("tool", name, input)."""
+    ("edit", path, content), ("hang",) until aborted, ("tool", name, input), ("wait", event)
+    until the event is set (an abort does not end it: a thread outliving shutdown)."""
 
     def __init__(self, server: FakeServer, text: str, model_id: str, steps: list[tuple]):
         self.server, self.text, self.model_id, self.steps = server, text, model_id, steps
@@ -124,6 +125,9 @@ class FakeTurn:
                 elif op == "tool":
                     tools += 1
                     yield ToolEvent(f"c{tools}", step[1], step[2], "out", False, sid)
+                elif op == "wait":
+                    srv.hanging.set()
+                    assert step[1].wait(10)
                 elif op == "hang":
                     srv.hanging.set()
                     srv.aborted.wait(10)
@@ -150,6 +154,8 @@ class FakeServer:
 
     def start(self, *, resume: str | None = None, title: str | None = None) -> str:
         self.starts.append(resume)
+        if self.h.on_start is not None:
+            self.h.on_start(self)
         self.session_id = resume or f"ses_{self.kw['session_id']}"
         return self.session_id
 
@@ -210,6 +216,7 @@ class Harness:
         self.worktrees = WorktreeManager(tmp / "wts", identity=GitIdentity("bot", "b@x.y"))
         self.scripts: list[list[tuple]] = []
         self.servers: list[FakeServer] = []
+        self.on_start: Any = None  # called in FakeServer.start (mid-_open)
         self.clock = Clock()
         self.managers: list[ChatManager] = []
         self.verify = VerifyOutcome(True, "pytest: passed", "3 passed")
@@ -835,3 +842,190 @@ def test_no_secrets_in_events_or_recordings(h: Harness):
     for secret in ("sk-ant-", "abcdefghijkl123", API_KEY, FAKE_TOKEN):
         assert secret not in recorded, secret
     assert "[redacted]" in shown and "my key is" in recorded
+
+
+# --------------------------------------------------------------------------- review fixes
+
+
+def test_a_turn_outliving_shutdown_takes_no_locks_after_the_release(h: Harness, monkeypatch):
+    monkeypatch.setattr(chat, "_JOIN_S", 0.05)
+    mgr = h.manager()
+    mgr.start(REPO)
+    gate = threading.Event()
+    h.scripts.append([("edit", "lib/late.py", "y\n"), ("wait", gate)])
+    mgr.send(1, "slow")
+    assert h.servers[0].hanging.wait(5)
+    thread = mgr._live[1].thread
+    mgr.shutdown()  # the join times out: the turn thread is still running
+    assert mgr.get(1).state == "ended" and h.store.chat_lock_rows(1) == []
+    gate.set()
+    thread.join(10)
+    assert not thread.is_alive()
+    assert h.store.chat_lock_rows(1) == []  # its finish did not lock lib/late.py again
+    assert mgr.get(1).state == "ended"
+
+
+def test_end_idle_and_a_concurrent_send_cannot_both_win(h: Harness):
+    mgr = h.manager(idle_minutes=30)
+    mgr.start(REPO)
+    h.clock.t += 31 * 60
+    end = mgr._end
+    outcome: list[str] = []
+
+    def racing_end(live, reason):
+        def send() -> None:
+            try:
+                mgr.send(1, "just in time")
+                outcome.append("sent")
+            except ChatError:
+                outcome.append("refused")
+
+        t = threading.Thread(target=send)
+        threads.append(t)
+        t.start()
+        t.join(0.3)  # with the fix it blocks on live.lock until the end is done
+        end(live, reason)
+
+    threads: list[threading.Thread] = []
+    mgr._end = racing_end
+    assert mgr.end_idle() == [1]
+    threads[0].join(5)
+    assert outcome == ["refused"] and h.servers[0].sent == []
+
+
+def test_another_process_recover_leaves_a_starting_session_alone(h: Harness):
+    seen: list[str] = []
+
+    def other_host(server: FakeServer) -> None:
+        h.manager()  # its recover() runs now, mid-_open
+        seen.append(h.store.get_chat_session(1).state)
+
+    h.on_start = other_host
+    mgr = h.manager()
+    s = mgr.start(REPO)
+    assert seen == ["starting"]
+    assert s.state == "idle" and Path(s.worktree).exists()
+
+
+def test_a_resuming_session_holds_its_slot_against_another_start(h: Harness):
+    mgr = h.manager()
+    mgr.start(REPO)
+    mgr.shutdown()
+    errors: list[str] = []
+
+    def other_start(server: FakeServer) -> None:
+        if server.kw["session_id"] != 1:
+            return
+        try:
+            h.manager().start(REPO)
+        except ChatError as exc:
+            errors.append(str(exc))
+
+    h.on_start = other_start
+    again = h.manager()
+    assert again.resume(1).state == "idle"
+    assert len(errors) == 1 and "already open" in errors[0]
+    assert len(h.store.list_chat_sessions(states=chat.CLAIMED_STATES)) == 1
+
+
+def test_a_resume_that_crashed_mid_open_keeps_its_worktree(h: Harness):
+    mgr = h.manager()
+    s = mgr.start(REPO)
+    mgr.shutdown()
+    h.store.set_chat_state(1, "starting")  # the resuming host died in _open
+    h.manager()
+    assert h.store.get_chat_session(1).state == "ended" and Path(s.worktree).exists()
+
+
+def test_a_failed_open_leaves_nothing_live(h: Harness, monkeypatch):
+    mgr = h.manager()
+
+    def boom() -> None:
+        raise RuntimeError("reaper")
+
+    monkeypatch.setattr(mgr, "_start_reaper", boom)
+    with pytest.raises(ChatError, match="could not start"):
+        mgr.start(REPO)
+    assert mgr._live == {} and h.servers[0].stopped
+    assert mgr.get(1).state == "failed"
+    assert not (mgr.state_dir(1) / chat.HOST_FILE).exists()
+    assert mgr._db_key(1) not in chat._HOSTED
+    monkeypatch.undo()
+    assert h.manager().start(REPO).state == "idle"  # the slot is free
+
+
+def test_discard_racing_a_message_refuses_the_message(h: Harness):
+    mgr = h.manager()
+    mgr.start(REPO)
+    close = mgr._close_live
+    outcome: list[str] = []
+
+    def racing_close(live, outcome_, **extra):
+        try:
+            mgr.send(1, "one more thing")
+            outcome.append("sent")
+        except ChatError as exc:
+            outcome.append(str(exc))
+        close(live, outcome_, **extra)
+
+    mgr._close_live = racing_close
+    assert mgr.discard(1).state == "discarded"
+    assert outcome == ["closing: /pr or /discard is running"] and h.servers[0].sent == []
+
+
+def test_pr_racing_a_message_refuses_the_message(h: Harness):
+    mgr = h.manager()
+    mgr.start(REPO)
+    h.run(mgr, 1, "Edit", ("edit", "app.py", "x = 3\n"))
+    closable = mgr._closable
+    outcome: list[str] = []
+
+    def racing_closable(session_id):
+        got = closable(session_id)
+        try:
+            mgr.send(1, "one more thing")
+            outcome.append("sent")
+        except ChatError as exc:
+            outcome.append(str(exc))
+        return got
+
+    mgr._closable = racing_closable
+    assert mgr.open_pr(1).state == "opened_pr"
+    assert outcome == ["closing: /pr or /discard is running"]
+    assert len(h.servers[0].sent) == 1
+
+
+def test_a_fallback_the_preflight_would_refuse_is_not_picked(h: Harness):
+    mgr = h.manager()
+    mgr.start(REPO)
+    h.store.record_spend("live", 4.995, model="claude", chat_session_id=1)  # daily 5.0
+    assert h.spend.chat_room(1) is None  # some headroom, but not one call's worth
+    live = mgr._live[1]
+    live.turn = chat._Turn(0, 9, 1, "qwen-small", "x")
+    try:
+        assert mgr._fallback(live.ctx) is None
+    finally:
+        live.turn = None
+
+
+def test_a_refused_fallback_preflight_is_not_the_turns_refusal(h: Harness):
+    mgr = h.manager()
+    mgr.start(REPO)
+    h.store.record_spend("live", 4.995, model="claude", chat_session_id=1)
+    h.spend.start_chat_turn(1)
+    from dataclasses import replace
+
+    fctx = replace(mgr._live[1].ctx, fallback_from="qwen-small")
+    assert h.spend.hook(CLAUDE, 0.5, fctx, phase="estimate") is False
+    assert h.spend.refusal_for_chat(1) is None  # the call keeps waiting; the turn goes on
+
+
+def test_near_the_cap_a_busy_slot_waits_for_local_instead_of_refusing(h: Harness):
+    mgr = h.manager()
+    mgr.start(REPO)
+    h.store.record_spend("live", 4.995, model="claude", chat_session_id=1)
+    hold_local_slot(h.slots)
+    threading.Timer(0.6, h.slots.release).start()
+    turn = h.run(mgr, 1, "quick fix", ("llm",))
+    assert turn.status == "finished" and hosts(h.models) == ["127.0.0.1"]
+    assert of(mgr, 1, "refused") == [] and of(mgr, 1, "fallback") == []

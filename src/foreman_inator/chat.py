@@ -777,7 +777,24 @@ class ChatManager:
             model=turn.model,
             started_at="",
         )
-        return chat_cloud_fallback(self.spend, self.store, session, live.ladder)
+        return chat_cloud_fallback(
+            self.spend, self.store, session, live.ladder,
+            estimate_usd=self._fallback_estimate(live.ladder, turn.tier),
+        )  # fmt: skip
+
+    @staticmethod
+    def _fallback_estimate(ladder: tuple[Rung, ...], tier: int) -> float:
+        """The least the proxy's preflight will estimate for a call to the fallback rung
+        (no input, the default output allowance; the real estimate adds the input), so
+        a fallback the preflight is sure to refuse is not picked. 0 for a flat-fee plan
+        model, which the caps do not count."""
+        from foreman_inator.proxy import pricing
+        from foreman_inator.proxy.server import DEFAULT_MAX_OUT
+
+        rung = next((r for r in ladder if r.tier >= tier and r.endpoint.kind == "cloud"), None)
+        if rung is None or not rung.endpoint.metered:
+            return 0.0
+        return pricing.cost_usd(rung.endpoint, 0, DEFAULT_MAX_OUT)
 
     def _on_usage(self, usage: Any) -> None:
         if self._prev_on_usage is not None:
@@ -948,7 +965,11 @@ class ChatManager:
     def _reserve(self, session_id: int | None = None) -> None:
         """Decision 7: at most ``max_sessions`` open sessions (here and in other hosts)."""
         with self._lock:
-            open_ = [*self._live, *self._starting, *self._claimed_elsewhere()]
+            # The session being reserved is not counted: its own claim is already up.
+            open_ = [
+                i for i in (*self._live, *self._starting, *self._claimed_elsewhere())
+                if i != session_id
+            ]  # fmt: skip
             if len(open_) >= self.max_sessions:
                 ids = ", ".join(str(i) for i in sorted(set(open_)))
                 raise ChatError(
@@ -1000,10 +1021,18 @@ class ChatManager:
             repo, base_branch=base, tier=rung.tier, model=rung.endpoint.name
         )
         try:
+            # host.json before anything else: another process's recover() must see this
+            # ``starting`` row as hosted, or it fails it and removes its worktree.
+            self._claim_host(row.id)
             self._reserve(row.id)
-        except ChatError as exc:  # another start won the race
-            self.store.set_chat_state(row.id, "failed", end_reason="capacity")
-            raise exc
+        except Exception as exc:  # another start won the race (or the state dir broke)
+            self._unclaim_host(row.id)
+            self.store.set_chat_state(
+                row.id,
+                "failed",
+                end_reason="capacity" if isinstance(exc, ChatError) else "start: state dir",
+            )
+            raise
         wt = None
         try:
             wt = self._mirror(repo).create_chat(base, row.id, token=self._token())
@@ -1040,8 +1069,13 @@ class ChatManager:
             if (rung.tier, rung.endpoint.name) != (row.tier, row.model):
                 self.store.update_chat_session(session_id, tier=rung.tier, model=rung.endpoint.name)
             try:
+                # Hosted and claimed (``starting``: a live, non-final state) while it opens,
+                # so another process's _reserve counts it and its recover() leaves it be.
+                self._claim_host(session_id)
+                self.store.set_chat_state(session_id, "starting")
                 self._open(row, ladder, rung, wt, resume=row.opencode_session_id)
             except Exception as exc:
+                self._unclaim_host(session_id)
                 self.spend.end_chat_session(session_id)
                 with contextlib.suppress(StoreError):
                     self.store.set_chat_state(
@@ -1112,16 +1146,34 @@ class ChatManager:
             last_activity=self._clock(),
             first_message=self._first_message(sid, None) if resume else None,
         )
+        try:
+            with self._lock:
+                self._live[sid] = live
+            self.store.set_chat_state(sid, "idle")
+            self._emit(sid, "status", {"state": "idle", "resumed": bool(resume)})
+            self._emit_tier(live)
+            self._start_reaper()
+        except BaseException:
+            # Nothing may outlive a failed open: the live entry (and its max_sessions
+            # slot), the server and the proxy context all go before the caller's cleanup.
+            live.state = "ended"
+            self._close_live(live, "ended", stopped_reason="error", end_reason="open_failed")
+            raise
+        return live
+
+    def _claim_host(self, session_id: int) -> None:
+        """Mark this process as the session's host (``host.json`` and ``_HOSTED``)."""
+        state_dir = self.state_dir(session_id)
+        state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         (state_dir / HOST_FILE).write_text(json.dumps({"pid": os.getpid()}))
         with _HOSTED_LOCK:
-            _HOSTED.add(self._db_key(sid))
-        with self._lock:
-            self._live[sid] = live
-        self.store.set_chat_state(sid, "idle")
-        self._emit(sid, "status", {"state": "idle", "resumed": bool(resume)})
-        self._emit_tier(live)
-        self._start_reaper()
-        return live
+            _HOSTED.add(self._db_key(session_id))
+
+    def _unclaim_host(self, session_id: int) -> None:
+        with _HOSTED_LOCK:
+            _HOSTED.discard(self._db_key(session_id))
+        with contextlib.suppress(OSError):
+            (self.state_dir(session_id) / HOST_FILE).unlink()
 
     def _open_recorder(
         self,
@@ -1167,6 +1219,7 @@ class ChatManager:
     def _fail_start(self, session_id: int, wt: Any, exc: BaseException) -> None:
         """A start that broke: nothing of the user's exists yet, so the worktree goes."""
         log.warning("chat %s failed to start: %s", session_id, type(exc).__name__)
+        self._unclaim_host(session_id)
         self.spend.end_chat_session(session_id)
         if wt is not None:
             with contextlib.suppress(Exception):
@@ -1214,6 +1267,8 @@ class ChatManager:
     def _begin_turn(self, live: _Live, text: str) -> ChatTurn:
         sid = live.id
         with live.lock:
+            if live.state == "closing":
+                raise ChatError("closing: /pr or /discard is running")
             if live.state != "idle" or live.turn is not None:
                 raise ChatError("still working: /abort or wait")
             rung = live.rung
@@ -1377,7 +1432,15 @@ class ChatManager:
             turn.done.set()
 
     def _touch_locks(self, live: _Live) -> None:
-        """Decision 6: lock what the chat changed; warn about tickets holding the rest."""
+        """Decision 6: lock what the chat changed; warn about tickets holding the rest.
+        Only for a session still open here: a turn thread outliving ``_end`` (shutdown's
+        join timed out) or one finishing as ``/pr``/``/discard`` closes it must not take
+        locks again after they were released. Called under ``live.lock``, which ``_end``
+        and ``_closable`` also take to change the state, so the check cannot go stale."""
+        with self._lock:
+            current = self._live.get(live.id) is live
+        if not current or live.state not in ("idle", "busy"):
+            return
         try:
             paths = live.worktree.changed_files()
         except Exception as exc:
@@ -1557,8 +1620,11 @@ class ChatManager:
         live = self._live.get(session_id)
         if live is None and row.state in CLAIMED_STATES and self._host_alive(session_id):
             raise ChatError(f"chat session {session_id} is open in another process")
-        if live is not None and (live.state != "idle" or live.turn is not None):
-            raise ChatError("still working: /abort or wait")
+        if live is not None:
+            with live.lock:  # check and claim at once: a message cannot start in between
+                if live.state != "idle" or live.turn is not None:
+                    raise ChatError("still working: /abort or wait")
+                live.state = "closing"
         return row, live
 
     def open_pr(self, session_id: int, *, title: str | None = None) -> ChatSession:
@@ -1567,13 +1633,11 @@ class ChatManager:
         A failing verify does not block (the user decided); the body's first line says
         so. Then the server stops, the worktree goes (the remote branch stays), the
         locks are released and the row is ``opened_pr``."""
-        row, live = self._closable(session_id)
         if self.github is None:
             raise ChatError("no GitHub client: cannot open a PR")
-        if live is not None:
-            live.state = "closing"
-        self.store.set_chat_state(session_id, "closing")
+        row, live = self._closable(session_id)
         try:
+            self.store.set_chat_state(session_id, "closing")
             wt = live.worktree if live else self._mirror(row.repo).open_chat(session_id)
             pr_title = self._pr_title(session_id, title, live)
             head = wt.commit_all(f"{pr_title}\n\nFrom foreman-inator chat session {session_id}.")
@@ -1684,7 +1748,14 @@ class ChatManager:
 
     def _end(self, live: _Live, reason: str) -> None:
         """Idle timeout or host exit: server stopped, worktree kept, locks released,
-        row ``ended`` (it can be resumed, opened as a PR or discarded later)."""
+        row ``ended`` (it can be resumed, opened as a PR or discarded later). The state
+        flips under ``live.lock`` first, so a turn thread still running (or about to
+        start) cannot take locks or begin a turn after the release below."""
+        with live.lock:
+            live.state = "ended"
+            with self._lock:
+                if self._live.get(live.id) is live:
+                    del self._live[live.id]
         self._close_live(live, "ended", end_reason=reason)
         with contextlib.suppress(StoreError):
             self.store.set_chat_state(live.id, "ended", end_reason=reason)
@@ -1697,12 +1768,12 @@ class ChatManager:
         limit = self.idle_minutes * 60.0
         ended = []
         for live in list(self._live.values()):
-            with live.lock:
+            with live.lock:  # held through _end: a concurrent send cannot slip in
                 stale = live.state == "idle" and live.turn is None
                 stale = stale and now - live.last_activity >= limit
-            if stale:
-                self._end(live, "idle_timeout")
-                ended.append(live.id)
+                if stale:
+                    self._end(live, "idle_timeout")
+                    ended.append(live.id)
         return ended
 
     def shutdown(self) -> None:
@@ -1722,8 +1793,10 @@ class ChatManager:
     def recover(self) -> list[int]:
         """Crash safety: rows that claim a live server no live host has (this one
         included) are settled: ``starting`` -> ``failed`` (its half-made worktree
-        removed: nothing of the user's is in it), ``idle``/``busy``/``closing`` ->
-        ``ended`` (``host_restart``; worktree kept, resumable); their running turns
+        removed: nothing of the user's is in it; a resume that died while opening, which
+        has an OpenCode session id, -> ``ended`` instead, worktree kept),
+        ``idle``/``busy``/``closing`` -> ``ended`` (``host_restart``; worktree kept,
+        resumable); their running turns
         -> ``errored``. Any lock held by a session that is not open goes (decision 6)."""
         fixed = []
         for row in self.store.list_chat_sessions(states=CLAIMED_STATES):
@@ -1733,7 +1806,7 @@ class ChatManager:
                 if t.status is None:
                     with contextlib.suppress(StoreError):
                         self.store.finish_chat_turn(t.id, "errored")
-            if row.state == "starting":
+            if row.state == "starting" and not row.opencode_session_id:
                 with contextlib.suppress(Exception):
                     mirror = self._mirror(row.repo)
                     Worktree(mirror, mirror.chat_path(row.id), row.branch, "").remove()
