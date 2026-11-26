@@ -138,7 +138,19 @@ EXTRA_COLUMNS: dict[str, list[str]] = {
         "plan",  # migration 013: flat-fee plan calls, kept out of the caps
         "credits",  # migration 014 (#85): estimated GLM Coding Plan credits
     ],
-    "spend_approvals": ["id", "ticket_id", "approved_at", "consumed_at"],
+    "spend_approvals": [
+        "id",
+        "ticket_id",
+        "approved_at",
+        "consumed_at",
+        # migration 015 (#82): which attempt holds it, its room, and what it spent
+        "attempt_id",
+        "kind",
+        "limit_usd",
+        "spent_usd",
+        "settled_at",
+        "reopened",
+    ],
     "file_locks": ["repo", "path", "ticket_id", "acquired_at", "chat_session_id"],  # 012
     "schema_migrations": ["version", "name", "applied_at"],
     # migration 004 (#23)
