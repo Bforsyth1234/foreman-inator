@@ -91,7 +91,7 @@ ITEM_COLUMNS: dict[str, list[str]] = {
 
 # Beyond SPEC and the item: every addition is listed here so a change is deliberate.
 EXTRA_COLUMNS: dict[str, list[str]] = {
-    "tickets": ["routed_tier", "flag_reason", "flagged_at"],
+    "tickets": ["routed_tier", "flag_reason", "flagged_at", "pair_side"],  # 016: pair_side
     "attempts": [
         "started_at",
         "ended_at",
@@ -234,6 +234,22 @@ EXTRA_COLUMNS: dict[str, list[str]] = {
         "decided_at",
         "experiment_id",
     ],  # fmt: skip
+    # migration 016 (#34)
+    "pairs": [
+        "id",
+        "repo",
+        "issue_number",
+        "ticket_a",
+        "ticket_b",
+        "opponent_variant",
+        "opponent_reason",
+        "experiment_id",
+        "status",
+        "winner_ticket_id",
+        "loser_outcome",
+        "created_at",
+        "decided_at",
+    ],
     # migration 012 (#60)
     "chat_sessions": [
         "id",
