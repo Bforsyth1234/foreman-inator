@@ -11,7 +11,9 @@ it: the attempt is stored ``superseded`` and marked *uncounted*, or the review's
 is thrown away (no review row, so the review runs again after the pause). A paused ticket
 is flagged ``spend_cap: ...``; the issue gets ``Spend.approval_comment`` (once per pause,
 by a hidden marker); ``resume_paused`` clears the flag on each pass once
-``Spend.resume_reason`` allows it.
+``Spend.resume_reason`` allows it. A ``thrifty`` pause also lifts when the ticket's next
+writer step is a flat-fee plan model (``plan_usd_month``): that attempt is never gated, so
+waiting for an approval would wait for nothing.
 
 **Locks.** A ticket whose wanted files are held by another ticket waits in the queue
 (``worker_queue``). An attempt whose diff touched a held file (``Locks.widen``) is not
@@ -32,7 +34,8 @@ import logging
 from typing import Any
 
 from foreman_inator.db.store import OPEN_COLUMNS, Attempt, Ticket
-from foreman_inator.spend import FLAG_SPEND_CAP, Refusal
+from foreman_inator.routing import escalation as esc
+from foreman_inator.spend import FLAG_SPEND_CAP, FLAG_THRIFTY, Refusal
 
 log = logging.getLogger("foreman_inator.worker")
 
@@ -117,6 +120,8 @@ class PauseSteps:
             if not (t.flag_reason or "").startswith(FLAG_SPEND_CAP):
                 continue
             why = self.spend.resume_reason(t)
+            if why is None and self._next_writer_on_plan(t):
+                why = "next_model_on_plan"
             if why is None:
                 continue
             self.store.clear_flag(t.id)
@@ -124,6 +129,17 @@ class PauseSteps:
             resumed.append(t.id)
             log.info("ticket %d: spend pause over (%s); resuming", t.id, why.replace("_", " "))
         return resumed
+
+    def _next_writer_on_plan(self, t: Ticket) -> bool:
+        """A thrifty pause whose next writer attempt runs on a flat-fee plan model, which
+        the writer gate never stops. Cap pauses keep their own rule (a review's metered
+        call may have caused them)."""
+        if not (t.flag_reason or "").startswith(FLAG_THRIFTY):
+            return False
+        step = self.policy_for(t)  # type: ignore[attr-defined]
+        if not isinstance(step, esc.Retry):
+            return False
+        return not self._writer_endpoint(step).metered  # type: ignore[attr-defined]
 
 
 __all__ = ["PauseSteps"]
