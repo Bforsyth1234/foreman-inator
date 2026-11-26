@@ -357,12 +357,12 @@ def _endpoint_row(guard: forms.FormGuard, m: ModelEndpoint, first: bool, last: b
                                       button="Down", cls="inline")  # fmt: skip
     return (
         f"<tr><td><code>{e(m.name)}</code></td><td><code>{e(m.model)}</code></td>"
-        f"<td>{e(m.base_url)}</td><td>{e(', '.join(flags))}</td>"
-        f"<td>{e(_key_label(m.api_key_ref))}</td><td>{up}{down}"
-        f'<a href="{PATH}?edit={quote(m.name)}#endpoint">Edit</a> '
-        + guard.form(f"{PATH}/endpoint/remove", name, button="Remove", cls="inline")
+        f'<td class="muted">{e(m.base_url)}</td><td class="muted">{e(", ".join(flags))}</td>'
+        f'<td class="muted">{e(_key_label(m.api_key_ref))}</td><td><div class="actions">{up}{down}'
         + guard.form(f"{PATH}/endpoint/test", name, button="Test", cls="inline")
-        + "</td></tr>"
+        + f'<a href="{PATH}?edit={quote(m.name)}#endpoint">Edit</a>'
+        + guard.form(f"{PATH}/endpoint/remove", name, button="Remove", cls="inline danger")
+        + "</div></td></tr>"
     )
 
 
@@ -517,8 +517,7 @@ def render_tiers(
 ) -> str:
     warns = "".join(f'<p class="error">Warning: {e(w)}</p>' for w in tier_warnings(cfg, local_only))
     body = (
-        "<style>form.inline{display:inline;margin-right:.3em}"
-        " section.card{margin-bottom:1.5em}</style><h1>Tiers</h1>"
+        "<h1>Tiers</h1>"
         '<p class="lede">Each tier tries its endpoints in order. Changes are saved to'
         " config.toml with the same checks as the CLI; the worker reads them on its next"
         " start or config reload.</p>"
