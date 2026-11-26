@@ -142,9 +142,11 @@ class RebaseSteps:
             endpoint = self.config.models_for_tier(src.tier)[0]
         if endpoint.metered:
             refusal = self.spend.blocked(t.id)  # type: ignore[attr-defined]
-            if refusal is not None:
-                self.pause_for_spend(t, refusal)  # type: ignore[attr-defined]
-                return
+        else:  # #85: a flat-fee plan at its quota waits for the reset
+            refusal = self.spend.plan_gate(endpoint, t.id)  # type: ignore[attr-defined]
+        if refusal is not None:
+            self.pause_for_spend(t, refusal)  # type: ignore[attr-defined]
+            return
         from foreman_inator.worker_attempt import _remove_old_worktrees, _write_excludes
 
         mirror = self._mirror(t.repo)  # type: ignore[attr-defined]

@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta, timezone
 
 from foreman_inator.config import ModelEndpoint
 
@@ -197,15 +198,93 @@ def estimate_tokens(text_or_bytes: str | bytes) -> int:
     return (n + 2) // 3
 
 
+# ----------------------------------------------------------------- GLM Coding Plan credits
+#
+# Source: https://docs.z.ai/devpack/overview ("Usage Credit Allowance" and the per-model
+# multipliers; read 2026-11-25). The plan meters credits, not dollars:
+#   credits = (uncached input x in_mult + cached input x cached_mult + output x out_mult)
+#             / 10,000
+# Off-peak calls are charged 50%; peak is Monday to Friday 14:00-18:00 UTC+8. The
+# GLM-5.3-Flash 50% promotion (2026-11-24 to 2026-12-24) is not modelled, so the estimate
+# runs high rather than low. z.ai has no API for the remaining quota (dashboard only),
+# so these are local estimates.
+
+PLAN_SOURCE = "https://docs.z.ai/devpack/overview"
+PLAN_AS_OF = "2026-11-25"
+PLAN_CREDIT_DIVISOR = 10_000
+PLAN_OFF_PEAK_RATE = 0.5
+PLAN_PEAK_TZ = timezone(timedelta(hours=8))  # Singapore Standard Time
+PLAN_PEAK_HOURS = (14, 18)  # [start, end) local hours, Monday to Friday
+
+
+@dataclass(frozen=True)
+class CreditRate:
+    """GLM Coding Plan credit multipliers per token type."""
+
+    input_mult: float
+    cached_mult: float
+    output_mult: float
+
+
+PLAN_CREDITS: dict[str, CreditRate] = {
+    "glm-5.4": CreditRate(4.6, 1.1, 16),
+    "glm-5.3": CreditRate(6.9, 1.7, 24),
+    "glm-5.3-flash": CreditRate(1.15, 0.28, 4),
+}
+
+#: Credit allowance per plan tier: (per 5 hours, per week).
+PLAN_LIMITS: dict[str, tuple[int, int]] = {
+    "lite": (2_000, 10_000),
+    "pro": (12_000, 60_000),
+    "max": (28_000, 140_000),
+}
+
+
+def is_peak(at: datetime) -> bool:
+    """True during the plan's peak hours (Mon-Fri 14:00-18:00 UTC+8)."""
+    local = (at if at.tzinfo else at.replace(tzinfo=UTC)).astimezone(PLAN_PEAK_TZ)
+    start, end = PLAN_PEAK_HOURS
+    return local.weekday() < 5 and start <= local.hour < end
+
+
+def credit_rate(model: str) -> CreditRate | None:
+    m = model.lower()
+    return PLAN_CREDITS.get(m) or PLAN_CREDITS.get(_DATE_SUFFIX.sub("", m))
+
+
+def plan_credits(
+    model: str, tokens_in: int, tokens_out: int, *, cache_read: int = 0, at: datetime
+) -> float | None:
+    """Estimated Coding Plan credits for one call; None for a model not in the table.
+    ``tokens_in`` is all input, cached included (as ``Price.cost``)."""
+    rate = credit_rate(model)
+    if rate is None:
+        return None
+    tokens_in, tokens_out = max(0, tokens_in), max(0, tokens_out)
+    cached = min(max(0, cache_read), tokens_in)
+    raw = (
+        (tokens_in - cached) * rate.input_mult
+        + cached * rate.cached_mult
+        + tokens_out * rate.output_mult
+    ) / PLAN_CREDIT_DIVISOR
+    return raw if is_peak(at) else raw * PLAN_OFF_PEAK_RATE
+
+
 __all__ = [
     "AS_OF",
     "CLAUDE_CACHE_WRITE_1H",
     "CLAUDE_CACHE_WRITE_5M",
     "CONSERVATIVE_DEFAULT",
     "FREE",
+    "PLAN_CREDITS",
+    "PLAN_LIMITS",
     "PRICES",
+    "CreditRate",
     "Price",
     "cost_usd",
+    "credit_rate",
     "estimate_tokens",
+    "is_peak",
+    "plan_credits",
     "price_for",
 ]

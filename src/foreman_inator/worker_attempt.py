@@ -222,6 +222,10 @@ class AttemptSteps:
             if refusal is not None:
                 self.pause_for_spend(ticket, refusal)  # type: ignore[attr-defined]
                 return
+        elif (refusal := self.spend.plan_gate(endpoint, ticket.id)) is not None:
+            # #85: the plan's quota is used up (z.ai 429): wait for its reset, no attempt.
+            self.pause_for_spend(ticket, refusal)  # type: ignore[attr-defined]
+            return
         mirror = self._mirror(ticket.repo)  # type: ignore[attr-defined]
         token = self._token(ticket.repo)
         mirror.ensure(token)

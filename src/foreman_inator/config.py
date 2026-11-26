@@ -81,6 +81,8 @@ Layout (every key optional; missing keys take the defaults below)::
     # vision = true      # #71: may describe issue images for the writer
     # plan_usd_month = 18.0  # a flat-fee plan (GLM Coding Plan): calls skip the spend
     #                    # caps and are logged at list price to show what the plan saved
+    # plan_tier = "lite" # #85: lite | pro | max: the plan's credit limits per 5 hours and
+    #                    # per week; `fman status` shows estimated credits against them
     # wire = "openai"    # openai | anthropic: how OpenCode talks to it through the proxy
     #                    # (#52). "anthropic": the native Messages route, with prompt caching.
 
@@ -223,6 +225,9 @@ class ModelEndpoint:
     #: budget; the ledger still records them at list price (``fman status`` shows what
     #: the plan saved). None: pay per token, counted toward the caps.
     plan_usd_month: float | None = None
+    #: #85: the Coding Plan tier ("lite", "pro", "max"), which sets the credit limits per
+    #: 5 hours and per week (``proxy.pricing.PLAN_LIMITS``). Needs ``plan_usd_month``.
+    plan_tier: str | None = None
 
     @property
     def is_cloud(self) -> bool:
@@ -723,6 +728,13 @@ def _validate_model(m: ModelEndpoint) -> None:
             raise ConfigError(f"{where}: plan_usd_month is only for a cloud model")
         if m.plan_usd_month < 0:
             raise ConfigError(f"{where}: plan_usd_month must be >= 0")
+    if m.plan_tier is not None:
+        from foreman_inator.proxy.pricing import PLAN_LIMITS  # pricing imports config
+
+        if m.plan_usd_month is None:
+            raise ConfigError(f"{where}: plan_tier needs plan_usd_month")
+        if m.plan_tier not in PLAN_LIMITS:
+            raise ConfigError(f"{where}: plan_tier must be one of {', '.join(PLAN_LIMITS)}")
     url = urlparse(m.base_url)
     if url.scheme not in ("http", "https") or not url.hostname:
         raise ConfigError(f"{where}: base_url must be an http(s) URL")
@@ -792,7 +804,8 @@ def _model_from_dict(raw: Any, where: str) -> ModelEndpoint:
     _typed(raw, dict, where)
     allowed = {f.name for f in fields(ModelEndpoint)}
     _check_keys(raw, allowed, where)
-    missing = sorted(allowed - {"api_key_ref", "wire", "vision", "plan_usd_month"} - set(raw))
+    optional = {"api_key_ref", "wire", "vision", "plan_usd_month", "plan_tier"}
+    missing = sorted(allowed - optional - set(raw))
     if missing:
         raise ConfigError(f"{where}: missing key(s) {', '.join(missing)}")
     return ModelEndpoint(
@@ -806,6 +819,7 @@ def _model_from_dict(raw: Any, where: str) -> ModelEndpoint:
         wire=_typed(raw.get("wire", "openai"), str, f"{where}.wire"),  # type: ignore[arg-type]
         vision=_typed(raw.get("vision", False), bool, f"{where}.vision"),
         plan_usd_month=_plan_fee(raw.get("plan_usd_month"), f"{where}.plan_usd_month"),
+        plan_tier=_typed(raw.get("plan_tier"), (str, type(None)), f"{where}.plan_tier"),
     )
 
 
