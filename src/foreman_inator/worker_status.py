@@ -14,6 +14,10 @@ Wave 15: with ``ollama_host`` the "Ollama: N loaded (X GB)" / "Ollama: unreachab
 line (#35, ``resources.ollama``), and with ``plugins`` one line per plugin (#45).
 Wave 21: the spend line carries chat spend (#71) and a ticket with a carried spend
 approval shows what it still allows (#82, ``Spend.approval_note``).
+Wave 23 (#34 ``ab:pair``, GH #16): each side of a pair is its own ticket line, tagged
+``pair #k A · <model>`` / ``pair #k B · <model>`` (``pair_tag``); once both sides' PRs
+are ready for you, both lines say ``WAITING: on your pick: merge #x or #y``
+(``pair_pick_wait``). Unpaired lines are unchanged.
 """
 
 from __future__ import annotations
@@ -23,7 +27,7 @@ from collections.abc import Sequence
 import httpx
 
 from foreman_inator.config import Config
-from foreman_inator.db.store import COLUMNS, Attempt, Store, Ticket
+from foreman_inator.db.store import COLUMNS, Attempt, Pair, Store, Ticket
 from foreman_inator.experiments import variants
 from foreman_inator.locks import Locks
 from foreman_inator.plugins import PluginSet
@@ -71,14 +75,16 @@ def _line(
     open_pr_cap: int | None = None,
     chat_waits: dict[int, tuple[int, ...]] | None = None,
     spend: Spend | None = None,
+    pairs: dict[int, Pair] | None = None,
 ) -> str:
     title = " ".join(t.title.split())
     if len(title) > TITLE_WIDTH:
         title = title[: TITLE_WIDTH - 1] + "…"
-    parts = [
-        f"  #{t.id:<4} {t.repo}#{t.issue_number:<5} {title:<{TITLE_WIDTH}}",
-        _attempt_text(attempts, budget_usd),
-    ]
+    parts = [f"  #{t.id:<4} {t.repo}#{t.issue_number:<5} {title:<{TITLE_WIDTH}}"]
+    pair = (pairs or {}).get(t.id)
+    if pair is not None:
+        parts.append(pair_tag(pair, t, attempts))
+    parts.append(_attempt_text(attempts, budget_usd))
     if t.pr_number is not None:
         parts.append(f"PR #{t.pr_number}")
     line = "  ".join(parts)
@@ -104,7 +110,82 @@ def _line(
         line += " (released on /pr, /discard or when the session ends)"
     for why in _waits(t, attempts, store, open_pr_cap):
         line += f"\n         WAITING: {why}"
+    pick = pair_pick_wait(store, pair) if pair is not None and store is not None else None
+    if pick:
+        line += f"\n         WAITING: {pick}"
     return line
+
+
+# --------------------------------------------------------------------- ab:pair (#34)
+
+
+def pair_map(store: Store) -> dict[int, Pair]:
+    """Every pair (any status) by both of its ticket ids; {} on a database from before
+    migration 016."""
+    try:
+        pairs = store.list_pairs()
+    except Exception:
+        return {}
+    out: dict[int, Pair] = {}
+    for p in pairs:
+        out[p.ticket_a] = p
+        out[p.ticket_b] = p
+    return out
+
+
+def pair_side(pair: Pair, ticket_id: int) -> str:
+    """``A`` or ``B``."""
+    return "A" if ticket_id == pair.ticket_a else "B"
+
+
+def _opponent_model(pair: Pair) -> str:
+    from foreman_inator.experiments.pair import _model_of
+
+    return _model_of(pair.opponent_variant)
+
+
+def pair_model(pair: Pair, t: Ticket, attempts: Sequence[Attempt]) -> str | None:
+    """The side's model: its latest attempt's; before one, side B's opponent."""
+    if attempts:
+        return attempts[-1].model
+    if t.id == pair.ticket_b:
+        return _opponent_model(pair)
+    return None
+
+
+def pair_tag(pair: Pair, t: Ticket, attempts: Sequence[Attempt]) -> str:
+    """``pair #3 A · qwen3-coder`` (``, won`` / ``, lost`` once decided)."""
+    model = pair_model(pair, t, attempts)
+    tag = f"pair #{pair.id} {pair_side(pair, t.id)}" + (
+        f" · {' '.join(model.split())}" if model else ""
+    )
+    if pair.status == "decided" and pair.winner_ticket_id is not None:
+        tag += ", won" if pair.winner_ticket_id == t.id else ", lost"
+    return tag
+
+
+def pair_side_ready(store: Store, t: Ticket) -> bool:
+    """The side's PR is waiting on you: in testing with a PR, the attempt over and past
+    CI and the AI review (reviewed, or handed over with a flag). A spend pause is not."""
+    if t.column != "testing" or t.pr_number is None:
+        return False
+    if (t.flag_reason or "").startswith(FLAG_SPEND_CAP):
+        return False
+    attempts = store.list_attempts(t.id)
+    last = attempts[-1] if attempts else None
+    if last is None or last.ended_at is None:
+        return False
+    return bool(t.flag_reason) or bool(store.list_reviews(attempt_id=last.id, shadow=False))
+
+
+def pair_pick_wait(store: Store, pair: Pair) -> str | None:
+    """``on your pick: merge #12 or #13`` once both sides of a running pair are ready."""
+    if pair.status != "running":
+        return None
+    a, b = store.get_ticket(pair.ticket_a), store.get_ticket(pair.ticket_b)
+    if not (pair_side_ready(store, a) and pair_side_ready(store, b)):
+        return None
+    return f"on your pick: merge #{a.pr_number} or #{b.pr_number}"
 
 
 def _chat_holders(chats: Sequence[int]) -> str:
@@ -175,6 +256,7 @@ def render_status(
     budget = config.attempt_budget_usd if config is not None else None
     cap = int(config.max_open_prs_per_repo) if config is not None else None
     spend = Spend(store, config) if config is not None else None
+    pairs = pair_map(store)
     by_col: dict[str, list[Ticket]] = {c: [] for c in COLUMNS}
     for t in tickets:
         by_col[t.column].append(t)
@@ -189,7 +271,7 @@ def render_status(
             header += f", latest {len(shown)}"
         out.append(header)
         out.extend(
-            _line(t, store.list_attempts(t.id), waits, store, budget, cap, chat_waits, spend)
+            _line(t, store.list_attempts(t.id), waits, store, budget, cap, chat_waits, spend, pairs)
             for t in shown
         )
         if not items:
@@ -210,6 +292,7 @@ def render_status(
             t.id in waits
             or (t.flag_reason or "").startswith(FLAG_SPEND_CAP)
             or _waits(t, store.list_attempts(t.id), store, cap)
+            or (t.id in pairs and pair_pick_wait(store, pairs[t.id]))
         )
     )
     out.append(f"{len(tickets)} ticket(s), {flagged} flagged for you, {waiting} waiting.")
@@ -345,6 +428,12 @@ __all__ = [
     "local_ollama_host",
     "local_only_lines",
     "ollama_line",
+    "pair_map",
+    "pair_model",
+    "pair_pick_wait",
+    "pair_side",
+    "pair_side_ready",
+    "pair_tag",
     "profile_lines",
     "render_status",
     "repos_line",
