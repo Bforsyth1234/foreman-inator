@@ -356,3 +356,19 @@ def test_attempt_gathers_conventions_with_the_rules_file(
         assert att.attributes["conventions.sha256"] == gathered[0].sha256
     finally:
         e.close()
+
+
+def test_thrifty_pause_lifts_when_the_next_writer_is_a_plan_model(env: Env) -> None:
+    from dataclasses import replace
+
+    env.store.set_profile(REPO, "thrifty", "normal")
+    n = env.label("Big", "Please add feature().", "tier:3")
+    env.once(passing(model_call=False))
+    t = env.ticket(n)
+    assert t.flag_reason and env.attempts(n) == []  # paused at the thrifty writer gate
+    assert env.worker.resume_paused(REPO) == []  # metered next writer: keeps waiting
+    cfg = env.worker.config
+    plan = tuple(replace(m, plan_usd_month=18.0) if m.tier == 3 else m for m in cfg.models)
+    env.worker.config = replace(cfg, models=plan)
+    assert env.worker.resume_paused(REPO) == [t.id]  # nothing would gate it: no approval
+    assert env.ticket(n).flag_reason is None
