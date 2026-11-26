@@ -65,7 +65,7 @@ in the item, and put the shape you rely on behind one small adapter so a
 change touches one file.
 ============================================================ -->
 
-Next ID: #85
+Next ID: #86
 Legend: `[ ]` todo · `[~]` in progress · `[~] live` built, waiting on its live check · `[x]` done (move to DONE.md)
 
 ## Wave plan
@@ -426,6 +426,30 @@ DECISIONS (assistant, 2026-11-25): allow that exact S3 host only as a redirect t
 Files: ⚬ EDITED: src/foreman_inator/tickets/images.py, its tests.
 Verify: fake transport `user-attachments` → 302 to the S3 host → 200 PNG is used; the same S3 URL given directly in issue text is refused; a redirect to another `*.s3.amazonaws.com` bucket is refused. Non-vacuous: remove the redirect-target allowance, first test fails. Live (user): re-run a ticket whose issue has a screenshot; no "redirect off" warning in `worker.out.log`. pytest + ruff gate (rule 8).
 Deviations:
+
+### Unscheduled (GLM Coding Plan quota, 2026-11-25)
+
+#85 — Track GLM Coding Plan credits and pause tier 2 at z.ai's quota errors [~] live · built 2026-11-25 on branch `glm-plan-quota` (from `glm-plan-spend`) · Added: 2026-11-25 · Source: user (subscribed to the GLM Coding Plan Lite, $18/month; goal: cancel the $100/month Max plan)
+Ask: the plan has credit limits per 5 hours and per week. z.ai offers no API to read usage, so estimate it locally from token counts, show it in `fman status`, and react to the 429 quota codes instead of burning attempts or escalating to Claude.
+DECISIONS (assistant, 2026-11-25):
+1. Credits per call = (uncached input × in_mult + cached input × cached_mult + output × out_mult) / 10,000; off-peak is half rate; peak is Mon–Fri 14:00–18:00 UTC+8. GLM-5.3 6.9/1.7/24, GLM-5.4 4.6/1.1/16, GLM-5.3-Flash 1.15/0.28/4. Table in `proxy/pricing.py` (source https://docs.z.ai/devpack/overview, read 2026-11-25). The temporary GLM-5.3-Flash 50% promotion (2026-11-24 to 2026-12-24) is not modelled: the estimate runs high, not low.
+2. Credits are stored on the `plan = 1` ledger rows (`spend_ledger.credits`, migration 014; #82's migration takes the next free number).
+3. `[[models]] plan_tier = "lite" | "pro" | "max"` picks the limits (Lite 2,000/10,000, Pro 12,000/60,000, Max 28,000/140,000). `fman status` shows "GLM credits (estimate): X of N in the last 5h, Y of M in the last 7 days": z.ai's 5-hour window starts at first use and its weekly window at purchase, so local rolling windows are approximations.
+4. Quota errors (https://docs.z.ai/api-reference/api-code, read 2026-11-25): HTTP 429 `{"error":{"code":"1308","message":"..."}}`. 1308 (5-hour), 1310 (weekly), 1316–1321 (other limit-reached cases) carry `{next_flush_time}` in the message; its format is undocumented, so it is parsed leniently (as UTC+8 when no zone is given) with a 1-hour retry fallback. 1309 (plan expired) waits for the user (`fman approve-spend <ticket>` after renewing). The parse lives in one adapter, `proxy/zai_quota.py`.
+5. On a quota code the plan model is paused until the reset (kept in the store, so a restart keeps it): its calls are refused before they are sent, a writer attempt on it is not started, and an attempt cut by it is set aside uncounted (no escalation to Claude) and the ticket waits with a `spend_cap: plan quota` flag that lifts itself at the reset.
+Files: ⚬ EDITED: src/foreman_inator/proxy/pricing.py, proxy/server.py, config.py, spend.py, db/store.py, worker_attempt.py, worker_rebase.py, docs/configuration.md · ⚬ NEW: proxy/zai_quota.py, plan_quota.py, db/migrations/014_plan_credits.sql, tests/test_plan_quota.py
+Verify:
+⚬ credit math: cached vs uncached, peak vs off-peak (test_plan_quota.py).
+⚬ status line shows credits against the plan's limits.
+⚬ a fake upstream answering 429 code 1308 / 1310 pauses the model until the parsed reset; the next call is refused before it is sent; the attempt is set aside uncounted.
+⚬ each new test shown failing with its change removed; pytest + ruff gate (rule 8).
+Live (user): set `plan_tier = "lite"` on the `glm` model in config.toml. After the next 5-hour limit hit, `fman status` shows the pause and the reset time, and the ticket resumes on its own. Compare the status line's credit estimate with z.ai's dashboard (https://z.ai/manage-apikey/subscription) once or twice; if it drifts, the multipliers in `proxy/pricing.py` need a re-read.
+Results (2026-11-25): tests/test_plan_quota.py (14 tests). Non-vacuous, each checked by breaking one piece: off-peak rate set to 1.0 → `test_off_peak_is_half_rate` fails; cached tokens priced as input → `test_cached_input_uses_the_cached_multiplier` fails; credits dropped from `status_line` → `test_status_line_shows_credits_against_the_plan_limits` fails; proxy no longer reports the 429 → both worker tests (1308, 1310) and the proxy test fail; worker `plan_gate` removed → the worker tests fail on the second ticket. Full suite 2237 passed, 1 skipped; ruff check and format clean.
+Deviations:
+⚬ z.ai documents `{next_flush_time}` only as a placeholder (no format, no zone), so the reset time is parsed leniently (decision 4) and checked on the worker's clock in `plan_quota` (past or more than 8 days ahead → retry in 1 hour).
+⚬ The pause is per account (`api_key_ref`, else base URL), not per model: the plan's quota is shared by every GLM model on the key. Credits are summed the same way.
+⚬ `fman approve-spend <ticket>` also lifts a quota pause (and uses up the approval): the only way out of 1309 (expired) and an override when the dashboard shows quota left before the reset.
+⚬ Migration 014 is taken here, so #82 needs the next free number (its text still says 013).
 
 ### Unscheduled (status on the issue, 2026-11-25)
 

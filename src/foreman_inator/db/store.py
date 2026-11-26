@@ -317,6 +317,7 @@ class SpendEntry:
     created_at: datetime
     chat_session_id: int | None = None  # migration 012 (#60)
     plan: bool = False  # migration 013: a flat-fee plan call, at list price; not in the caps
+    credits: float | None = None  # migration 014 (#85): estimated Coding Plan credits
 
 
 @dataclass(frozen=True, slots=True)
@@ -1567,10 +1568,12 @@ class Store:
         experiment_id: int | None = None,
         chat_session_id: int | None = None,
         plan: bool = False,
+        credits: float | None = None,
     ) -> SpendEntry:
         """One ledger row. ``chat_session_id`` (#60) tags a chat call's row; chat rows are
         bucket ``live`` (option C) but nothing here enforces that (``spend`` does).
-        ``plan`` (migration 013): a flat-fee plan call at list price, kept out of the caps."""
+        ``plan`` (migration 013): a flat-fee plan call at list price, kept out of the caps.
+        ``credits`` (migration 014, #85): its estimated Coding Plan credits."""
         values: dict[str, Any] = {
             "bucket": bucket,
             "cost_usd": float(cost_usd),
@@ -1584,6 +1587,8 @@ class Store:
             values["chat_session_id"] = chat_session_id
         if plan:  # only then: a store migrated part-way (before 013) has no column
             values["plan"] = True
+        if credits is not None:  # only then, as for ``plan``
+            values["credits"] = float(credits)
         entry_id = self._insert("spend_ledger", values)
         row = self._one("SELECT * FROM spend_ledger WHERE id = ?", (entry_id,))
         assert row is not None
@@ -1639,6 +1644,20 @@ class Store:
             params.append(_ts(until))
         rows = self.query(sql + " GROUP BY model", params)
         return {str(r["model"]): (int(r["n"]), float(r["total"])) for r in rows}
+
+    def plan_credits(self, model: str, *, since: datetime, until: datetime | None = None) -> float:
+        """#85: estimated Coding Plan credits of ``model``'s plan calls with
+        ``since <= created_at < until``, both buckets."""
+        sql = (
+            "SELECT COALESCE(SUM(credits), 0.0) AS total FROM spend_ledger"
+            " WHERE plan = 1 AND model = ? AND created_at >= ?"
+        )
+        params: list[Any] = [model, _ts(since)]
+        if until is not None:
+            sql += " AND created_at < ?"
+            params.append(_ts(until))
+        row = self._one(sql, params)
+        return float(row["total"]) if row else 0.0
 
     def approve_spend(self, ticket_id: int) -> SpendApproval:
         approval_id = self._insert(

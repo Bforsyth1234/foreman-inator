@@ -70,6 +70,10 @@ Spend hook (#18 replaces the no-op default). Called twice per call:
 estimate: prompt chars/3 tokens in, ``max_tokens``/``max_completion_tokens`` or 4,096
 out). Returning False (or raising) refuses the call with HTTP 429 ``spend_cap_reached``.
 ``phase="actual"`` after the call, with the real cost; its return value is ignored.
+For a flat-fee plan endpoint (``plan_usd_month``, #85) the actual call also gets
+``credits=`` (estimated GLM Coding Plan credits, ``pricing.plan_credits``) when the
+model has multipliers, and a 429 quota error from z.ai calls the hook once more with
+``phase="quota", quota=<zai_quota.QuotaHit>`` (cost 0) so the plan can be paused.
 The hook runs for local models too (cost 0) so it sees every call; it runs on the
 proxy's event loop thread, so keep it quick and thread-safe.
 
@@ -162,6 +166,7 @@ from collections import deque
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal, Protocol
 from urllib.parse import urlparse
@@ -177,12 +182,12 @@ from starlette.routing import Route
 from foreman_inator import tracing
 from foreman_inator.config import Config, ConfigError, ModelEndpoint
 
-from . import pricing
+from . import pricing, zai_quota
 
 log = logging.getLogger(__name__)
 
 Bucket = Literal["live", "experiments"]
-Phase = Literal["estimate", "actual"]
+Phase = Literal["estimate", "actual", "quota"]
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_MAX_OUT = 4096
 MESSAGES_PATH = "messages"  # #52: the Anthropic Messages passthrough
@@ -420,12 +425,18 @@ def _is_loopback(host: str) -> bool:
 
 class SpendHook(Protocol):
     def __call__(
-        self, endpoint: ModelEndpoint, cost_usd: float, context: CallContext, *, phase: Phase
+        self,
+        endpoint: ModelEndpoint,
+        cost_usd: float,
+        context: CallContext,
+        *,
+        phase: Phase,
+        **extra: Any,
     ) -> bool | None: ...
 
 
 def no_spend_hook(
-    endpoint: ModelEndpoint, cost_usd: float, context: CallContext, *, phase: Phase
+    endpoint: ModelEndpoint, cost_usd: float, context: CallContext, *, phase: Phase, **extra: Any
 ) -> bool:
     """The default: allow everything (#18 supplies the real caps)."""
     return True
@@ -1421,8 +1432,21 @@ class ModelProxy:
                 err += f": {call.error_text}"
             if key and key.encode() in data:  # never hand our own key back (7c)
                 data = data.replace(key.encode(), b"[redacted]")
+            if ep.plan_usd_month is not None:
+                self._quota_hit(ep, call.ctx, resp.status_code, data)
         call.finish(status=resp.status_code, error=err)
         return Response(data, status_code=resp.status_code, headers=out_headers)
+
+    def _quota_hit(self, ep: ModelEndpoint, ctx: CallContext, status: int, data: bytes) -> None:
+        """#85: tell the spend hook about a Coding Plan quota error (429 1308-1321)."""
+        hit = zai_quota.parse_quota_error(status, data)
+        if hit is None:
+            return
+        log.warning("proxy: %s plan quota: z.ai code %s (%s)", ep.name, hit.code, hit.kind)
+        try:
+            self.spend_hook(ep, 0.0, ctx, phase="quota", quota=hit)
+        except Exception as exc:
+            log.warning("proxy: spend hook (quota) failed: %s", type(exc).__name__)
 
     # ------------------------------------------------------------------ refused parameters
 
@@ -1761,8 +1785,15 @@ class _Call:
                 self.proxy.on_usage(record)
             except Exception as exc:
                 log.warning("proxy: on_usage callback failed: %s", type(exc).__name__)
+        extra: dict[str, Any] = {}
+        if self.ep.plan_usd_month is not None and (tokens_in or tokens_out):
+            credits = pricing.plan_credits(
+                self.ep.model, tokens_in, tokens_out, cache_read=cache_read, at=datetime.now(UTC)
+            )
+            if credits is not None:
+                extra["credits"] = credits
         try:
-            self.proxy.spend_hook(self.ep, cost, ctx, phase="actual")
+            self.proxy.spend_hook(self.ep, cost, ctx, phase="actual", **extra)
         except Exception as exc:
             log.warning("proxy: spend hook (actual) failed: %s", type(exc).__name__)
 
