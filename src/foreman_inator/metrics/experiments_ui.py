@@ -27,6 +27,12 @@ read-only ``GET /experiments``):
   calls ``worker_experiments.promote`` (the CLI's function) only with ``confirm=yes`` and
   the champion the confirm page showed. Without them nothing changes.
 
+Head-to-head pairs (``ab:pair``, #34): the manage page lists the W-L and cost per win per
+model pair (``experiments.pair.score``) when any pair is decided, and a running
+``mode='pair'`` experiment's result is its record. The promote page and result show a
+writer's pair record (``status_lines`` / ``promote``'s message); it never gates promotion
+(Decision 2), so no form here reads it.
+
 Every POST goes through ``forms.FormGuard`` (CSRF token, own loopback Origin/Host); GETs
 open a read-only store. Everything from the database or a run's output is escaped.
 """
@@ -319,7 +325,32 @@ def _message(text: str | None, error: bool = False) -> str:
     if not text:
         return ""
     cls = ' class="error"' if error else ""
-    return f"<p{cls}>{e(text)}</p>"
+    return f"<p{cls}>{'<br>'.join(e(line) for line in text.splitlines())}</p>"
+
+
+def _pairs_table(store: Store) -> str:
+    """Decided ``ab:pair`` records per model pair (#34); empty when none (shown only)."""
+    from foreman_inator.experiments import pair
+
+    try:
+        records = pair.score(store)
+    except Exception as exc:  # a broken pair row must not hide the page
+        log.warning("pair records not read: %s", exc)
+        return ""
+    if not records:
+        return ""
+
+    def cpw(x: float | None) -> str:
+        return "-" if x is None else f"${x:.4f}"
+
+    rows = [
+        f"<tr><td>{e(r.a)}</td><td>{e(r.b)}</td><td>{r.a_wins}-{r.b_wins}</td>"
+        f"<td>{cpw(r.a_cost_per_win)}</td><td>{cpw(r.b_cost_per_win)}</td></tr>"
+        for r in records
+    ]
+    head = "<tr><th>Side A</th><th>Side B (opponent)</th><th>W-L</th>"
+    head += "<th>A cost per win</th><th>B cost per win</th></tr>"
+    return _table("Head-to-head pairs (shown only; promotion does not use them)", head, rows)
 
 
 # =========================================================================== routes
@@ -385,7 +416,7 @@ def routes(
         store = read_store()
         try:
             champs = "".join(f"<li>{e(line)}</li>" for line in variants.status_lines(store))
-            running = _running_table(guard, store, cfg)
+            running = _running_table(guard, store, cfg) + _pairs_table(store)
             propose = _propose_section(guard, store)
         finally:
             store.close()

@@ -1,6 +1,13 @@
 """``fman experiment status`` and ``fman experiment promote`` (todo #29).
 
 The promotion rule is described in ``worker_experiments`` ("Experiments and promotion").
+
+``ab:pair`` records (#34, Decision 2) are SHOWN, never gating: ``status`` prints the W-L
+per model pair of a ``mode='pair'`` experiment and, for a writer variant, of every decided
+pair it played in; ``promote`` decides exactly as without pair data (the same outcome,
+experiments ended, champion and history note) and only appends those lines to its
+message. Promoting or rejecting a writer also ends its running pair experiments with the
+same status (not listed in the result's ``experiments``).
 """
 
 from __future__ import annotations
@@ -10,6 +17,7 @@ from dataclasses import dataclass
 
 from foreman_inator.config import Config
 from foreman_inator.db.store import Experiment, Store
+from foreman_inator.experiments import pair as pair_mod
 from foreman_inator.experiments import replay_runner as rr
 from foreman_inator.experiments import shadow, variants
 from foreman_inator.experiments import split as split_mod
@@ -57,6 +65,12 @@ def summary(store: Store, exp: Experiment, config: Config) -> str:
             return split_mod.summary(store, exp.id, min_sample=config.experiments.live_min_sample)
         except Exception as exc:
             return f"not scored ({type(exc).__name__})"
+    if exp.mode == "pair":  # #34: W-L and cost per win, read live
+        try:
+            records = pair_mod.score(store, experiment_id=exp.id)
+        except Exception as exc:
+            return f"not scored ({type(exc).__name__})"
+        return "; ".join(pair_mod.note(records).splitlines())
     if exp.mode == "seeded":  # #35: the note's first line; the details print it whole
         lines = (exp.result_note or "").splitlines()
         return lines[0] if lines else "not finished"
@@ -78,6 +92,8 @@ def status_lines(store: Store, config: Config, experiment_id: int | None = None)
         ]
         if exp.mode in ("replay", "seeded") and exp.result_note:
             lines += ["", *exp.result_note.splitlines()]
+        if exp.role == "writer" and exp.mode != "pair":
+            lines += pair_lines(store, exp.challenger_variant)
         return lines
     lines = [f"Champion {line}" for line in variants.status_lines(store)]
     exps = store.list_experiments()
@@ -88,7 +104,33 @@ def status_lines(store: Store, config: Config, experiment_id: int | None = None)
     if ended:
         lines.append("Ended (latest 10):")
         lines += [_line(store, e, config) for e in ended]
+    records = _records(store)
+    if records:
+        lines.append(f"Head-to-head pairs ({sum(r.decided for r in records)} decided):")
+        lines += [f"  {line}" for line in pair_mod.note(records).splitlines()]
     return lines
+
+
+def _records(store: Store, variant: str | None = None) -> list[pair_mod.PairRecord]:
+    """Decided pair records (all, or those ``variant`` played in); [] on any error."""
+    try:
+        records = pair_mod.score(store)
+    except Exception as exc:  # shown only: a broken pair row never breaks status/promote
+        log.warning("pair records not read: %s", exc)
+        return []
+    if variant is None:
+        return records
+    return [r for r in records if variant in (r.a, r.b)]
+
+
+def pair_lines(store: Store, variant: str) -> list[str]:
+    """The head-to-head lines for one writer variant (shown, not gating); [] if none."""
+    records = _records(store, variant)
+    if not records:
+        return []
+    return ["", "Head-to-head pairs (shown only; promotion does not use them):"] + [
+        f"  {line}" for line in pair_mod.note(records).splitlines()
+    ]
 
 
 def _origin(e: Experiment) -> str:
@@ -140,8 +182,32 @@ def _end(store: Store, exps: list[Experiment], status: str, why: str) -> tuple[i
 def promote(
     store: Store, config: Config, target: str, *, replay_only: bool = False
 ) -> PromoteResult:
-    """SPEC's promotion rule; see the module docstring. Nothing else changes a champion."""
+    """SPEC's promotion rule; see the module docstring. Nothing else changes a champion.
+    Pair records only add lines to the message (Decision 2)."""
     role, vid = _target(store, target)
+    res = _decide(store, config, role, vid, replay_only=replay_only)
+    if role != "writer":
+        return res
+    if res.outcome in ("promoted", "rejected"):
+        _end_pairs(store, vid, res.outcome)
+    extra = pair_lines(store, vid)
+    if not extra:
+        return res
+    return PromoteResult(res.outcome, "\n".join([res.message, *extra[1:]]), res.experiments)
+
+
+def _end_pairs(store: Store, vid: str, status: str) -> None:
+    for e in store.list_experiments(role="writer", status="running"):
+        if e.mode == "pair" and e.challenger_variant == vid:
+            note = pair_mod.note(pair_mod.score(store, experiment_id=e.id))
+            store.end_experiment(e.id, status, f"{note}\n{status} by `fman experiment promote`")  # type: ignore[arg-type]
+            log.info("experiment %d: %s", e.id, status)
+
+
+def _decide(
+    store: Store, config: Config, role: rr.Role, vid: str, *, replay_only: bool
+) -> PromoteResult:
+    """The promotion decision itself; it never reads a pair."""
     if variants.lookup(store, vid) is None:
         return PromoteResult("refused", f"{vid} is not a registered variant")
     current = variants.champion(store, role)

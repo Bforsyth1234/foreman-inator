@@ -52,6 +52,11 @@ Readings shared by every metric (SPEC leaves these open; also listed in the item
   were later reverted or followed up (``post_merge_signals``, found by
   ``metrics.quality.scan``). A reverted ticket still counts as accepted in every other
   metric here: the signal is shown next to the accepted count, not subtracted from it.
+* **Pairs** (``ab:pair``, #34): a pair's losing side is a dropped ticket, so it is out of
+  every metric like any dropped ticket, except that its spend is charged to the winner
+  in cost per accepted ticket and the cost trend (``pair_loser_spend_usd``, decided
+  pairs only). ``pair_record`` is the W-L per model pair (``experiments.pair.score``);
+  only the repo filter applies to it. Unpaired tickets read exactly as before.
 * **Local** = accepted on tier 1 or 2 (SPEC "Routing and escalation": tiers 1–2 are
   local, tier 3 is cloud).
 * **Chat** (#60, docs/chat-design.md sections 5 and 6): chat sessions never feed the
@@ -78,6 +83,8 @@ from typing import Any, Literal
 
 from foreman_inator.config import DEFAULT_CHAT_MONTHLY_USD
 from foreman_inator.db.store import Store
+from foreman_inator.experiments import pair as pair_mod
+from foreman_inator.experiments.pair import PairRecord
 
 Bucket = Literal["day", "week", "month"]
 BUCKETS: tuple[str, ...] = ("day", "week", "month")
@@ -283,6 +290,14 @@ started AS (
              WHERE ra.ticket_id = s.id AND r.shadow = 0) AS spend_usd,
         (SELECT COALESCE(SUM(a.cost_usd), 0) FROM attempts a
          WHERE a.ticket_id = s.id) AS attempt_spend_usd,
+        (SELECT COALESCE(SUM(pa.cost_usd), 0) FROM pairs p
+         JOIN attempts pa ON pa.ticket_id = p.ticket_a + p.ticket_b - s.id
+         WHERE p.status = 'decided' AND p.winner_ticket_id = s.id)
+          + (SELECT COALESCE(SUM(r.cost_usd), 0) FROM pairs p
+             JOIN attempts ra ON ra.ticket_id = p.ticket_a + p.ticket_b - s.id
+             JOIN reviews r ON r.attempt_id = ra.id
+             WHERE p.status = 'decided' AND p.winner_ticket_id = s.id AND r.shadow = 0)
+          AS pair_loser_spend_usd,
         (SELECT COALESCE(SUM(a.seconds), 0) FROM attempts a
          WHERE a.ticket_id = s.id) AS attempt_seconds,
         (SELECT COUNT(*) FROM kickbacks k JOIN attempts ka ON ka.id = k.attempt_id
@@ -396,10 +411,14 @@ def cost_per_accepted_ticket(store: Store, filt: MetricsFilter | None = None) ->
     Implemented: for closed tickets started on the model, the sum of every attempt's
     cost (failed, superseded and explore attempts included) plus every non-shadow AI
     review's cost ÷ the number of those tickets. Spend on tickets still open is left
-    out until they close (the denominator only has accepted tickets).
+    out until they close (the denominator only has accepted tickets). A ``ab:pair``
+    winner also carries its losing sibling's spend (attempts plus non-shadow reviews,
+    through ``pairs``): the loser is dropped, so without this its spend would vanish
+    from every metric, and the head-to-head is what bought the accepted change.
     """
     sql = _STARTED + (
-        "SELECT COALESCE(SUM(spend_usd), 0) AS total, COUNT(*) AS n FROM started WHERE closed"
+        "SELECT COALESCE(SUM(spend_usd + pair_loser_spend_usd), 0) AS total, COUNT(*) AS n"
+        " FROM started WHERE closed"
     )
     row = store.query(sql, _p(filt))[0]
     return Mean(float(row["total"]), int(row["n"]))
@@ -587,7 +606,7 @@ def trend(
         raise ValueError(f"bucket must be one of {BUCKETS}")
     sql = _STARTED + (
         f"SELECT {_BUCKET_SQL[bucket]} AS bucket, COUNT(*) AS accepted,"
-        " COALESCE(SUM(spend_usd), 0) AS spend,"
+        " COALESCE(SUM(spend_usd + pair_loser_spend_usd), 0) AS spend,"
         " COALESCE(SUM(accepted_tier IN (1, 2)), 0) AS local"
         " FROM started WHERE closed GROUP BY 1 ORDER BY 1"
     )
@@ -990,6 +1009,8 @@ class Report:
     # #60: tickets vs chat vs experiments (never part of a writer/router metric)
     spend: SpendSplit | None = None
     spend_trend: list[SpendPoint] = field(default_factory=list)
+    # #34: ab:pair W-L per model pair (shown only; never gates promotion)
+    pairs: list[PairRecord] = field(default_factory=list)
 
 
 def writer_row(store: Store, filt: MetricsFilter) -> WriterRow:
@@ -1037,7 +1058,15 @@ def report(
         recent=recent_tickets(store, filt),
         spend=spend_split(store, filt, chat_monthly_usd=chat_monthly_usd, month=month),
         spend_trend=spend_trend(store, filt, bucket=bucket),
+        pairs=pair_record(store, filt),
     )
+
+
+def pair_record(store: Store, filt: MetricsFilter | None = None) -> list[PairRecord]:
+    """W-L and cost per win per model pair over decided ``ab:pair`` pairs (#34), from
+    ``experiments.pair.score``. Only the repo filter applies (a pair's two sides are on
+    two models, so the model filter does not pick one). Empty when nothing is paired."""
+    return pair_mod.score(store, repo=(filt or MetricsFilter()).repo)
 
 
 # --- failure steps per variant (#27, wired in #29) -------------------------------------
@@ -1172,6 +1201,7 @@ __all__ = [
     "first_try_accept_rate",
     "kickbacks_per_ticket",
     "local_share",
+    "pair_record",
     "post_merge_quality",
     "recent_tickets",
     "report",
