@@ -268,3 +268,20 @@ def test_cancel_in_this_process_waits_for_the_call_in_flight(store, clock):
 def test_migration_015_columns(store):
     cols = {r["name"] for r in store.query("PRAGMA table_info(spend_approvals)")}
     assert {"attempt_id", "kind", "limit_usd", "spent_usd", "settled_at", "reopened"} <= cols
+
+
+def test_approving_again_replaces_a_part_spent_carried_approval(store, clock):
+    """Review fix: `fman approve-spend` on a ticket whose carried approval has only
+    scraps left gives a fresh full approval, not the scraps."""
+    tid = ticket(store)
+    spend = make_spend(store)
+    first = spend.approve(tid)
+    assert spend.approve(tid).id == first.id  # unused: idempotent, as before
+    store.consume_spend_approval(first.id, kind="attempt")
+    store.add_spend_approval_spend(first.id, 4.80)
+    assert store.reopen_spend_approval(first.id)  # carried with $0.20 left
+    second = spend.approve(tid)
+    assert second.id != first.id
+    assert second.spent_usd == 0.0
+    assert store.open_spend_approval(tid).id == second.id
+    assert store.get_spend_approval(first.id).settled_at is not None

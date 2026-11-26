@@ -1365,7 +1365,14 @@ class Spend:
         if ticket.column in ("done", "dropped"):
             raise SpendError(f"ticket {ticket_id} is {ticket.column}; nothing to approve")
         existing = self.store.open_spend_approval(ticket_id)
-        return existing if existing is not None else self.store.approve_spend(ticket_id)
+        if existing is not None and existing.spent_usd <= _EPS:
+            return existing
+        if existing is not None:
+            # #82: a carried approval with part of it spent: the user asked for a new
+            # one, so close the leftover and give a fresh full approval (the leftover
+            # may be too small for the next call, which would flag the ticket again).
+            self.store.close_spend_approval(existing.id)
+        return self.store.approve_spend(ticket_id)
 
     def resume_reason(self, ticket: Ticket) -> Literal["approved", "cap_clear"] | None:
         """For a ticket paused at the cap: why it may run again now, or None to keep

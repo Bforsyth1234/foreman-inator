@@ -1758,6 +1758,18 @@ class Store:
             )
             return cur.rowcount == 1
 
+    def close_spend_approval(self, approval_id: int) -> bool:
+        """#82: close an approval whether or not it is in use (a carried one the user
+        replaces with a fresh approval). False if it was already closed."""
+        with self.transaction() as conn:
+            now = _ts(self.now())
+            cur = conn.execute(
+                "UPDATE spend_approvals SET consumed_at = COALESCE(consumed_at, ?),"
+                " settled_at = ? WHERE id = ? AND settled_at IS NULL",
+                (now, now, approval_id),
+            )
+            return cur.rowcount == 1
+
     def reopen_spend_approval(self, approval_id: int) -> bool:
         """#82: its attempt was cut short with room left: open again for the ticket's
         next attempt, keeping its room and its spend. False if closed meanwhile."""
