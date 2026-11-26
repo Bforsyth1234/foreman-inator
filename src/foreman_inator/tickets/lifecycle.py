@@ -71,8 +71,9 @@ default to False and then the table above holds exactly.
 * ``ClosedUnmerged(paired=True)``: ``what="pr"`` → that side ``dropped``, recorded
   ``rejected``; the sibling continues alone (decision 4). ``what="issue"`` and
   ``AgentLabelRemoved(paired=True)`` drop the side and the pair. ``Merged(paired=True)``
-  records the win. Each adds ``RECORD_PAIR_RESULT``; ``pair_result(event)`` is its payload
-  and ``pair_status`` the ``pairs.status`` to store.
+  records the win. Each adds ``RECORD_PAIR_RESULT``; ``pair_result(event)`` is its payload,
+  ``pair_status`` the ``pairs.status`` it leads to and ``pair_store_op`` the store call
+  (``decide_pair`` / ``drop_pair``, or nothing while a rejected side's sibling goes on).
 * Locks: a pair is one lock holder, so ``RELEASE_LOCKS`` on a paired side releases only
   when ``pair_locks_releasable(sibling_column)`` (the sibling is terminal too). The
   transitions still emit ``RELEASE_LOCKS``; the handler makes that check.
@@ -85,6 +86,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import StrEnum
 from typing import Literal, Protocol
+
+from foreman_inator.db.store import LoserOutcome, PairStatus
 
 Column = Literal["todo", "in_progress", "testing", "done", "dropped"]
 OPEN: frozenset[str] = frozenset({"todo", "in_progress", "testing"})
@@ -546,7 +549,6 @@ def apply(column: str | None, event: Event) -> Transition:
 #: What happened to one side of a pair (``won`` / ``merged_other`` / ``rejected`` match
 #: ``pairs.winner_ticket_id`` and ``pairs.loser_outcome``; ``dropped`` = no result).
 PairOutcome = Literal["won", "merged_other", "rejected", "dropped"]
-PairStatus = Literal["running", "decided", "dropped"]
 
 
 @dataclass(frozen=True)
@@ -561,7 +563,7 @@ class PairResult:
     ticket_id: int
     outcome: PairOutcome
     winner_ticket_id: int | None = None
-    loser_outcome: Literal["merged_other", "rejected"] | None = None
+    loser_outcome: LoserOutcome | None = None
     flag_reason: str | None = None
 
 
@@ -597,6 +599,47 @@ def pair_status(outcome: PairOutcome, sibling_column: str | None) -> PairStatus:
     if outcome == "rejected" and sibling_column in OPEN:
         return "running"
     return "dropped"
+
+
+@dataclass(frozen=True)
+class PairOp:
+    """The store call ``RECORD_PAIR_RESULT`` makes: ``decide`` →
+    ``store.decide_pair(pair_id, winner_ticket_id=, loser_outcome=)``; ``drop`` →
+    ``store.drop_pair(pair_id)``."""
+
+    kind: Literal["decide", "drop"]
+    winner_ticket_id: int | None = None
+    loser_outcome: LoserOutcome | None = None
+
+
+def pair_store_op(
+    result: PairResult, *, sibling_id: int, pair_now: PairStatus, sibling_column: str | None
+) -> PairOp | None:
+    """The store call for ``result`` on a pair now ``pair_now`` whose other side is
+    ``sibling_id`` in ``sibling_column``; None: nothing to store.
+
+    A pair that is no longer running is left alone (``decide_pair`` re-decides only with
+    the same result; ``drop_pair`` never undoes a result), except that a re-read merge or
+    ``PairLost`` re-sends its decision, which the store treats as a no-op. A merge whose
+    sibling was already ``dropped`` (its PR closed alone, decision 4) wins over a
+    ``rejected`` loser; otherwise the loser lost to the merge (``merged_other``)."""
+    if result.outcome == "won":
+        lost = "rejected" if sibling_column == "dropped" else "merged_other"
+        if pair_now == "dropped":
+            return None
+        return PairOp("decide", result.ticket_id, lost)
+    if result.outcome == "merged_other":
+        if pair_now == "dropped":
+            return None
+        return PairOp("decide", result.winner_ticket_id, "merged_other")
+    if pair_now != "running":
+        return None
+    status = pair_status(result.outcome, sibling_column)
+    if status == "running":
+        return None  # rejected while the sibling goes on alone: its merge decides
+    if status == "decided":  # the sibling was merged first; record that win
+        return PairOp("decide", sibling_id, "merged_other")
+    return PairOp("drop")
 
 
 def pair_locks_releasable(sibling_column: str | None) -> bool:
@@ -750,11 +793,13 @@ __all__ = [
     "PairOutcome",
     "PairRemoved",
     "PairRequested",
+    "PairOp",
     "PairResult",
     "PairStatus",
     "pair_locks_releasable",
     "pair_result",
     "pair_status",
+    "pair_store_op",
     "REBASE_CAP",
     "AIReviewed",
     "Action",

@@ -41,7 +41,8 @@ The record (``record`` / ``score``)
 -----------------------------------
 ``record`` stores the decision through ``store.decide_pair``: the merged side wins and
 the other is ``merged_other``; a side whose PR the user closed alone loses ``rejected``
-and the survivor is the winner (Decision 4). ``score`` groups decided pairs by model
+and the survivor wins once it is merged (Decision 4; until then the pair stays running,
+see ``lifecycle.pair_store_op``). ``score`` groups decided pairs by model
 pair (side A's first-attempt variant, side B's opponent variant) into W-L and cost per
 win, where a pair's cost is BOTH tickets' attempts plus their non-shadow reviews, so the
 loser's spend is charged to the win.
@@ -52,18 +53,18 @@ from __future__ import annotations
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, cast
 
 from fde_kit.prompts import PromptRef
 
 from foreman_inator.config import ConfigError, ModelEndpoint
+from foreman_inator.db.store import LoserOutcome, OpponentReason, Pair, Store, Ticket
 from foreman_inator.experiments import split, variants
 from foreman_inator.routing import escalation as esc
 
 log = logging.getLogger("foreman_inator.experiments")
 
-Reason = Literal["challenger", "next_rung", "lower_rung"]
-LoserOutcome = Literal["merged_other", "rejected"]
+Reason = OpponentReason
 REASONS: tuple[str, ...] = ("challenger", "next_rung", "lower_rung")
 LOSER_OUTCOMES: tuple[str, ...] = ("merged_other", "rejected")
 
@@ -176,16 +177,15 @@ class PairPick:
     experiment_id: int | None = None
 
 
-def pair_for(store: Any, ticket: Any) -> Any:
-    """The ticket's pair row, or None (also when the store has no Pair API)."""
-    fn = getattr(store, "pair_for_ticket", None)
-    return None if fn is None else fn(ticket.id)
+def pair_for(store: Store, ticket: Ticket) -> Pair | None:
+    """The ticket's pair row (any status), or None for an unpaired ticket."""
+    return store.pair_for_ticket(ticket.id)
 
 
 def pick(
-    store: Any,
+    store: Store,
     config: Any,
-    ticket: Any,
+    ticket: Ticket,
     step: Any,
     endpoint: ModelEndpoint,
     counted: Sequence[Any],
@@ -193,20 +193,18 @@ def pick(
     local_only: bool = False,
 ) -> PairPick | None:
     """The opponent pin for side B's first attempt (see the module docstring)."""
-    if getattr(ticket, "pair_side", None) != "b":
+    if ticket.pair_side != "b":
         return None
     if any(getattr(a, "outcome", None) != "superseded" for a in counted):
         return None  # not the first attempt: escalation decides
     if not isinstance(step, esc.Retry) or isinstance(step, esc.Escalate):
         return None
     pair = pair_for(store, ticket)
-    if pair is None or getattr(pair, "status", None) != "running":
+    if pair is None or pair.status != "running":
         return None
-    reason = getattr(pair, "opponent_reason", None)
-    label = getattr(pair, "opponent_variant", None)
+    reason, label, exp_id = pair.opponent_reason, pair.opponent_variant, pair.experiment_id
     if reason not in REASONS or not label:
         return None
-    exp_id = getattr(pair, "experiment_id", None)
     template: PromptRef | None = None
     if reason == "challenger":
         try:
@@ -233,15 +231,16 @@ def pick(
 # =========================================================================== results
 
 
-def record(store: Any, pair: Any, winner: Any, outcome: str) -> Any:
+def record(store: Store, pair: Pair, winner: Ticket | int, outcome: str) -> Pair:
     """Store the pair's decision. ``winner``: the winning side's ticket (or its id);
     ``outcome``: the loser's, ``merged_other`` or ``rejected``. Returns the decided pair."""
     if outcome not in LOSER_OUTCOMES:
         raise ValueError(f"loser outcome must be one of {LOSER_OUTCOMES}, not {outcome!r}")
-    wid = int(getattr(winner, "id", winner))
+    wid = winner if isinstance(winner, int) else winner.id
     if wid not in (pair.ticket_a, pair.ticket_b):
         raise ValueError(f"ticket {wid} is not a side of pair #{pair.id}")
-    return store.decide_pair(pair.id, wid, outcome)
+    lost = cast(LoserOutcome, outcome)
+    return store.decide_pair(pair.id, winner_ticket_id=wid, loser_outcome=lost)
 
 
 @dataclass(frozen=True, slots=True)
@@ -268,7 +267,7 @@ class PairRecord:
         return self.b_cost_usd / self.b_wins if self.b_wins else None
 
 
-def ticket_cost(store: Any, ticket_id: int) -> float:
+def ticket_cost(store: Store, ticket_id: int) -> float:
     """A ticket's writer attempts plus their non-shadow reviews."""
     att = store.query(
         "SELECT COALESCE(SUM(cost_usd), 0) AS c FROM attempts WHERE ticket_id = ?", (ticket_id,)
@@ -281,7 +280,7 @@ def ticket_cost(store: Any, ticket_id: int) -> float:
     return float(att or 0.0) + float(rev or 0.0)
 
 
-def side_a_variant(store: Any, ticket_id: int) -> str:
+def side_a_variant(store: Store, ticket_id: int) -> str:
     """Side A's first counted attempt's variant (else its model; else ``?``)."""
     rows = store.query(
         "SELECT variant_id, model FROM attempts WHERE ticket_id = ?"
@@ -294,17 +293,13 @@ def side_a_variant(store: Any, ticket_id: int) -> str:
 
 
 def score(
-    store: Any, *, experiment_id: int | None = None, repo: str | None = None
+    store: Store, *, experiment_id: int | None = None, repo: str | None = None
 ) -> list[PairRecord]:
     """W-L and cost per win per model pair over decided pairs (optionally one experiment's
     or one repo's), sorted by model pair."""
     acc: dict[tuple[str, str], list[float]] = {}
-    for p in store.list_pairs():
-        if getattr(p, "status", None) != "decided" or p.winner_ticket_id is None:
-            continue
-        if experiment_id is not None and getattr(p, "experiment_id", None) != experiment_id:
-            continue
-        if repo is not None and getattr(p, "repo", None) != repo:
+    for p in store.list_pairs(status="decided", experiment_id=experiment_id, repo=repo):
+        if p.winner_ticket_id is None:
             continue
         key = (side_a_variant(store, p.ticket_a), str(p.opponent_variant))
         row = acc.setdefault(key, [0, 0, 0.0, 0.0])

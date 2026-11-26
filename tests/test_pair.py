@@ -1,13 +1,12 @@
 """ab:pair (todo #34, GH #16): side B's opponent, its first-attempt pin, the pair record,
 and split.pick skipping paired tickets.
 
-The store's Pair API is built in parallel; ``PairStore`` fakes it (create/list/decide)
-over a real ``Store`` so the cost queries run against real attempt and review rows.
+Runs against the real ``Store`` Pair API (migration 016), so the pin, the decision and
+the cost queries read real pair, attempt and review rows.
 """
 
 from __future__ import annotations
 
-import dataclasses
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -16,7 +15,7 @@ import pytest
 
 from foreman_inator import prompts
 from foreman_inator.config import Config, ModelEndpoint, key_ref
-from foreman_inator.db.store import Store
+from foreman_inator.db.store import Pair, PairSide, Store, Ticket
 from foreman_inator.experiments import pair, split, variants
 from foreman_inator.routing import escalation as esc
 
@@ -119,45 +118,7 @@ def test_create_args_match_the_pair_columns():
     }
 
 
-# =========================================================================== fakes
-
-
-class PairStore:
-    """A real Store plus the design's Pair API (create_pair, pair_for_ticket,
-    decide_pair, list_pairs)."""
-
-    def __init__(self, store: Store) -> None:
-        self._s = store
-        self.pairs: list[Any] = []
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._s, name)
-
-    def create_pair(self, ticket_a: int, ticket_b: int, **kw: Any) -> Any:
-        p = SimpleNamespace(
-            id=len(self.pairs) + 1,
-            repo=REPO,
-            issue_number=1,
-            ticket_a=ticket_a,
-            ticket_b=ticket_b,
-            status="running",
-            winner_ticket_id=None,
-            loser_outcome=None,
-            **{"experiment_id": None, **kw},
-        )
-        self.pairs.append(p)
-        return p
-
-    def pair_for_ticket(self, ticket_id: int) -> Any:
-        return next((p for p in self.pairs if ticket_id in (p.ticket_a, p.ticket_b)), None)
-
-    def decide_pair(self, pair_id: int, winner_ticket_id: int, loser_outcome: str) -> Any:
-        p = self.pairs[pair_id - 1]
-        p.status, p.winner_ticket_id, p.loser_outcome = "decided", winner_ticket_id, loser_outcome
-        return p
-
-    def list_pairs(self) -> list[Any]:
-        return list(self.pairs)
+# =========================================================================== store
 
 
 @pytest.fixture
@@ -165,12 +126,12 @@ def env(tmp_path: Path):
     store = Store(tmp_path / "fman.db")
     config = make_config()
     variants.ensure_defaults(store, config)
-    yield PairStore(store), config
+    yield store, config
     store.close()
 
 
-def ticket(store: Any, n: int, side: str | None = None) -> Any:
-    t = store.create_ticket(
+def ticket(store: Store, n: int, side: PairSide | None = None) -> Ticket:
+    return store.create_ticket(
         repo=REPO,
         issue_number=n,
         title=f"T{n}",
@@ -178,16 +139,33 @@ def ticket(store: Any, n: int, side: str | None = None) -> Any:
         base_branch="main",
         route_reason="classifier: small",
         routed_tier=1,
+        pair_side=side,
     )
-    return SimpleNamespace(**{**dataclasses.asdict(t), "pair_side": side})
+
+
+def stored_exp(store: Store, model: str) -> Any:
+    """A real running writer experiment (so a pair row's experiment_id is a real one)."""
+    return store.create_experiment(
+        role="writer",
+        champion_variant=vid("w-one"),
+        challenger_variant=vid(model),
+        mode="pair",
+    )
+
+
+def set_opponent(store: Store, pair_id: int, variant: str) -> None:
+    """Rewrite a stored pair's opponent (a prompt or config change after it was opened)."""
+    with store.transaction() as conn:
+        conn.execute("UPDATE pairs SET opponent_variant = ? WHERE id = ?", (variant, pair_id))
 
 
 FIRST = esc.Retry("first", 1, "first attempt", "w-one")
 
 
-def opened(store: Any, opponent: pair.Opponent) -> tuple[Any, Any, Any]:
-    a, b = ticket(store, 1, "a"), ticket(store, 2, "b")
-    return a, b, store.create_pair(a.id, b.id, **pair.create_args(opponent))
+def opened(store: Store, opponent: pair.Opponent, n: int = 1) -> tuple[Ticket, Ticket, Pair]:
+    a, b = ticket(store, n), ticket(store, n, "b")
+    p = store.create_pair(ticket_a=a.id, ticket_b=b.id, **pair.create_args(opponent))
+    return store.get_ticket(a.id), b, p
 
 
 # =========================================================================== the pin
@@ -211,18 +189,19 @@ def test_pin_on_side_b_first_attempt_only(env):
     assert pair.pick(store, config, b, FIRST, config.model("w-alt"), [cut, done]) is None
     up = esc.Escalate("escalation", 2, "up", "w-two")
     assert pair.pick(store, config, b, up, config.model("w-two"), ()) is None
-    store.decide_pair(p.id, a.id, "merged_other")
+    store.decide_pair(p.id, winner_ticket_id=a.id, loser_outcome="merged_other")
     assert pair.pick(store, config, b, FIRST, config.model("w-one"), ()) is None  # not running
 
 
 def test_challenger_pin_runs_its_prompt_and_rechecks_7c(env):
     store, config = env
-    _, b, _ = opened(store, pair.choose_opponent(LADDER, rung("w-one"), experiment=exp("w-alt")))
+    x = stored_exp(store, "w-alt")
+    _, b, p = opened(store, pair.choose_opponent(LADDER, rung("w-one"), experiment=x))
     pk = pair.pick(store, config, b, FIRST, config.model("w-one"), ())
-    assert pk.endpoint.name == "w-alt" and pk.experiment_id == 4
+    assert pk.endpoint.name == "w-alt" and pk.experiment_id == x.id
     assert variants.variant_id(pk.endpoint.name, pk.template) == vid("w-alt")
     # stored challenger on the cloud against a local step: refused at run time
-    store.pairs[0].opponent_variant = vid("c-one")
+    set_opponent(store, p.id, vid("c-one"))
     assert pair.pick(store, config, b, FIRST, config.model("w-one"), ()) is None
 
 
@@ -248,7 +227,7 @@ def test_split_skips_paired_tickets(env, monkeypatch):
 # =========================================================================== results
 
 
-def spend(store: Any, t: Any, model: str, cost: float, review: float = 0.0) -> None:
+def spend(store: Store, t: Ticket, model: str, cost: float, review: float = 0.0) -> None:
     att = store.add_attempt(t.id, model=model, tier=1, trigger="first", variant_id=vid(model))
     store.add_attempt_usage(att.id, cost_usd=cost)
     store.finish_attempt(att.id, "accepted")
@@ -271,23 +250,27 @@ def test_record_validates_and_decides(env):
 
 def test_score_counts_wins_and_charges_the_losers_spend(env):
     store, _ = env
-    opp = pair.create_args(pair.choose_opponent(LADDER, rung("w-one"), experiment=exp("w-alt")))
+    x = stored_exp(store, "w-alt")
+    opp = pair.choose_opponent(LADDER, rung("w-one"), experiment=x)
     results = []
     for n, (ca, cb, a_wins) in enumerate([(1.0, 2.0, True), (0.5, 0.25, False), (3, 1, True)]):
-        a, b = ticket(store, 10 + 2 * n, "a"), ticket(store, 11 + 2 * n, "b")
-        p = store.create_pair(a.id, b.id, **opp)
+        a, b, p = opened(store, opp, 10 + n)
         spend(store, a, "w-one", ca, review=0.5)
         spend(store, b, "w-alt", cb)
         results.append((p, a if a_wins else b))
     for p, w in results:
         pair.record(store, p, w, "merged_other")
-    store.create_pair(ticket(store, 50, "a").id, ticket(store, 51, "b").id, **opp)  # running
+    opened(store, opp, 50)  # running: not scored
+    dropped = opened(store, opp, 51)[2]
+    store.drop_pair(dropped.id)  # dropped: not scored
     [r] = pair.score(store)
     assert (r.a, r.b, r.a_wins, r.b_wins, r.decided) == (vid("w-one"), vid("w-alt"), 2, 1, 3)
     # A's wins: (1 + .5 + 2) + (3 + .5 + 1) = 8.0 over 2 wins; B's: .5 + .5 + .25 = 1.25
     assert r.a_cost_per_win == pytest.approx(4.0)
     assert r.b_cost_per_win == pytest.approx(1.25)
-    assert pair.score(store, experiment_id=4) == [r]
-    assert pair.score(store, experiment_id=5) == []
+    assert pair.score(store, experiment_id=x.id) == [r]
+    assert pair.score(store, experiment_id=x.id + 1) == []
+    assert pair.score(store, repo=REPO) == [r]
+    assert pair.score(store, repo="other/repo") == []
     assert "2-1" in pair.note([r]) and "$4.0000" in pair.note([r])
     assert pair.note([]) == "pairs: none decided"

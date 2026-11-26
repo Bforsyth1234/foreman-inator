@@ -213,7 +213,7 @@ def pick(
     min_cases: int = 10,
 ) -> Pick | None:
     """The split's say over this attempt (see the module docstring); None: none."""
-    if getattr(ticket, "pair_side", None) is not None:
+    if ticket.pair_side is not None:
         return None  # #16: paired tickets are excluded from split assignment
     if is_override(ticket):
         return None

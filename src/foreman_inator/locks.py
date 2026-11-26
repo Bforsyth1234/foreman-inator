@@ -92,8 +92,7 @@ Rules
   ``release`` frees the pair's rows only when no other side is still open, or when the
   caller passes ``pair_over=True``; ``sweep`` keeps them while any side is open and not
   dormant (side A may be dropped while side B goes on alone). The pair link comes from
-  ``Store.pair_for_ticket`` (migration 016), looked up with ``getattr``: a store
-  without it has no pairs and every ticket is its own holder.
+  ``Store.pair_for_ticket`` (migration 016): an unpaired ticket is its own holder.
 """
 
 from __future__ import annotations
@@ -103,7 +102,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Literal
 
-from foreman_inator.db.store import Store, Ticket
+from foreman_inator.db.store import Pair, Store, Ticket
 
 OPEN_COLUMNS = ("todo", "in_progress", "testing")
 
@@ -492,24 +491,23 @@ class Locks:
 
     # -- pairs (#34) --
 
-    def _pair(self, tid: int) -> object | None:
-        """The ``Pair`` the ticket is a side of, or None (no pair, or no pair API yet)."""
-        lookup = getattr(self.store, "pair_for_ticket", None)
-        return lookup(tid) if lookup is not None else None
+    def _pair(self, tid: int) -> Pair | None:
+        """The ``Pair`` the ticket is a side of (any status), or None."""
+        return self.store.pair_for_ticket(tid)
 
     def holder_id(self, ticket: Ticket | int) -> int:
         """The id the ticket's lock rows are stored under: ``ticket_a`` for either side
         of a pair, the ticket's own id otherwise."""
         tid = _tid(ticket)
         pair = self._pair(tid)
-        return int(pair.ticket_a) if pair is not None else tid  # type: ignore[attr-defined]
+        return pair.ticket_a if pair is not None else tid
 
     def _sides(self, tid: int) -> tuple[int, ...]:
         """Both sides of the ticket's pair (``ticket_a`` first), or just the ticket."""
         pair = self._pair(tid)
         if pair is None:
             return (tid,)
-        return (int(pair.ticket_a), int(pair.ticket_b))  # type: ignore[attr-defined]
+        return (pair.ticket_a, pair.ticket_b)
 
     # -- reads --
 
