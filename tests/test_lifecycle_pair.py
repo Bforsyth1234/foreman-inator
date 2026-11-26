@@ -246,6 +246,28 @@ def test_merge_then_pair_lost_decides_once(store):
     assert _record(store, p, lost, "done") == won  # re-sent decision: a store no-op
 
 
+@pytest.mark.parametrize("lost_first", [True, False])
+def test_pair_lost_and_merge_in_either_order_decide_once(store, lost_first):
+    """A's merge and B's PairLost may be handled in either order; once B was cancelled
+    (column ``dropped``) A's merge must not try to re-decide the pair as ``rejected``."""
+    p = _pair(store, 1)
+    merged = Merged(REPO, 1, ticket_id=p.ticket_a, pr_number=10, paired=True)
+    lost = PairLost(
+        REPO, 1, ticket_id=p.ticket_b, sibling_ticket_id=p.ticket_a, sibling_pr_number=10
+    )
+    if lost_first:
+        _record(store, p, lost, "done")
+        final = _record(store, p, merged, "dropped")
+    else:
+        _record(store, p, merged, "testing")
+        final = _record(store, p, lost, "done")
+    assert (final.status, final.winner_ticket_id, final.loser_outcome) == (
+        "decided",
+        p.ticket_a,
+        "merged_other",
+    )
+
+
 def test_rejected_side_leaves_the_pair_running_until_the_survivor_merges(store):
     p = _pair(store, 1)
     assert _record(store, p, _closed(p.ticket_b), "in_progress").status == "running"

@@ -41,6 +41,7 @@ from foreman_inator.github.client import (
     MissingPermission,
     ReviewComment,
     log_tail,
+    require_deletable_fman_branch,
     require_fman_branch,
 )
 
@@ -387,6 +388,14 @@ class FakeGitHub:
         self.repos[repo].branches[branch] = sha
         return sha
 
+    def human_pr(
+        self, repo: str, *, head: str, base: str = "main", body: str = "", by: str = "brooks"
+    ) -> int:
+        """A PR someone else opened from a non-worker branch (the worker must not close it)."""
+        pr = self._new_item(repo, f"PR from {head}", body, by)
+        pr.is_pr, pr.head, pr.base = True, head, base
+        return pr.number
+
     # ------------------------------------------------------------------ GitHubAPI: identity
 
     def token(self) -> str:
@@ -509,9 +518,7 @@ class FakeGitHub:
         return Ref(f"refs/heads/{branch}", sha)
 
     def delete_branch(self, repo: str, branch: str) -> None:
-        require_fman_branch(branch)
-        if branch.rstrip("/") + "/" == "fman/":
-            raise ForbiddenOperation(f"branch {branch!r} names no worker branch")
+        require_deletable_fman_branch(branch)
         self._write("delete_branch", repo=repo, branch=branch)
         r = self._repo(repo)
         if branch not in r.branches:
@@ -552,6 +559,7 @@ class FakeGitHub:
         return self._pr_dc(self._pr(repo, number))
 
     def close_pr(self, repo: str, number: int) -> PullRequest:
+        require_fman_branch(self.get_pr(repo, number).head_ref)
         self._write("close_pr", repo=repo, number=number)
         pr = self._pr(repo, number)
         if pr.state == "open":

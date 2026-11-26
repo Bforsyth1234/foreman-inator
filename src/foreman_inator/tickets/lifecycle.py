@@ -619,14 +619,14 @@ def pair_store_op(
     ``sibling_id`` in ``sibling_column``; None: nothing to store.
 
     A pair that is no longer running is left alone (``decide_pair`` re-decides only with
-    the same result; ``drop_pair`` never undoes a result), except that a re-read merge or
+    the same result; ``drop_pair`` never undoes a result), except that a re-read
     ``PairLost`` re-sends its decision, which the store treats as a no-op. A merge whose
     sibling was already ``dropped`` (its PR closed alone, decision 4) wins over a
     ``rejected`` loser; otherwise the loser lost to the merge (``merged_other``)."""
     if result.outcome == "won":
+        if pair_now != "running":
+            return None  # already decided (e.g. the sibling's PairLost came first) or dropped
         lost = "rejected" if sibling_column == "dropped" else "merged_other"
-        if pair_now == "dropped":
-            return None
         return PairOp("decide", result.ticket_id, lost)
     if result.outcome == "merged_other":
         if pair_now == "dropped":

@@ -169,6 +169,8 @@ def test_client_close_pr_and_delete_branch_requests():
 
     def handler(request: httpx.Request) -> httpx.Response:
         seen.append(request)
+        if request.method == "GET":
+            return httpx.Response(200, json=_pr_json("open"))
         if request.method == "PATCH":
             return httpx.Response(200, json=_pr_json("closed"))
         return httpx.Response(204)
@@ -178,13 +180,52 @@ def test_client_close_pr_and_delete_branch_requests():
     assert pr.state == "closed"
     c.delete_branch(REPO, "fman/issue-1-b/a1")
     assert [(r.method, r.url.path) for r in seen] == [
+        ("GET", "/repos/octo/widgets/pulls/5"),
         ("PATCH", "/repos/octo/widgets/pulls/5"),
         ("DELETE", "/repos/octo/widgets/git/refs/heads/fman/issue-1-b/a1"),
     ]
-    assert json.loads(seen[0].content) == {"state": "closed"}
+    assert json.loads(seen[1].content) == {"state": "closed"}
 
 
-@pytest.mark.parametrize("branch", ["main", "feature/x", "fmanx/y", "fman/../main", "fman/"])
+def test_close_pr_refuses_a_non_fman_head_before_any_write():
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        body = _pr_json("open")
+        body["head"]["ref"] = "someone/feature"
+        return httpx.Response(200, json=body)
+
+    c = GitHubClient(_Auth(), transport=httpx.MockTransport(handler))  # type: ignore[arg-type]
+    with pytest.raises(ForbiddenOperation):
+        c.close_pr(REPO, 5)
+    assert [r.method for r in seen] == ["GET"]
+
+    fake = FakeGitHub()
+    fake.create_repo(REPO)
+    n = fake.create_issue(REPO, "Fix it", author="brooks")
+    fake.human_branch(REPO, "someone/feature")
+    num = fake.human_pr(REPO, head="someone/feature", body=f"Closes #{n}")
+    with pytest.raises(ForbiddenOperation):
+        fake.close_pr(REPO, num)
+    fake.assert_no_writes()
+    assert fake.get_pr(REPO, num).state == "open"
+
+
+@pytest.mark.parametrize(
+    "branch",
+    [
+        "main",
+        "feature/x",
+        "fmanx/y",
+        "fman/../main",
+        "fman/",
+        "fman/%2e%2e/x",
+        "fman/a..b",
+        "fman/x.lock",
+        "fman/ space",
+    ],
+)
 def test_delete_branch_refuses_non_fman_before_any_request(branch):
     seen: list[httpx.Request] = []
 
@@ -204,6 +245,29 @@ def test_delete_branch_refuses_non_fman_before_any_request(branch):
         fake.delete_branch(REPO, branch)
     fake.assert_no_writes()
     assert branch in fake.repos[REPO].branches
+
+
+def test_delete_and_update_branch_accept_a_normal_side_b_branch():
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if request.method == "PATCH":
+            return httpx.Response(200, json={"ref": "refs/heads/x", "object": {"sha": "a" * 40}})
+        return httpx.Response(204)
+
+    c = GitHubClient(_Auth(), transport=httpx.MockTransport(handler))  # type: ignore[arg-type]
+    c.delete_branch(REPO, "fman/issue-3-b/a1")
+    c.update_branch(REPO, "fman/issue-3-b/a1", "a" * 40)
+    assert [(r.method, r.url.raw_path) for r in seen] == [
+        ("DELETE", b"/repos/octo/widgets/git/refs/heads/fman/issue-3-b/a1"),
+        ("PATCH", b"/repos/octo/widgets/git/refs/heads/fman/issue-3-b/a1"),
+    ]
+    fake = FakeGitHub()
+    fake.create_repo(REPO)
+    fake.push_branch(REPO, "fman/issue-3-b/a1")
+    fake.delete_branch(REPO, "fman/issue-3-b/a1")
+    assert fake.deleted_branches == [(REPO, "fman/issue-3-b/a1")]
 
 
 def test_fake_records_close_and_delete_and_404s_unknown():

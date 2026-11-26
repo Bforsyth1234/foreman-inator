@@ -96,6 +96,7 @@ from urllib.parse import quote
 
 import httpx
 
+from ..runner.worktree import BranchRefused, check_branch
 from .app_auth import (
     API_URL,
     USER_AGENT,
@@ -349,6 +350,21 @@ def label_applied_by(events: Iterable[IssueEvent], label: str) -> str | None:
 def require_fman_branch(branch: str) -> None:
     if not branch.startswith(BRANCH_PREFIX) or ".." in branch:
         raise ForbiddenOperation(f"branch {branch!r} is not a worker branch ({BRANCH_PREFIX}*)")
+
+
+def require_deletable_fman_branch(branch: str) -> None:
+    """``delete_branch``'s guard (7a): an ``fman/`` branch that is also a valid git branch
+    name (the worktree's ``check_branch`` / ``git check-ref-format`` rules) and carries no
+    ``%`` (a percent-escape could name another ref once the URL is decoded)."""
+    require_fman_branch(branch)
+    if branch.rstrip("/") + "/" == BRANCH_PREFIX:
+        raise ForbiddenOperation(f"branch {branch!r} names no worker branch")
+    if "%" in branch:
+        raise ForbiddenOperation(f"branch {branch!r} is not a worker branch name")
+    try:
+        check_branch(branch)
+    except BranchRefused as e:
+        raise ForbiddenOperation(str(e)) from e
 
 
 def _split(repo: str) -> tuple[str, str]:
@@ -734,18 +750,18 @@ class GitHubClient:
         require_fman_branch(branch)
         o, r = _split(repo)
         data = self._json(
-            "PATCH", f"/repos/{o}/{r}/git/refs/heads/{branch}", json={"sha": sha, "force": force}
+            "PATCH",
+            f"/repos/{o}/{r}/git/refs/heads/{quote(branch, safe='/')}",
+            json={"sha": sha, "force": force},
         )
         return ref_from_json(data)
 
     def delete_branch(self, repo: str, branch: str) -> None:
         """ab:pair (#16): delete the losing side's head branch. Refuses anything not under
-        ``fman/`` (invariant 7a) before any request."""
-        require_fman_branch(branch)
-        if branch.rstrip("/") + "/" == BRANCH_PREFIX:
-            raise ForbiddenOperation(f"branch {branch!r} names no worker branch")
+        ``fman/`` or not a valid branch name (invariant 7a) before any request."""
+        require_deletable_fman_branch(branch)
         o, r = _split(repo)
-        self._json("DELETE", f"/repos/{o}/{r}/git/refs/heads/{branch}")
+        self._json("DELETE", f"/repos/{o}/{r}/git/refs/heads/{quote(branch, safe='/')}")
 
     # -- pull requests
 
@@ -773,7 +789,9 @@ class GitHubClient:
         return pr_from_json(self._json("GET", f"/repos/{o}/{r}/pulls/{number}"))
 
     def close_pr(self, repo: str, number: int) -> PullRequest:
-        """ab:pair (#16): close the losing side's PR (never merges: there is no merge method)."""
+        """ab:pair (#16): close the losing side's PR (never merges: there is no merge method).
+        Refuses, before any write, a PR whose head is not an ``fman/`` branch (7a)."""
+        require_fman_branch(self.get_pr(repo, number).head_ref)
         o, r = _split(repo)
         data = self._json("PATCH", f"/repos/{o}/{r}/pulls/{number}", json={"state": "closed"})
         return pr_from_json(data)
