@@ -66,6 +66,14 @@ Rules as implemented:
   tokens pass the limit by at most one call's input. ``None`` turns a limit off, and is
   the constructor's default (so a bare ``Spend`` keeps the old behaviour); the worker
   passes the config's values, whose defaults are the ``DEFAULT_ATTEMPT_*`` constants.
+* **Flat-fee plans.** A cloud model with ``plan_usd_month`` set (the GLM Coding Plan)
+  costs nothing per call, so its calls skip the daily, monthly and experiments caps,
+  approvals and the per-attempt USD budget; they reserve nothing. Each call is still
+  written to the ledger at its list price with ``plan = 1``, which ``spend_total``
+  leaves out, so ``summary().plans`` can show what the plan would have cost metered.
+  The local-only rule and the per-attempt input-token limit still apply. Chat calls
+  to a plan model skip the chat turn budget and the chat sub-cap too
+  (``chat_spend_total`` leaves plan rows out).
 * **Local only** (#49). A repo set ``cloud = false`` (``repo_settings.cloud = 0``,
   ``Store.set_cloud``) never sends its code to a cloud model. Escalation already stops at
   its last local tier and review picks a local reviewer; as defence in depth (invariant
@@ -229,6 +237,20 @@ class Refusal:
 
 
 @dataclass(frozen=True)
+class PlanUse:
+    """One flat-fee plan model this month: its fee and what its calls would have cost."""
+
+    model: str
+    fee_usd_month: float
+    calls: int
+    list_usd: float  # the same calls at pay-per-token list price
+
+    @property
+    def saved_usd(self) -> float:
+        return self.list_usd - self.fee_usd_month
+
+
+@dataclass(frozen=True)
 class SpendSummary:
     """Read-only numbers for `fman status` and the metrics page."""
 
@@ -251,6 +273,7 @@ class SpendSummary:
     live_blocked: bool
     experiments_blocked: bool
     open_approvals: int
+    plans: tuple[PlanUse, ...] = ()
 
     def as_dict(self) -> dict[str, object]:
         out = asdict(self)
@@ -268,6 +291,11 @@ class SpendSummary:
         )
         if self.live_blocked:
             line += " (live cap reached: tier 3 waits for `fman approve-spend`)"
+        for p in self.plans:
+            line += (
+                f"; {p.model} plan ${p.fee_usd_month:.2f}/month, not capped: {p.calls} calls"
+                f" this month, ${p.list_usd:.2f} at list price"
+            )
         return line
 
 
@@ -347,6 +375,8 @@ class Spend:
     ) -> None:
         self.store = store
         self.caps = config.spend_caps if isinstance(config, Config) else config
+        models = config.models if isinstance(config, Config) else ()
+        self.plan_fees = {m.name: m.plan_usd_month for m in models if m.plan_usd_month is not None}
         self._clock = clock or store.now
         self.tz: tzinfo | None = ZoneInfo(tz) if isinstance(tz, str) else tz
         if approval_usd is None:
@@ -469,16 +499,18 @@ class Spend:
         attempt_id: int | None = None,
         experiment_id: int | None = None,
         chat_session_id: int | None = None,
+        plan: bool = False,
     ) -> SpendEntry | None:
         """Write spend that happened to the ledger. Zero cost writes nothing. A chat row
-        carries ``chat_session_id`` (store column from migration 012)."""
+        carries ``chat_session_id`` (store column from migration 012). ``plan``: a
+        flat-fee plan call at list price, kept out of the caps (migration 013)."""
         if bucket not in BUCKETS:
             raise ValueError(f"unknown spend bucket {bucket!r}")
         if cost <= 0:
             return None
         if chat_session_id is not None:
             return self.store.record_spend(
-                bucket, cost, model=model, chat_session_id=chat_session_id
+                bucket, cost, model=model, chat_session_id=chat_session_id, plan=plan
             )
         return self.store.record_spend(
             bucket,
@@ -487,6 +519,7 @@ class Spend:
             ticket_id=ticket_id,
             attempt_id=attempt_id,
             experiment_id=experiment_id,
+            plan=plan,
         )
 
     # ------------------------------------------------------------------ the proxy hook
@@ -504,6 +537,19 @@ class Spend:
                 return self._local_estimate(endpoint, context)
             return None
         bucket = getattr(context, "bucket", "live")
+        if endpoint.plan_usd_month is not None:
+            if phase == "estimate":
+                return self._plan_estimate(endpoint, context, bucket)
+            who = self._who(context)
+            self.record(
+                float(cost_usd),
+                bucket if bucket in BUCKETS else "live",
+                model=endpoint.name,
+                ticket_id=who.ticket_id,
+                attempt_id=who.attempt_id,
+                plan=True,
+            )
+            return None
         if phase == "estimate":
             return self._estimate(endpoint, float(cost_usd), context, bucket)
         self._actual(endpoint, float(cost_usd), context, bucket)
@@ -547,17 +593,7 @@ class Spend:
             now = self.now()
             who = self._who(ctx)
             if not self._repo_allows_cloud(who):
-                refusal = _with_who(
-                    Refusal(bucket, "local_only", 0.0, 0.0, 0.0, estimate, None, now),  # type: ignore[arg-type]
-                    who,
-                    ep.name,
-                )
-                if who.attempt_id is not None:
-                    self._refusals_by_attempt[who.attempt_id] = refusal
-                log.warning(
-                    "spend: refused %s call: ticket %s's repo is local only", ep.name, who.ticket_id
-                )
-                return False
+                return self._refuse_local_only(ep, estimate, bucket, who, now)
             reserved = self._reserved(bucket, now)
             stop = self._attempt_check(ep, estimate, ctx, bucket, who, now)
             if stop is not None:
@@ -578,6 +614,35 @@ class Spend:
             res = _Reservation(estimate, now, who.attempt_id if granted else None)
             self._state.reservations.setdefault(key, deque()).append(res)
             return True
+
+    def _refuse_local_only(
+        self, ep: ModelEndpoint, estimate: float, bucket: str, who: _Who, now: datetime
+    ) -> bool:
+        refusal = _with_who(
+            Refusal(bucket, "local_only", 0.0, 0.0, 0.0, estimate, None, now),  # type: ignore[arg-type]
+            who,
+            ep.name,
+        )
+        if who.attempt_id is not None:
+            self._refusals_by_attempt[who.attempt_id] = refusal
+        log.warning(
+            "spend: refused %s call: ticket %s's repo is local only", ep.name, who.ticket_id
+        )
+        return False
+
+    def _plan_estimate(self, ep: ModelEndpoint, ctx, bucket: str) -> bool:
+        """A flat-fee plan call: no caps, no reservation; local-only and the attempt's
+        input-token limit still refuse it."""
+        if bucket not in BUCKETS:
+            log.warning("spend: unknown bucket %r; refusing", bucket)
+            return False
+        with self._lock:
+            now = self.now()
+            who = self._who(ctx)
+            if not self._repo_allows_cloud(who):
+                return self._refuse_local_only(ep, 0.0, bucket, who, now)
+            stop = self._attempt_check(ep, 0.0, ctx, bucket, who, now)
+            return True if stop is None else self._stop(stop, who, ep)
 
     def _repo_allows_cloud(self, who: _Who) -> bool:
         """#49: False when the call's ticket belongs to a repo set local only. A call the
@@ -608,7 +673,7 @@ class Spend:
         if bucket != "live" or who.attempt_id is None or getattr(ctx, "review_id", None):
             return None
         token_limit = self.attempt_max_input_tokens.get(ep.kind)
-        budget = self.attempt_budget_usd if ep.kind == "cloud" else None
+        budget = self.attempt_budget_usd if ep.metered else None
         if token_limit is None and budget is None:
             return None
         try:
@@ -878,8 +943,8 @@ class Spend:
             if ep.name not in allowed and not fallback:
                 bare = Refusal("live", "chat_model", 0.0, 0.0, 0.0, estimate, None, now)
                 return self._chat_refuse(bare, session_id, ep)
-            if not cloud:
-                return True
+            if not cloud or not ep.metered:
+                return True  # local, or a flat-fee plan: no turn budget, no caps
             reserved = self._reserved("live", now)
             live = list(self._unexpired(now))
             chat_reserved = sum(r.amount for r in live if r.chat is not None)
@@ -944,6 +1009,9 @@ class Spend:
         return grant
 
     def _chat_actual(self, ep: ModelEndpoint, cost: float, ctx, session_id: int) -> None:
+        if not ep.metered:  # a flat-fee plan: logged at list price, outside every cap
+            self.record(cost, "live", model=ep.name, chat_session_id=session_id, plan=True)
+            return
         with self._lock:
             key = self._key(ep, ctx, "live")
             q = self._state.reservations.get(key)
@@ -1088,6 +1156,10 @@ class Spend:
             exp_month = self._total("experiments", month)
             r_live = self._reserved("live", now)
             r_exp = self._reserved("experiments", now)
+        use = self.store.plan_use(since=month[0], until=month[1]) if self.plan_fees else {}
+        plans = tuple(
+            PlanUse(name, fee, *use.get(name, (0, 0.0))) for name, fee in self.plan_fees.items()
+        )
         caps = self.caps
         rem_month = max(0.0, caps.monthly_usd - live_month - r_live)
         rem_today = max(0.0, min(caps.daily_usd - today - r_live, rem_month))
@@ -1115,6 +1187,7 @@ class Spend:
             live_blocked=rem_today <= _EPS,
             experiments_blocked=rem_exp <= _EPS,
             open_approvals=int(open_approvals),
+            plans=plans,
         )
 
 
@@ -1185,6 +1258,7 @@ __all__ = [
     "FLAG_LOCAL_ONLY",
     "FLAG_SPEND_CAP",
     "FLAG_THRIFTY",
+    "PlanUse",
     "Refusal",
     "Spend",
     "SpendError",

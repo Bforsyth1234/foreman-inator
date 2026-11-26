@@ -316,6 +316,7 @@ class SpendEntry:
     experiment_id: int | None
     created_at: datetime
     chat_session_id: int | None = None  # migration 012 (#60)
+    plan: bool = False  # migration 013: a flat-fee plan call, at list price; not in the caps
 
 
 @dataclass(frozen=True, slots=True)
@@ -417,6 +418,7 @@ _BOOL_FIELDS = frozenset(
         "ci_passed",
         "cloud",
         "chat_network",
+        "plan",
     }
 )
 _JSON_TUPLE_FIELDS = frozenset({"owned_files"})
@@ -1564,9 +1566,11 @@ class Store:
         attempt_id: int | None = None,
         experiment_id: int | None = None,
         chat_session_id: int | None = None,
+        plan: bool = False,
     ) -> SpendEntry:
         """One ledger row. ``chat_session_id`` (#60) tags a chat call's row; chat rows are
-        bucket ``live`` (option C) but nothing here enforces that (``spend`` does)."""
+        bucket ``live`` (option C) but nothing here enforces that (``spend`` does).
+        ``plan`` (migration 013): a flat-fee plan call at list price, kept out of the caps."""
         values: dict[str, Any] = {
             "bucket": bucket,
             "cost_usd": float(cost_usd),
@@ -1578,6 +1582,8 @@ class Store:
         }
         if chat_session_id is not None:
             values["chat_session_id"] = chat_session_id
+        if plan:  # only then: a store migrated part-way (before 013) has no column
+            values["plan"] = True
         entry_id = self._insert("spend_ledger", values)
         row = self._one("SELECT * FROM spend_ledger WHERE id = ?", (entry_id,))
         assert row is not None
@@ -1586,9 +1592,10 @@ class Store:
     def spend_total(
         self, bucket: SpendBucket, *, since: datetime, until: datetime | None = None
     ) -> float:
-        """Sum of ``bucket`` spend with ``since <= created_at < until``."""
+        """Sum of ``bucket`` spend with ``since <= created_at < until``. Flat-fee plan
+        calls (``plan = 1``, migration 013) are left out: they cost nothing extra."""
         sql = "SELECT COALESCE(SUM(cost_usd), 0.0) AS total FROM spend_ledger"
-        sql += " WHERE bucket = ? AND created_at >= ?"
+        sql += " WHERE bucket = ? AND plan = 0 AND created_at >= ?"
         params: list[Any] = [bucket, _ts(since)]
         if until is not None:
             sql += " AND created_at < ?"
@@ -1609,13 +1616,29 @@ class Store:
         """Sum of every chat session's spend with ``since <= created_at < until`` (#60;
         the chat sub-cap, option C). Any bucket: chat rows are ``live`` by contract."""
         sql = "SELECT COALESCE(SUM(cost_usd), 0.0) AS total FROM spend_ledger"
-        sql += " WHERE chat_session_id IS NOT NULL AND created_at >= ?"
+        sql += " WHERE chat_session_id IS NOT NULL AND plan = 0 AND created_at >= ?"
         params: list[Any] = [_ts(since)]
         if until is not None:
             sql += " AND created_at < ?"
             params.append(_ts(until))
         row = self._one(sql, params)
         return float(row["total"]) if row else 0.0
+
+    def plan_use(
+        self, *, since: datetime, until: datetime | None = None
+    ) -> dict[str, tuple[int, float]]:
+        """Flat-fee plan calls with ``since <= created_at < until``, both buckets, per
+        model name: ``(calls, list-price USD)``. What the calls would have cost metered."""
+        sql = (
+            "SELECT model, COUNT(*) AS n, COALESCE(SUM(cost_usd), 0.0) AS total"
+            " FROM spend_ledger WHERE plan = 1 AND created_at >= ?"
+        )
+        params: list[Any] = [_ts(since)]
+        if until is not None:
+            sql += " AND created_at < ?"
+            params.append(_ts(until))
+        rows = self.query(sql + " GROUP BY model", params)
+        return {str(r["model"]): (int(r["n"]), float(r["total"])) for r in rows}
 
     def approve_spend(self, ticket_id: int) -> SpendApproval:
         approval_id = self._insert(

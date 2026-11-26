@@ -79,6 +79,8 @@ Layout (every key optional; missing keys take the defaults below)::
     family = "glm"       # reviewer must be a different family from the writer
     api_key_ref = "keychain:foreman-inator/glm"
     # vision = true      # #71: may describe issue images for the writer
+    # plan_usd_month = 18.0  # a flat-fee plan (GLM Coding Plan): calls skip the spend
+    #                    # caps and are logged at list price to show what the plan saved
     # wire = "openai"    # openai | anthropic: how OpenCode talks to it through the proxy
     #                    # (#52). "anthropic": the native Messages route, with prompt caching.
 
@@ -216,10 +218,20 @@ class ModelEndpoint:
     #: #71: this model takes images; issue images from allowed users are described by it
     #: (``tickets.images``) and the writer gets the description as text.
     vision: bool = False
+    #: A flat-fee subscription (e.g. the GLM Coding Plan) at this many USD a month. Its
+    #: calls cost nothing extra, so they skip the spend caps and the per-attempt USD
+    #: budget; the ledger still records them at list price (``fman status`` shows what
+    #: the plan saved). None: pay per token, counted toward the caps.
+    plan_usd_month: float | None = None
 
     @property
     def is_cloud(self) -> bool:
         return self.kind == "cloud"
+
+    @property
+    def metered(self) -> bool:
+        """A cloud model billed per token: its calls count toward the spend caps."""
+        return self.kind == "cloud" and self.plan_usd_month is None
 
     def api_key(self) -> str | None:
         """Resolve the key lazily from the Keychain; None for a model without one."""
@@ -706,6 +718,11 @@ def _validate_model(m: ModelEndpoint) -> None:
         raise ConfigError(f"{where}: family is required")
     if not isinstance(m.vision, bool):
         raise ConfigError(f"{where}: vision must be true or false")
+    if m.plan_usd_month is not None:
+        if m.kind != "cloud":
+            raise ConfigError(f"{where}: plan_usd_month is only for a cloud model")
+        if m.plan_usd_month < 0:
+            raise ConfigError(f"{where}: plan_usd_month must be >= 0")
     url = urlparse(m.base_url)
     if url.scheme not in ("http", "https") or not url.hostname:
         raise ConfigError(f"{where}: base_url must be an http(s) URL")
@@ -775,7 +792,7 @@ def _model_from_dict(raw: Any, where: str) -> ModelEndpoint:
     _typed(raw, dict, where)
     allowed = {f.name for f in fields(ModelEndpoint)}
     _check_keys(raw, allowed, where)
-    missing = sorted(allowed - {"api_key_ref", "wire", "vision"} - set(raw))
+    missing = sorted(allowed - {"api_key_ref", "wire", "vision", "plan_usd_month"} - set(raw))
     if missing:
         raise ConfigError(f"{where}: missing key(s) {', '.join(missing)}")
     return ModelEndpoint(
@@ -788,7 +805,16 @@ def _model_from_dict(raw: Any, where: str) -> ModelEndpoint:
         api_key_ref=_typed(raw.get("api_key_ref"), (str, type(None)), f"{where}.api_key_ref"),
         wire=_typed(raw.get("wire", "openai"), str, f"{where}.wire"),  # type: ignore[arg-type]
         vision=_typed(raw.get("vision", False), bool, f"{where}.vision"),
+        plan_usd_month=_plan_fee(raw.get("plan_usd_month"), f"{where}.plan_usd_month"),
     )
+
+
+def _plan_fee(value: Any, where: str) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ConfigError(f"{where}: must be a number of USD")
+    return float(value)
 
 
 def from_dict(data: Mapping[str, Any]) -> Config:

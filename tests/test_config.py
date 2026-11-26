@@ -365,3 +365,39 @@ def test_wire_defaults_parses_validates_and_round_trips(tmp_path):
     path.write_text(text.replace('wire = "anthropic"', 'wire = "grpc"', 1))
     with pytest.raises(ConfigError, match="wire"):
         config.load(path)
+
+
+# --------------------------------------------------------------------------- flat-fee plan
+
+
+def test_plan_fee_loads_and_round_trips(foreman_home: Path) -> None:
+    _write(foreman_home, _models_toml(extra="plan_usd_month = 18\n"))
+    cfg = config.load()
+    glm = cfg.model("glm")
+    assert glm.plan_usd_month == 18.0
+    assert glm.is_cloud and not glm.metered
+    assert config.from_dict(config.to_dict(cfg)).model("glm").plan_usd_month == 18.0
+    assert "plan_usd_month" not in config.to_dict(Config())["models"][1]  # None stays implicit
+    assert Config().model("glm").metered  # default: pay per token, capped
+
+
+def test_plan_fee_is_cloud_only_and_a_number(foreman_home: Path) -> None:
+    with pytest.raises(ConfigError, match="only for a cloud model"):
+        config.from_dict(
+            {
+                "models": [
+                    {
+                        "name": "q",
+                        "tier": 1,
+                        "kind": "local",
+                        "model": "q",
+                        "base_url": "http://127.0.0.1:11434/v1",
+                        "family": "q",
+                        "plan_usd_month": 5,
+                    }
+                ]
+            }  # fmt: skip
+        )
+    _write(foreman_home, _models_toml(extra='plan_usd_month = "18"\n'))
+    with pytest.raises(ConfigError, match="number of USD"):
+        config.load()

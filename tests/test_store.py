@@ -135,6 +135,7 @@ EXTRA_COLUMNS: dict[str, list[str]] = {
         "experiment_id",
         "created_at",
         "chat_session_id",  # migration 012 (#60)
+        "plan",  # migration 013: flat-fee plan calls, kept out of the caps
     ],
     "spend_approvals": ["id", "ticket_id", "approved_at", "consumed_at"],
     "file_locks": ["repo", "path", "ticket_id", "acquired_at", "chat_session_id"],  # 012

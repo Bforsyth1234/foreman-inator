@@ -416,3 +416,20 @@ def test_fallback_endpoint_passes_the_gate(store) -> None:
     sp.start_chat_turn(1)  # next turn tries local again
     assert not call(sp, GLM, 0.1, None)
     assert call(sp, LOCAL, 0.0, None)
+
+
+def test_chat_on_a_flat_fee_plan_skips_turn_budget_and_caps(store) -> None:
+    plan = ModelEndpoint(
+        "glm", 2, "cloud", "glm-x", "https://api.example.com/v1", "glm", plan_usd_month=18.0
+    )
+    sp = make_spend(store, daily=5.0, chat_monthly_usd=100.0, chat_turn_budget_usd=1.0)
+    chat(sp, model="glm")
+    assert call(sp, plan, 4.0, 4.0)  # over the $1 turn budget: a plan call is not capped
+    assert call(sp, plan, 3.0, 3.0)  # and past the $5 daily cap
+    assert sp.chat_turn_spent(1) == 0.0
+    rows = store.query("SELECT cost_usd, plan FROM spend_ledger ORDER BY id")
+    assert [(r["cost_usd"], r["plan"]) for r in rows] == [(4.0, 1), (3.0, 1)]
+    sp.set_chat_model(1, "claude")
+    sp.start_chat_turn(1)
+    assert call(sp, CLAUDE, 1.0, 1.0)  # metered chat still has the whole turn budget
+    assert not call(sp, CLAUDE, 0.5, None)  # and the turn budget still binds it

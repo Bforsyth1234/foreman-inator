@@ -174,6 +174,7 @@ every model is one rung of the escalation ladder.
 | `api_key_ref` | for cloud | `"keychain:foreman-inator/<name>"`. |
 | `vision` | no | `true`: this model takes images. Images that allowed users attached to the issue (body, answers, comments) are fetched by the worker from GitHub's attachment hosts and described by a vision model (a local one first; a cloud one only when the repo allows cloud, inside the spend caps); the writer gets the descriptions as text. Default `false`. |
 | `wire` | no | How the writer (OpenCode) talks to the model through the proxy: `"openai"` (default, `chat/completions`) or `"anthropic"` (Anthropic's native Messages route, `/v1/messages`, which keeps prompt caching). The reviewer and router use `chat/completions` either way. |
+| `plan_usd_month` | no | A flat-fee subscription for this cloud model, in USD a month (e.g. `18.0` for the GLM Coding Plan). Its calls skip the daily, monthly and experiments caps, approvals and the per-attempt USD budget (the input-token limit and local-only repos still apply). Each call is still logged at list price, and `fman status` shows the plan's calls this month and what they would have cost metered. Unset: pay per token, counted toward the caps. |
 
 The defaults:
 

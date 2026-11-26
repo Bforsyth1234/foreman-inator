@@ -140,7 +140,7 @@ class RebaseSteps:
             endpoint = self.config.model(src.model)
         except ConfigError:
             endpoint = self.config.models_for_tier(src.tier)[0]
-        if endpoint.is_cloud:
+        if endpoint.metered:
             refusal = self.spend.blocked(t.id)  # type: ignore[attr-defined]
             if refusal is not None:
                 self.pause_for_spend(t, refusal)  # type: ignore[attr-defined]
