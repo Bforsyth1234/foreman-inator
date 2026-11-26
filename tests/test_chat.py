@@ -151,14 +151,3 @@ def test_event_buffer_replays_after_seq_and_drops_old():
     assert [e.seq for e in buf.after(0)] == [3, 4, 5]
     assert [e.data["i"] for e in buf.after(4)] == [4]
     assert buf.after(5) == []
-
-
-# --------------------------------------------------------------------------- not built yet
-
-
-def test_manager_is_a_skeleton():
-    mgr = chat.ChatManager(config=None, store=None)
-    with pytest.raises(NotImplementedError, match="chat-design"):
-        mgr.start("o/r")
-    with pytest.raises(NotImplementedError):
-        mgr.send(1, "hi")
