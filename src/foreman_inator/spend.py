@@ -74,6 +74,14 @@ Rules as implemented:
   The local-only rule and the per-attempt input-token limit still apply. Chat calls
   to a plan model skip the chat turn budget and the chat sub-cap too
   (``chat_spend_total`` leaves plan rows out).
+* **Plan quota** (#85). A plan call's estimated GLM Coding Plan credits (from the proxy)
+  go on its ledger row; ``summary().credits`` sums them against the plan tier's limits
+  (``plan_quota``). A 429 quota error from z.ai (``phase="quota"``) pauses the plan's
+  account until the reset it names: its calls are refused before they are sent (cap
+  ``plan_quota``), ``plan_gate`` holds back a writer attempt on it, and the refusal
+  pauses the ticket like a spend cap (flag ``FLAG_PLAN_QUOTA``, a ``spend_cap`` pause:
+  never a failed attempt, never an escalation). It lifts itself at the reset time, or
+  when the user runs ``fman approve-spend`` (after renewing an expired plan).
 * **Local only** (#49). A repo set ``cloud = false`` (``repo_settings.cloud = 0``,
   ``Store.set_cloud``) never sends its code to a cloud model. Escalation already stops at
   its last local tier and review picks a local reviewer; as defence in depth (invariant
@@ -108,6 +116,7 @@ Rules as implemented:
 from __future__ import annotations
 
 import logging
+import re
 import threading
 from collections import deque
 from dataclasses import asdict, dataclass, field, replace
@@ -118,11 +127,13 @@ from zoneinfo import ZoneInfo
 from foreman_inator import config as config_defaults
 from foreman_inator.config import Config, ModelEndpoint, SpendCaps
 from foreman_inator.db.store import NotFoundError, SpendApproval, SpendEntry, Store, Ticket
+from foreman_inator.plan_quota import PlanCredits, PlanPause, PlanQuota, account_of
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Iterator
 
     from foreman_inator.chat import ChatSession, Rung
+    from foreman_inator.proxy.zai_quota import QuotaHit
 
 log = logging.getLogger(__name__)
 
@@ -138,6 +149,7 @@ CapName = Literal[
     "chat_monthly",
     "chat_turn",
     "chat_model",
+    "plan_quota",
 ]
 BUCKETS: tuple[Bucket, ...] = ("live", "experiments")
 
@@ -150,6 +162,11 @@ FLAG_ATTEMPT_BUDGET = "attempt_budget"
 #: #51: the flag reason of a ticket paused by the ``thrifty`` writer mode (a spend_cap
 #: pause, so the status and resume paths treat it like one).
 FLAG_THRIFTY = f"{FLAG_SPEND_CAP}: thrifty profile"
+#: #85: a ticket paused because its flat-fee plan (GLM Coding Plan) hit z.ai's quota (a
+#: spend_cap pause, so the status and resume paths treat it like one).
+FLAG_PLAN_QUOTA = f"{FLAG_SPEND_CAP}: plan quota"
+_PLAN_QUOTA_MODEL = re.compile(rf"^{re.escape(FLAG_PLAN_QUOTA)} (\S+?):")
+_QUOTA_WINDOW = {"five_hour": "5-hour", "weekly": "weekly"}
 #: #49: a cloud call refused because the ticket's repo is local only (``cloud = false``).
 FLAG_LOCAL_ONLY = "local_only"
 #: Per-attempt limits (#58), defined in ``config`` (whose keys default to them) and
@@ -196,6 +213,8 @@ class Refusal:
     tokens_in: int | None = None
     token_limit: int | None = None
     chat_session_id: int | None = None  # a chat call (todo #71)
+    quota_code: int | None = None  # cap "plan_quota" only (#85): z.ai's error code
+    quota_kind: str | None = None  # "five_hour" | "weekly" | "expired"
 
     @property
     def needs_approval(self) -> bool:
@@ -228,6 +247,14 @@ class Refusal:
             return f"chat turn budget: {self.detail}"
         if self.cap == "chat_model":
             return f"chat: model {self.model or '?'} is not the session's current model"
+        if self.cap == "plan_quota":
+            until = f"until {self.resets_at:%Y-%m-%d %H:%M} UTC" if self.resets_at else ""
+            what = _QUOTA_WINDOW.get(self.quota_kind or "", "")
+            what = f"{what} limit reached" if what else "plan expired"
+            return (
+                f"{FLAG_PLAN_QUOTA} {self.model or '?'}: {what} (z.ai code "
+                f"{self.quota_code}){', ' + until if until else ''}"
+            )
         if self.cap == "local_only":
             return (
                 f"{FLAG_LOCAL_ONLY}: the repo is local only (cloud = false); refused a call "
@@ -274,6 +301,7 @@ class SpendSummary:
     experiments_blocked: bool
     open_approvals: int
     plans: tuple[PlanUse, ...] = ()
+    credits: tuple[PlanCredits, ...] = ()  # #85: estimated Coding Plan credits
 
     def as_dict(self) -> dict[str, object]:
         out = asdict(self)
@@ -296,6 +324,18 @@ class SpendSummary:
                 f"; {p.model} plan ${p.fee_usd_month:.2f}/month, not capped: {p.calls} calls"
                 f" this month, ${p.list_usd:.2f} at list price"
             )
+        for c in self.credits:
+            line += (
+                f"; GLM credits ({', '.join(c.models)}, {c.tier}, estimates): "
+                f"{c.used_5h:,.0f} of {c.limit_5h:,} in the last 5h, "
+                f"{c.used_week:,.0f} of {c.limit_week:,} this week"
+                " (z.ai's 5h window starts at first use, its week at purchase)"
+            )
+            if c.paused is not None:
+                until = c.paused.until
+                line += f" (paused: z.ai code {c.paused.code}" + (
+                    f", until {until:%Y-%m-%d %H:%M} UTC)" if until else ", until renewed)"
+                )
         return line
 
 
@@ -377,6 +417,7 @@ class Spend:
         self.caps = config.spend_caps if isinstance(config, Config) else config
         models = config.models if isinstance(config, Config) else ()
         self.plan_fees = {m.name: m.plan_usd_month for m in models if m.plan_usd_month is not None}
+        self.quota = PlanQuota(store, models)
         self._clock = clock or store.now
         self.tz: tzinfo | None = ZoneInfo(tz) if isinstance(tz, str) else tz
         if approval_usd is None:
@@ -500,17 +541,23 @@ class Spend:
         experiment_id: int | None = None,
         chat_session_id: int | None = None,
         plan: bool = False,
+        credits: float | None = None,
     ) -> SpendEntry | None:
         """Write spend that happened to the ledger. Zero cost writes nothing. A chat row
         carries ``chat_session_id`` (store column from migration 012). ``plan``: a
         flat-fee plan call at list price, kept out of the caps (migration 013)."""
         if bucket not in BUCKETS:
             raise ValueError(f"unknown spend bucket {bucket!r}")
-        if cost <= 0:
+        if cost <= 0 and not credits:
             return None
         if chat_session_id is not None:
             return self.store.record_spend(
-                bucket, cost, model=model, chat_session_id=chat_session_id, plan=plan
+                bucket,
+                max(cost, 0.0),
+                model=model,
+                chat_session_id=chat_session_id,
+                plan=plan,
+                credits=credits,
             )
         return self.store.record_spend(
             bucket,
@@ -520,18 +567,34 @@ class Spend:
             attempt_id=attempt_id,
             experiment_id=experiment_id,
             plan=plan,
+            credits=credits,
         )
 
     # ------------------------------------------------------------------ the proxy hook
 
     def hook(
-        self, endpoint: ModelEndpoint, cost_usd: float, context, *, phase: str = "estimate"
+        self,
+        endpoint: ModelEndpoint,
+        cost_usd: float,
+        context,
+        *,
+        phase: str = "estimate",
+        credits: float | None = None,
+        quota: QuotaHit | None = None,
     ) -> bool | None:
         """``ModelProxy(spend_hook=spend.hook)``. ``estimate``: allow (and reserve) or refuse
-        before anything is sent. ``actual``: settle the reservation and record the cost."""
+        before anything is sent. ``actual``: settle the reservation and record the cost
+        (``credits``: a plan call's estimated credits, #85). ``quota``: z.ai refused a plan
+        call for quota; pause the plan."""
+        if phase == "quota":
+            if quota is not None and endpoint.plan_usd_month is not None:
+                self._plan_quota_hit(endpoint, context, quota)
+            return None
         chat_id = getattr(context, "chat_session_id", None)
         if chat_id is not None:
-            return self._chat_hook(endpoint, float(cost_usd), context, int(chat_id), phase)
+            return self._chat_hook(
+                endpoint, float(cost_usd), context, int(chat_id), phase, credits=credits
+            )
         if endpoint.kind != "cloud":
             if phase == "estimate":
                 return self._local_estimate(endpoint, context)
@@ -548,6 +611,7 @@ class Spend:
                 ticket_id=who.ticket_id,
                 attempt_id=who.attempt_id,
                 plan=True,
+                credits=credits,
             )
             return None
         if phase == "estimate":
@@ -641,8 +705,65 @@ class Spend:
             who = self._who(ctx)
             if not self._repo_allows_cloud(who):
                 return self._refuse_local_only(ep, 0.0, bucket, who, now)
+            pause = self.quota.paused(ep, now)
+            if pause is not None:
+                self._remember_quota_refusal(ep, pause, bucket, who, now)
+                return False
             stop = self._attempt_check(ep, 0.0, ctx, bucket, who, now)
             return True if stop is None else self._stop(stop, who, ep)
+
+    def _plan_quota_hit(self, ep: ModelEndpoint, ctx, hit: QuotaHit) -> None:
+        """#85: z.ai refused a plan call for quota: pause the account; the call's attempt
+        (if any) remembers the refusal so the worker pauses its ticket after it."""
+        with self._lock:
+            now = self.now()
+            pause = self.quota.pause(ep, hit, now)
+            log.warning(
+                "spend: %s plan paused (z.ai code %s) until %s",
+                ep.name,
+                hit.code,
+                pause.until.isoformat() if pause.until else "the plan is renewed",
+            )
+            if getattr(ctx, "chat_session_id", None) is not None:
+                return
+            bucket = getattr(ctx, "bucket", "live")
+            self._remember_quota_refusal(ep, pause, bucket, self._who(ctx), now)
+
+    def _quota_refusal(self, ep: ModelEndpoint, pause: PlanPause, bucket: str, now) -> Refusal:
+        return Refusal(
+            bucket,  # type: ignore[arg-type]
+            "plan_quota",
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            pause.until,
+            now,
+            model=ep.name,
+            quota_code=pause.code,
+            quota_kind=pause.kind,
+        )
+
+    def _remember_quota_refusal(
+        self, ep: ModelEndpoint, pause: PlanPause, bucket: str, who: _Who, now
+    ) -> None:
+        refusal = _with_who(self._quota_refusal(ep, pause, bucket, now), who, ep.name)
+        if who.attempt_id is not None:
+            self._refusals_by_attempt[who.attempt_id] = refusal
+        if who.ticket_id is not None and bucket == "live":
+            self._refusals_by_ticket[who.ticket_id] = refusal
+        log.info("spend: refused %s call: plan quota (z.ai code %s)", ep.name, pause.code)
+
+    def plan_gate(self, ep: ModelEndpoint, ticket_id: int | None = None) -> Refusal | None:
+        """#85: before an attempt on a flat-fee plan model: a Refusal (cap ``plan_quota``)
+        while its plan is paused at z.ai's quota, else None."""
+        if ep.plan_usd_month is None:
+            return None
+        now = self.now()
+        pause = self.quota.paused(ep, now)
+        if pause is None:
+            return None
+        return replace(self._quota_refusal(ep, pause, "live", now), ticket_id=ticket_id)
 
     def _repo_allows_cloud(self, who: _Who) -> bool:
         """#49: False when the call's ticket belongs to a repo set local only. A call the
@@ -906,7 +1027,14 @@ class Spend:
         yield "daily", self.caps.daily_usd, day, self._total("live", day), reserved
 
     def _chat_hook(
-        self, ep: ModelEndpoint, cost: float, ctx, session_id: int, phase: str
+        self,
+        ep: ModelEndpoint,
+        cost: float,
+        ctx,
+        session_id: int,
+        phase: str,
+        *,
+        credits: float | None = None,
     ) -> bool | None:
         bucket = getattr(ctx, "bucket", "live")
         if bucket != "live":
@@ -914,7 +1042,7 @@ class Spend:
         if phase == "estimate":
             return self._chat_estimate(ep, cost, ctx, session_id)
         if ep.kind == "cloud":
-            self._chat_actual(ep, cost, ctx, session_id)
+            self._chat_actual(ep, cost, ctx, session_id, credits=credits)
         return None
 
     def _chat_refuse(
@@ -951,6 +1079,9 @@ class Spend:
             fallback = cloud and fb is not None and fb in allowed
             if ep.name not in allowed and not fallback:
                 bare = Refusal("live", "chat_model", 0.0, 0.0, 0.0, estimate, None, now)
+                return self._chat_refuse(bare, session_id, ep, record=record)
+            if cloud and not ep.metered and (pause := self.quota.paused(ep, now)) is not None:
+                bare = self._quota_refusal(ep, pause, "live", now)
                 return self._chat_refuse(bare, session_id, ep, record=record)
             if not cloud or not ep.metered:
                 return True  # local, or a flat-fee plan: no turn budget, no caps
@@ -1017,9 +1148,13 @@ class Spend:
         grant.reserved_usd = max(0.0, grant.reserved_usd - res.amount)
         return grant
 
-    def _chat_actual(self, ep: ModelEndpoint, cost: float, ctx, session_id: int) -> None:
+    def _chat_actual(
+        self, ep: ModelEndpoint, cost: float, ctx, session_id: int, *, credits=None
+    ) -> None:
         if not ep.metered:  # a flat-fee plan: logged at list price, outside every cap
-            self.record(cost, "live", model=ep.name, chat_session_id=session_id, plan=True)
+            self.record(
+                cost, "live", model=ep.name, chat_session_id=session_id, plan=True, credits=credits
+            )
             return
         with self._lock:
             key = self._key(ep, ctx, "live")
@@ -1111,15 +1246,67 @@ class Spend:
         waiting. Tickets not flagged ``spend_cap`` return None."""
         if not (ticket.flag_reason or "").startswith(FLAG_SPEND_CAP):
             return None
-        if self.store.open_spend_approval(ticket.id) is not None:
+        approval = self.store.open_spend_approval(ticket.id)
+        if approval is not None:
+            if (m := _PLAN_QUOTA_MODEL.match(ticket.flag_reason or "")) is not None:
+                # #85: the user says the plan works again (renewed, or the dashboard
+                # shows quota left): lift the pause; the approval is used up by it.
+                self._plan_clear(m.group(1))
+                self.store.consume_spend_approval(approval.id)
             return "approved"
         if (ticket.flag_reason or "").startswith(FLAG_THRIFTY):
             return None  # #51: only the user's approval lifts a thrifty pause
+        if (m := _PLAN_QUOTA_MODEL.match(ticket.flag_reason or "")) is not None:
+            return self._plan_resume(m.group(1))
         return "cap_clear" if self.blocked(None) is None else None
+
+    def _plan_endpoint(self, model: str) -> ModelEndpoint | None:
+        for eps in self.quota.accounts.values():
+            for ep in eps:
+                if ep.name == model:
+                    return ep
+        return None
+
+    def _plan_resume(self, model: str) -> Literal["cap_clear"] | None:
+        ep = self._plan_endpoint(model)
+        if ep is None:  # the model left the config: nothing holds the ticket back
+            return "cap_clear"
+        return "cap_clear" if self.quota.paused(ep, self.now()) is None else None
+
+    def _plan_clear(self, model: str) -> None:
+        ep = self._plan_endpoint(model)
+        if ep is not None:
+            self.quota.clear(account_of(ep))
+
+    def _plan_quota_comment(self, ticket: Ticket, refusal: Refusal, marker: str) -> str:
+        model = refusal.model or "the GLM model"
+        if refusal.quota_kind == "expired":
+            return (
+                f"{marker}\nforeman-inator paused work on this issue: z.ai says the GLM Coding "
+                f"Plan for {model} has expired (code {refusal.quota_code}). Renew it on z.ai, "
+                "then run on the worker's Mac:\n\n"
+                f"    fman approve-spend {ticket.id}\n\n"
+                "Nothing escalated to a paid model, and no attempt was counted."
+            )
+        window = _QUOTA_WINDOW.get(refusal.quota_kind or "", "usage")
+        when = ""
+        if refusal.resets_at is not None:
+            local = refusal.resets_at.astimezone(self.tz)
+            when = f" at {local:%Y-%m-%d %H:%M %Z}"
+        return (
+            f"{marker}\nforeman-inator paused work on this issue: the GLM Coding Plan's "
+            f"{window} limit for {model} is reached (z.ai code {refusal.quota_code}). "
+            f"It resumes on its own when the limit resets{when}. Nothing escalated to a "
+            "paid model, and no attempt was counted.\n\n"
+            "If z.ai's dashboard shows quota left before then, run on the worker's Mac:\n\n"
+            f"    fman approve-spend {ticket.id}"
+        )
 
     def approval_comment(self, ticket: Ticket, refusal: Refusal) -> str:
         """The issue comment asking for approval. Amounts and commands only."""
         marker = f"<!-- foreman-inator:flag ticket={ticket.id} -->"
+        if refusal.cap == "plan_quota":
+            return self._plan_quota_comment(ticket, refusal, marker)
         if refusal.cap == "thrifty":
             why = (
                 "this repo's profile is thrifty, so every cloud writer attempt waits for "
@@ -1169,6 +1356,7 @@ class Spend:
         plans = tuple(
             PlanUse(name, fee, *use.get(name, (0, 0.0))) for name, fee in self.plan_fees.items()
         )
+        credits = self.quota.usage(now) if self.quota.accounts else ()
         caps = self.caps
         rem_month = max(0.0, caps.monthly_usd - live_month - r_live)
         rem_today = max(0.0, min(caps.daily_usd - today - r_live, rem_month))
@@ -1197,6 +1385,7 @@ class Spend:
             experiments_blocked=rem_exp <= _EPS,
             open_approvals=int(open_approvals),
             plans=plans,
+            credits=credits,
         )
 
 
@@ -1265,6 +1454,7 @@ __all__ = [
     "DEFAULT_RESERVATION_TTL",
     "FLAG_ATTEMPT_BUDGET",
     "FLAG_LOCAL_ONLY",
+    "FLAG_PLAN_QUOTA",
     "FLAG_SPEND_CAP",
     "FLAG_THRIFTY",
     "PlanUse",
