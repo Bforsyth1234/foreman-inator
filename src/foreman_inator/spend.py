@@ -1045,35 +1045,44 @@ class Spend:
             self._chat_actual(ep, cost, ctx, session_id, credits=credits)
         return None
 
-    def _chat_refuse(self, refusal: Refusal, session_id: int, ep: ModelEndpoint) -> bool:
+    def _chat_refuse(
+        self, refusal: Refusal, session_id: int, ep: ModelEndpoint, *, record: bool = True
+    ) -> bool:
+        """Refuse a chat call; ``record`` makes it the turn's refusal (7e: the turn stops).
+        A refused local-slot fallback (decision 2) is not recorded: that call keeps waiting
+        for the local slot, so the turn goes on."""
         refusal = replace(refusal, chat_session_id=session_id, model=ep.name)
-        self._chat_refusals[session_id] = refusal
+        if record:
+            self._chat_refusals[session_id] = refusal
         log.info("spend: refused chat %s call to %s (%s)", session_id, ep.name, refusal.cap)
         return False
 
     def _chat_estimate(self, ep: ModelEndpoint, estimate: float, ctx, session_id: int) -> bool:
+        # A cloud call standing in for a queued local one (decision 2) that is refused
+        # just keeps waiting for the local slot: not the turn's refusal.
+        fb = getattr(ctx, "fallback_from", None)
+        record = fb is None
         with self._lock:
             now = self.now()
             st = self._chats.get(session_id)
             if st is None:
                 bare = Refusal("live", "chat_model", 0.0, 0.0, 0.0, estimate, None, now)
-                return self._chat_refuse(bare, session_id, ep)
+                return self._chat_refuse(bare, session_id, ep, record=record)
             cloud = ep.kind == "cloud"
             if cloud and not self.store.repo_allows_cloud(st.repo):
                 bare = Refusal("live", "local_only", 0.0, 0.0, 0.0, estimate, None, now)
-                return self._chat_refuse(bare, session_id, ep)
+                return self._chat_refuse(bare, session_id, ep, record=record)
             allowed = {m for m in (st.turn_model or st.model, st.small_model) if m}
             # The proxy's 5 s local-slot fallback (decision 2): a cloud call standing in
             # for a queued call to one of this turn's own (local) models. An ordinary call
             # has fallback_from None, which must never match an unset small_model.
-            fb = getattr(ctx, "fallback_from", None)
             fallback = cloud and fb is not None and fb in allowed
             if ep.name not in allowed and not fallback:
                 bare = Refusal("live", "chat_model", 0.0, 0.0, 0.0, estimate, None, now)
-                return self._chat_refuse(bare, session_id, ep)
+                return self._chat_refuse(bare, session_id, ep, record=record)
             if cloud and not ep.metered and (pause := self.quota.paused(ep, now)) is not None:
                 bare = self._quota_refusal(ep, pause, "live", now)
-                return self._chat_refuse(bare, session_id, ep)
+                return self._chat_refuse(bare, session_id, ep, record=record)
             if not cloud or not ep.metered:
                 return True  # local, or a flat-fee plan: no turn budget, no caps
             reserved = self._reserved("live", now)
@@ -1087,7 +1096,7 @@ class Spend:
                         "live", "chat_turn", budget, st.turn_spent_usd, turn_res, estimate,
                         None, now,
                     )  # fmt: skip
-                    return self._chat_refuse(over, session_id, ep)
+                    return self._chat_refuse(over, session_id, ep, record=record)
             refusal = None
             for cap, cap_usd, window, spent, res in self._chat_caps(now, reserved, chat_reserved):
                 if not _fits(spent + res, estimate, cap_usd):
@@ -1097,7 +1106,7 @@ class Spend:
             if refusal is not None:
                 refusal, granted = self._try_chat_grant(st, refusal, estimate)
             if refusal is not None:
-                return self._chat_refuse(refusal, session_id, ep)
+                return self._chat_refuse(refusal, session_id, ep, record=record)
             res_ = _Reservation(estimate, now, None, chat=(session_id, st.turn), chat_grant=granted)
             self._state.reservations.setdefault(self._key(ep, ctx, "live"), deque()).append(res_)
             return True

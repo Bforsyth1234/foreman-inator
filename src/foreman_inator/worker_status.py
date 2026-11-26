@@ -108,13 +108,16 @@ def _chat_holders(chats: Sequence[int]) -> str:
 
 
 def _release_hint(blockers: Sequence[int], store: Store | None) -> str:
-    """#55: for a blocker that is flagged for the user, say what releases its files."""
+    """#55: for a blocker that is flagged for the user, say what releases its files.
+    #83: a blocker paused at a spend cap is waiting, not flagged: name the approve command."""
     if store is None:
         return ""
     hints = []
     for b in blockers:
         bt = store.get_ticket(b)
-        if bt.flag_reason:
+        if bt.flag_reason and bt.flag_reason.startswith(FLAG_SPEND_CAP):
+            hints.append(f"#{b} waits for spend approval: run `fman approve-spend {b}`")
+        elif bt.flag_reason:
             hints.append(f"#{b} is flagged: close or re-label issue {bt.repo}#{bt.issue_number}")
     return f" ({'; '.join(hints)})" if hints else ""
 
