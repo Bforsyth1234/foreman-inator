@@ -4,7 +4,8 @@ SPEC "Experiments": "10-20% of live tickets go to the challenger; you review as 
 used "after a challenger wins on replay". The promotion rule then needs the challenger
 to hold up live: its live accept rate must not fall below the champion's and its cost
 per accepted ticket must not be higher. ``ab:pair`` (two PRs for one issue) is not built
-here: it needs a data-model rework (two live attempts and PRs per ticket).
+here (``experiments.pair`` is): a paired ticket (``ticket.pair_side`` set) is never in a
+split, so its two sides stay a clean head-to-head.
 
 Experiment rows: ``experiments`` with ``role = 'writer'``, ``mode = 'split'`` and
 ``traffic_share`` (default ``DEFAULT_SHARE``, 15%). Only the oldest running split whose
@@ -212,6 +213,8 @@ def pick(
     min_cases: int = 10,
 ) -> Pick | None:
     """The split's say over this attempt (see the module docstring); None: none."""
+    if getattr(ticket, "pair_side", None) is not None:
+        return None  # #16: paired tickets are excluded from split assignment
     if is_override(ticket):
         return None
     exp = active_split(store, min_cases=min_cases)
