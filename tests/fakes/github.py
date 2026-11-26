@@ -3,7 +3,7 @@
 ``FakeGitHub`` implements ``foreman_inator.github.GitHubAPI`` with the same method names and
 the same dataclasses as the real ``GitHubClient``. Client-facing methods act as the App's bot
 user; setup helpers (``create_repo``, ``create_issue``, ``apply_label``, ``submit_review``,
-``merge_pr``, ``close_pr``, ``close_issue_as``, ``comment_as``, ``push_branch``) act as a human
+``merge_pr``, ``close_pr_as``, ``close_issue_as``, ``comment_as``, ``push_branch``) act as a human
 and are never recorded as bot writes. CI (#41) is set up the same way: ``add_check_run``,
 ``set_check_run``, ``attach_job_log``, and ``deny_permission("checks" | "actions")`` for an
 App registered before those permissions existed.
@@ -41,6 +41,7 @@ from foreman_inator.github.client import (
     MissingPermission,
     ReviewComment,
     log_tail,
+    require_deletable_fman_branch,
     require_fman_branch,
 )
 
@@ -124,6 +125,9 @@ class FakeGitHub:
         self.calls: list[Call] = []
         self.writes: list[Call] = []
         self.git_pushes: list[Call] = []
+        #: ab:pair (#16): PRs the bot closed and branches it deleted, as (repo, number|branch)
+        self.closed_prs: list[tuple[str, int]] = []
+        self.deleted_branches: list[tuple[str, str]] = []
         self._writes_forbidden: str | None = None
         self._failures: dict[str, list[Exception]] = {}
         self._denied: set[str] = set()
@@ -320,7 +324,8 @@ class FakeGitHub:
                     self._close(linked, by, "completed")
         return self._pr_dc(pr)
 
-    def close_pr(self, repo: str, number: int, *, by: str = "brooks") -> None:
+    def close_pr_as(self, repo: str, number: int, *, by: str = "brooks") -> None:
+        """A person closes the PR (the client's ``close_pr`` is the bot's write, #16)."""
         self._close(self._pr(repo, number), by, None)
 
     def close_issue_as(
@@ -382,6 +387,14 @@ class FakeGitHub:
         sha = sha or _sha(f"{repo}-{branch}")
         self.repos[repo].branches[branch] = sha
         return sha
+
+    def human_pr(
+        self, repo: str, *, head: str, base: str = "main", body: str = "", by: str = "brooks"
+    ) -> int:
+        """A PR someone else opened from a non-worker branch (the worker must not close it)."""
+        pr = self._new_item(repo, f"PR from {head}", body, by)
+        pr.is_pr, pr.head, pr.base = True, head, base
+        return pr.number
 
     # ------------------------------------------------------------------ GitHubAPI: identity
 
@@ -504,6 +517,15 @@ class FakeGitHub:
         r.branches[branch] = sha
         return Ref(f"refs/heads/{branch}", sha)
 
+    def delete_branch(self, repo: str, branch: str) -> None:
+        require_deletable_fman_branch(branch)
+        self._write("delete_branch", repo=repo, branch=branch)
+        r = self._repo(repo)
+        if branch not in r.branches:
+            raise GitHubNotFound(404, "Not Found", "DELETE", f"{repo}/git/refs/heads/{branch}")
+        del r.branches[branch]
+        self.deleted_branches.append((repo, branch))
+
     # ------------------------------------------------------------------ GitHubAPI: pulls
 
     def create_draft_pr(
@@ -535,6 +557,15 @@ class FakeGitHub:
     def get_pr(self, repo: str, number: int) -> PullRequest:
         self._call("get_pr", repo=repo, number=number)
         return self._pr_dc(self._pr(repo, number))
+
+    def close_pr(self, repo: str, number: int) -> PullRequest:
+        require_fman_branch(self.get_pr(repo, number).head_ref)
+        self._write("close_pr", repo=repo, number=number)
+        pr = self._pr(repo, number)
+        if pr.state == "open":
+            self._close(pr, self._bot, None)
+            self.closed_prs.append((repo, number))
+        return self._pr_dc(pr)
 
     def find_pr_for_branch(self, repo: str, branch: str) -> PullRequest | None:
         self._call("find_pr_for_branch", repo=repo, branch=branch)

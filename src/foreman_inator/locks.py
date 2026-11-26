@@ -80,6 +80,19 @@ Rules
   and ``Waiter.blockers`` stay ticket ids only, so callers that look tickets up by them
   are unchanged. Before migration 012 there is no chat column and every chat call is a
   no-op (``chat_touch`` returns no holders and locks nothing).
+* **Pairs** (``ab:pair``, #34 / GH #16): the two sides of a pair are sibling tickets
+  that edit the same files on separate branches, so they must never block each other.
+  They are ONE holder whose id is the pair's ``ticket_a`` (``holder_id``): every lock
+  either side takes is stored under ``ticket_a``, either side may take or share paths
+  the pair holds, and ``held``, ``conflicts``, ``waiting``, ``may_start`` and ``acquire``
+  look at the pair's rows. Any third ticket waits on the pair exactly as on one ticket
+  (its ``blockers`` name ``ticket_a``). In the wait-for graph the pair is one node; on a
+  cycle the youngest holder (highest id; a pair's id is ``ticket_a``) yields, which
+  releases both sides' locks. Each side keeps its own wanted set (``owned_files``).
+  ``release`` frees the pair's rows only when no other side is still open, or when the
+  caller passes ``pair_over=True``; ``sweep`` keeps them while any side is open and not
+  dormant (side A may be dropped while side B goes on alone). The pair link comes from
+  ``Store.pair_for_ticket`` (migration 016): an unpaired ticket is its own holder.
 """
 
 from __future__ import annotations
@@ -89,7 +102,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Literal
 
-from foreman_inator.db.store import Store, Ticket
+from foreman_inator.db.store import Pair, Store, Ticket
 
 OPEN_COLUMNS = ("todo", "in_progress", "testing")
 
@@ -476,28 +489,55 @@ class Locks:
     def __init__(self, store: Store) -> None:
         self.store = store
 
+    # -- pairs (#34) --
+
+    def _pair(self, tid: int) -> Pair | None:
+        """The ``Pair`` the ticket is a side of (any status), or None."""
+        return self.store.pair_for_ticket(tid)
+
+    def holder_id(self, ticket: Ticket | int) -> int:
+        """The id the ticket's lock rows are stored under: ``ticket_a`` for either side
+        of a pair, the ticket's own id otherwise."""
+        tid = _tid(ticket)
+        pair = self._pair(tid)
+        return pair.ticket_a if pair is not None else tid
+
+    def _sides(self, tid: int) -> tuple[int, ...]:
+        """Both sides of the ticket's pair (``ticket_a`` first), or just the ticket."""
+        pair = self._pair(tid)
+        if pair is None:
+            return (tid,)
+        return (pair.ticket_a, pair.ticket_b)
+
     # -- reads --
 
     def held(self, ticket: Ticket | int) -> tuple[str, ...]:
-        tid = _tid(ticket)
-        return tuple(lk.path for lk in self.store.list_locks(ticket_id=tid))
+        """The lock keys the ticket's holder holds (for a pair side: the pair's)."""
+        hid = self.holder_id(ticket)
+        return tuple(lk.path for lk in self.store.list_locks(ticket_id=hid))
 
     def conflicts(self, ticket: Ticket | int, diff_files: Iterable[str]) -> tuple[Conflict, ...]:
-        """Which of ``diff_files`` other tickets hold. Read-only: locks nothing."""
+        """Which of ``diff_files`` other holders hold (a sibling never conflicts).
+        Read-only: locks nothing."""
         t = self._ticket(ticket)
-        return _conflicts(t.id, [lock_key(p) for p in clean_paths(diff_files)], self._rows(t.repo))
+        keys = [lock_key(p) for p in clean_paths(diff_files)]
+        return _conflicts(self.holder_id(t), keys, self._rows(t.repo))
 
     def waiting(self, repo: str) -> list[Waiter]:
         """Open tickets in ``repo`` that are paused on someone else's locks. Read-only:
-        a dormant ticket's rows count as released (the next ``acquire`` sweeps them)."""
+        a dormant ticket's rows count as released (the next ``acquire`` sweeps them); a
+        pair's rows count as released only when every open side is dormant."""
         tickets = self.store.list_tickets(column=OPEN_COLUMNS, repo=repo)
-        asleep = {t.id for t in tickets if dormant(t)}
+        owner = {t.id: self.holder_id(t) for t in tickets}
+        awake = {owner[t.id] for t in tickets if not dormant(t)}
+        asleep = {owner[t.id] for t in tickets if dormant(t)} - awake
         rows = [r for r in self._rows(repo) if r.ticket_id not in asleep]
         out = []
         for t in tickets:
-            if t.id in asleep:
+            if dormant(t):
                 continue
-            cs = _conflicts(t.id, _missing(t, rows), rows)
+            hid = owner[t.id]
+            cs = _conflicts(hid, _missing(t, hid, rows), rows)
             if cs:
                 out.append(Waiter(t.id, _ticket_ids(cs), cs, _chat_ids(cs)))
         return out
@@ -517,15 +557,16 @@ class Locks:
             t = self.store.get_ticket(tid)
             if t.column not in OPEN_COLUMNS:
                 return LockResult(tid, self.held(tid), closed=True)
+            hid = self.holder_id(t)  # a pair side locks for the pair (ticket_a)
             self._sweep_repo(t.repo, keep=t.id)
             t = self._want(t, add)
             while True:
                 rows = self._rows(t.repo)
-                missing = _missing(t, rows)
-                cs = _conflicts(t.id, missing, rows)
+                missing = _missing(t, hid, rows)
+                cs = _conflicts(hid, missing, rows)
                 if not cs:
                     if missing:
-                        left = self.store.acquire_locks(t.id, t.repo, missing)
+                        left = self.store.acquire_locks(hid, t.repo, missing)
                         if left:  # cannot happen: the overlap check covers exact paths
                             cs = tuple(
                                 Conflict(r.path, r.path, r.ticket_id)
@@ -534,12 +575,12 @@ class Locks:
                             )
                             return LockResult(t.id, self.held(t.id), cs, tuple(yielded))
                     return LockResult(t.id, self.held(t.id), yielded=tuple(yielded))
-                if t.id in yielded:
+                if hid in yielded:
                     return LockResult(t.id, (), tuple(cs), tuple(yielded))
-                cycle = self._cycle_through(t)
+                cycle = self._cycle_through(t, hid)
                 if cycle is None:
                     return LockResult(t.id, self.held(t.id), tuple(cs), tuple(yielded))
-                victim = max(cycle)  # the youngest ticket on the cycle yields
+                victim = max(cycle)  # the youngest holder on the cycle yields
                 self.store.release_locks(victim)
                 yielded.append(victim)
 
@@ -559,9 +600,20 @@ class Locks:
             paths += [old, new]
         return self.acquire(ticket, paths)
 
-    def release(self, ticket: Ticket | int) -> int:
-        """Drop every lock the ticket holds (merge, drop, handover-and-close). Idempotent."""
-        return self.store.release_locks(_tid(ticket))
+    def release(self, ticket: Ticket | int, *, pair_over: bool = False) -> int:
+        """Drop every lock the ticket holds (merge, drop, handover-and-close). Idempotent.
+
+        A pair side's locks are the pair's: they go only once no other side is open, or
+        when ``pair_over`` says the whole pair is finished; until then this returns 0.
+        """
+        tid = _tid(ticket)
+        sides = self._sides(tid)
+        if len(sides) == 1:
+            return self.store.release_locks(tid)
+        others = [s for s in sides if s != tid]
+        if not pair_over and any(self.store.get_ticket(s).column in OPEN_COLUMNS for s in others):
+            return 0
+        return sum(self.store.release_locks(s) for s in sides)
 
     def sweep(self) -> int:
         """Delete lock rows of tickets that are done, dropped or dormant, and of chat
@@ -641,7 +693,7 @@ class Locks:
         and of chat sessions in a final state."""
         n = 0
         live = {
-            t.id
+            self.holder_id(t)  # a pair stays live while either side is
             for t in self.store.list_tickets(column=OPEN_COLUMNS, repo=repo)
             if not dormant(t) or t.id == keep
         }
@@ -655,25 +707,29 @@ class Locks:
                 n += self.release_chat(sid)
         return n
 
-    def _cycle_through(self, start: Ticket) -> list[int] | None:
-        """A wait-for cycle through ``start`` (ticket ids), or None."""
+    def _cycle_through(self, start: Ticket, start_holder: int) -> list[int] | None:
+        """A wait-for cycle through ``start``'s holder (holder ids), or None. Nodes are
+        holders: a pair's two sides are one node, waiting on what either side wants."""
         rows = self._rows(start.repo)
         edges: dict[int, set[int]] = {}
         for t in self.store.list_tickets(column=OPEN_COLUMNS, repo=start.repo):
             if dormant(t) and t.id != start.id:
                 continue
+            hid = start_holder if t.id == start.id else self.holder_id(t)
             # a chat never waits, so it is never on a cycle: ticket edges only
-            edges[t.id] = set(_ticket_ids(_conflicts(t.id, _missing(t, rows), rows)))
+            cs = _conflicts(hid, _missing(t, hid, rows), rows)
+            edges.setdefault(hid, set()).update(_ticket_ids(cs))
+        root = start_holder
         parent: dict[int, int] = {}
-        frontier = [start.id]
-        seen = {start.id}
+        frontier = [root]
+        seen = {root}
         while frontier:
             nxt = []
             for node in frontier:
                 for to in sorted(edges.get(node, ())):
-                    if to == start.id:
-                        cycle, cur = [start.id], node
-                        while cur != start.id:
+                    if to == root:
+                        cycle, cur = [root], node
+                        while cur != root:
                             cycle.append(cur)
                             cur = parent[cur]
                         return cycle
@@ -689,17 +745,19 @@ def _tid(ticket: Ticket | int) -> int:
     return ticket if isinstance(ticket, int) else ticket.id
 
 
-def _missing(t: Ticket, rows: list[_Row]) -> list[str]:
-    mine = [r.path for r in rows if r.ticket_id == t.id]
+def _missing(t: Ticket, holder: int, rows: list[_Row]) -> list[str]:
+    """``t``'s wanted keys not yet inside a lock of its holder (``t.id``, or a pair's
+    ``ticket_a``)."""
+    mine = [r.path for r in rows if r.ticket_id == holder]
     keys = dict.fromkeys(lock_key(p) for p in t.owned_files)
     return [k for k in keys if not covered(k, mine)]
 
 
-def _conflicts(tid: int, keys: Iterable[str], rows: list[_Row]) -> tuple[Conflict, ...]:
+def _conflicts(holder: int, keys: Iterable[str], rows: list[_Row]) -> tuple[Conflict, ...]:
     out = []
     for k in keys:
         for r in rows:
-            if r.ticket_id == tid or not overlaps(k, r.path):
+            if r.ticket_id == holder or not overlaps(k, r.path):
                 continue
             if r.chat_session_id is not None:
                 out.append(Conflict(k, r.path, r.chat_session_id, "chat"))

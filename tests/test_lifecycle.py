@@ -294,7 +294,7 @@ def test_merge_wins_over_the_auto_closed_issue(env: Driver):
 
 def test_closed_pr_without_merge_drops(env: Driver):
     env.to_testing()
-    env.gh.close_pr(REPO, env.ticket().pr_number, by=ME)
+    env.gh.close_pr_as(REPO, env.ticket().pr_number, by=ME)
     (ev,) = env.poll()
     assert isinstance(ev, ClosedUnmerged) and ev.what == "pr"
     assert env.ticket().column == "dropped"

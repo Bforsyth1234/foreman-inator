@@ -54,6 +54,29 @@ Wave 6b:
   ``todo`` with no action: its cursors (``clarify_cursor`` = how it resumed,
   ``clarify_qa_cursor`` = the Q&A text for the writer prompt) are the whole effect, and
   the worker's route job picks the ticket up on its next pass.
+
+Wave 22 (#34, ``ab:pair``; design decisions of 2026-11-26): each side of a pair is its
+own ticket row, so every event below names the side it acts on (``ticket_id``). The
+paired variants never change an unpaired ticket's transitions: ``pair`` / ``paired``
+default to False and then the table above holds exactly.
+
+* ``TicketRequested(pair=True)`` adds ``CREATE_PAIR_SIDE`` after the usual actions;
+  ``PairRequested`` (``ab:pair`` added late, decision 3) on an open side A → same
+  column, ``CREATE_PAIR_SIDE``. Side B starts from base; once A is ``done`` it raises.
+* ``PairRemoved`` (an allowed user removed ``ab:pair``) on an open side B → ``dropped``,
+  closing its PR (``CLOSE_OWN_PR``) and recording the pair as dropped.
+* ``PairLost`` (the sibling's PR was merged) → ``dropped``: cancel, ``CLOSE_OWN_PR``,
+  ``DELETE_OWN_BRANCH`` (only under ``fman/``), ``RECORD_PAIR_RESULT`` with flag reason
+  ``pair_lost`` and the win for the sibling.
+* ``ClosedUnmerged(paired=True)``: ``what="pr"`` → that side ``dropped``, recorded
+  ``rejected``; the sibling continues alone (decision 4). ``what="issue"`` and
+  ``AgentLabelRemoved(paired=True)`` drop the side and the pair. ``Merged(paired=True)``
+  records the win. Each adds ``RECORD_PAIR_RESULT``; ``pair_result(event)`` is its payload,
+  ``pair_status`` the ``pairs.status`` it leads to and ``pair_store_op`` the store call
+  (``decide_pair`` / ``drop_pair``, or nothing while a rejected side's sibling goes on).
+* Locks: a pair is one lock holder, so ``RELEASE_LOCKS`` on a paired side releases only
+  when ``pair_locks_releasable(sibling_column)`` (the sibling is terminal too). The
+  transitions still emit ``RELEASE_LOCKS``; the handler makes that check.
 """
 
 from __future__ import annotations
@@ -63,6 +86,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import StrEnum
 from typing import Literal, Protocol
+
+from foreman_inator.db.store import LoserOutcome, PairStatus
 
 Column = Literal["todo", "in_progress", "testing", "done", "dropped"]
 OPEN: frozenset[str] = frozenset({"todo", "in_progress", "testing"})
@@ -105,6 +130,11 @@ class Action(StrEnum):
     FLAG_TICKET = "flag_ticket"  # store.flag_ticket: handed to the user (7e)
     RECORD_CI = "record_ci"  # store.set_ci_result (#41); "failed" also saves the log tail
     START_REBASE = "start_rebase"  # #43: one attempt with trigger "rebase" (replay + resolve)
+    # #34 ab:pair. RELEASE_LOCKS on a paired side: only if pair_locks_releasable(sibling).
+    CREATE_PAIR_SIDE = "create_pair_side"  # side B row (copies A's route) + pairs row + start
+    CLOSE_OWN_PR = "close_own_pr"  # close the event's own ticket's PR (not the sibling's)
+    DELETE_OWN_BRANCH = "delete_own_branch"  # its head branch; refused outside fman/
+    RECORD_PAIR_RESULT = "record_pair_result"  # store pair_result(event); flag if it says so
 
 
 # --------------------------------------------------------------------------- events
@@ -133,6 +163,7 @@ class TicketRequested(GitHubEvent):
     label_event_id: int
     tier_override: int | None = None  # from a ``tier:N`` label by an allowed user
     review_skip: bool = False  # ``review:skip`` label by an allowed user (#17)
+    pair: bool = False  # ``ab:pair`` applied by an allowed user (#34): also open side B
 
 
 @dataclass(frozen=True)
@@ -159,6 +190,50 @@ class AgentLabelRemoved(GitHubEvent):
 
     ticket_id: int
     removed_by: str
+    paired: bool = False  # #34: the ticket is one side of a pair → the pair is dropped
+
+
+@dataclass(frozen=True)
+class PairRequested(GitHubEvent):
+    """#34 decision 3: ``ab:pair`` applied by an allowed user to an issue whose open ticket
+    (side A, ``ticket_id``) has no pair yet. Allowed until side A is ``done``."""
+
+    ticket_id: int
+    labeled_by: str
+    label_event_id: int
+
+
+@dataclass(frozen=True)
+class PairRemoved(GitHubEvent):
+    """#34 decision 3: an allowed user removed ``ab:pair``. ``ticket_id`` is the undecided
+    side B; it is dropped and its PR (``pr_number``, None if not opened yet) closed."""
+
+    ticket_id: int
+    removed_by: str
+    pr_number: int | None = None
+
+
+#: The ``flag_reason`` prefix of a side dropped because its sibling's PR was merged.
+FLAG_PAIR_LOST = "pair_lost"
+
+
+@dataclass(frozen=True)
+class PairLost(GitHubEvent):
+    """#34: the sibling's PR (``sibling_pr_number``, ticket ``sibling_ticket_id``) was
+    merged. This side (``ticket_id``, PR ``pr_number`` or None) lost: it is cancelled, its
+    PR closed, its ``fman/`` branch deleted, and it is dropped with ``flag_reason``."""
+
+    ticket_id: int
+    sibling_ticket_id: int
+    sibling_pr_number: int
+    pr_number: int | None = None
+
+    @property
+    def flag_reason(self) -> str:
+        return (
+            f"{FLAG_PAIR_LOST}: PR #{self.sibling_pr_number} (ticket {self.sibling_ticket_id})"
+            " was merged instead"
+        )
 
 
 @dataclass(frozen=True)
@@ -236,15 +311,21 @@ class Merged(GitHubEvent):
     ticket_id: int
     pr_number: int
     merged_at: datetime | None = None
+    paired: bool = False  # #34: one side of a pair → record its win
 
 
 @dataclass(frozen=True)
 class ClosedUnmerged(GitHubEvent):
-    """The issue, or the ticket's PR, was closed with no merged PR."""
+    """The issue, or the ticket's PR, was closed with no merged PR.
+
+    ``paired`` (#34): the ticket is one side of a pair. ``what="pr"`` → this side lost
+    (``rejected``) and the sibling continues alone (decision 4); ``what="issue"`` → the
+    pair is dropped (the poller emits one event per open side)."""
 
     ticket_id: int
     pr_number: int | None
     what: Literal["issue", "pr"]
+    paired: bool = False
 
 
 CiState = Literal["passed", "failed", "base_red", "no_ci", "timed_out", "no_permission"]
@@ -368,6 +449,9 @@ Event = (
     | CiResult
     | BaseConflict
     | NeedsInfoAnswered
+    | PairRequested
+    | PairRemoved
+    | PairLost
 )
 
 
@@ -390,7 +474,8 @@ def apply(column: str | None, event: Event) -> Transition:
     if column is None:
         if isinstance(event, TicketRequested):
             pre = (_A.APPLY_TIER_OVERRIDE,) if event.tier_override is not None else ()
-            return Transition("todo", (_A.CREATE_TICKET, *pre, _A.ROUTE, _A.START_ATTEMPT))
+            pair = (_A.CREATE_PAIR_SIDE,) if event.pair else ()
+            return Transition("todo", (_A.CREATE_TICKET, *pre, _A.ROUTE, _A.START_ATTEMPT, *pair))
         raise IllegalTransition(column, event)
     if column in TERMINAL:
         raise IllegalTransition(column, event)
@@ -405,10 +490,24 @@ def apply(column: str | None, event: Event) -> Transition:
         case IssueEdited():
             return Transition(col, (_A.UPDATE_REQUEST,))
         case AgentLabelRemoved() | ClosedUnmerged():
-            return Transition("dropped", (*cancel, *_STOP))
+            rec = (_A.RECORD_PAIR_RESULT,) if event.paired else ()
+            return Transition("dropped", (*cancel, *rec, *_STOP))
         case Merged() if col in ("in_progress", "testing"):
+            rec = (_A.RECORD_PAIR_RESULT,) if event.paired else ()
             return Transition(
-                "done", (*cancel, _A.RECORD_ACCEPT, _A.CLOSE_ISSUE, _A.POST_SUMMARY, *_STOP)
+                "done",
+                (*cancel, _A.RECORD_ACCEPT, *rec, _A.CLOSE_ISSUE, _A.POST_SUMMARY, *_STOP),
+            )
+        case PairRequested():
+            return Transition(col, (_A.CREATE_PAIR_SIDE,))
+        case PairRemoved():
+            close = (_A.CLOSE_OWN_PR,) if event.pr_number is not None else ()
+            return Transition("dropped", (*cancel, *close, _A.RECORD_PAIR_RESULT, *_STOP))
+        case PairLost():
+            close = (_A.CLOSE_OWN_PR,) if event.pr_number is not None else ()
+            return Transition(
+                "dropped",
+                (*cancel, *close, _A.DELETE_OWN_BRANCH, _A.RECORD_PAIR_RESULT, *_STOP),
             )
         case ReviewSubmitted() if col == "testing":
             if not event.on_head:
@@ -443,6 +542,110 @@ def apply(column: str | None, event: Event) -> Transition:
                 return Transition("in_progress", (_A.START_REBASE,))
             return Transition(col, (_A.FLAG_TICKET,))
     raise IllegalTransition(column, event)
+
+
+# --------------------------------------------------------------------------- pairs (#34)
+
+#: What happened to one side of a pair (``won`` / ``merged_other`` / ``rejected`` match
+#: ``pairs.winner_ticket_id`` and ``pairs.loser_outcome``; ``dropped`` = no result).
+PairOutcome = Literal["won", "merged_other", "rejected", "dropped"]
+
+
+@dataclass(frozen=True)
+class PairResult:
+    """The payload of ``RECORD_PAIR_RESULT``: what to store for the event's side.
+
+    ``winner_ticket_id`` is set for ``won`` (this side) and ``merged_other`` (the sibling);
+    ``loser_outcome`` is the ``pairs.loser_outcome`` to store (None: leave it); a non-None
+    ``flag_reason`` is stored with ``store.flag_ticket`` directly (not a hand-over: no
+    comment, the ticket is already ``dropped``)."""
+
+    ticket_id: int
+    outcome: PairOutcome
+    winner_ticket_id: int | None = None
+    loser_outcome: LoserOutcome | None = None
+    flag_reason: str | None = None
+
+
+def pair_result(event: object) -> PairResult | None:
+    """What ``RECORD_PAIR_RESULT`` records for ``event``; None for an unpaired event."""
+    match event:
+        case PairLost():
+            return PairResult(
+                event.ticket_id,
+                "merged_other",
+                winner_ticket_id=event.sibling_ticket_id,
+                loser_outcome="merged_other",
+                flag_reason=event.flag_reason,
+            )
+        case Merged(paired=True):
+            return PairResult(event.ticket_id, "won", winner_ticket_id=event.ticket_id)
+        case ClosedUnmerged(paired=True, what="pr"):
+            return PairResult(event.ticket_id, "rejected", loser_outcome="rejected")
+        case ClosedUnmerged(paired=True) | AgentLabelRemoved(paired=True) | PairRemoved():
+            return PairResult(event.ticket_id, "dropped")
+    return None
+
+
+def pair_status(outcome: PairOutcome, sibling_column: str | None) -> PairStatus:
+    """The ``pairs.status`` after one side's ``outcome``, given the sibling's column now.
+
+    A merge decides the pair. A rejected side leaves it ``running`` while the sibling is
+    open (decision 4: it continues alone; its later merge decides the pair), else the pair
+    is ``dropped``. ``dropped`` (issue closed, ``agent`` or ``ab:pair`` removed) drops it,
+    unless the sibling was already merged."""
+    if outcome in ("won", "merged_other") or sibling_column == "done":
+        return "decided"
+    if outcome == "rejected" and sibling_column in OPEN:
+        return "running"
+    return "dropped"
+
+
+@dataclass(frozen=True)
+class PairOp:
+    """The store call ``RECORD_PAIR_RESULT`` makes: ``decide`` →
+    ``store.decide_pair(pair_id, winner_ticket_id=, loser_outcome=)``; ``drop`` →
+    ``store.drop_pair(pair_id)``."""
+
+    kind: Literal["decide", "drop"]
+    winner_ticket_id: int | None = None
+    loser_outcome: LoserOutcome | None = None
+
+
+def pair_store_op(
+    result: PairResult, *, sibling_id: int, pair_now: PairStatus, sibling_column: str | None
+) -> PairOp | None:
+    """The store call for ``result`` on a pair now ``pair_now`` whose other side is
+    ``sibling_id`` in ``sibling_column``; None: nothing to store.
+
+    A pair that is no longer running is left alone (``decide_pair`` re-decides only with
+    the same result; ``drop_pair`` never undoes a result), except that a re-read
+    ``PairLost`` re-sends its decision, which the store treats as a no-op. A merge whose
+    sibling was already ``dropped`` (its PR closed alone, decision 4) wins over a
+    ``rejected`` loser; otherwise the loser lost to the merge (``merged_other``)."""
+    if result.outcome == "won":
+        if pair_now != "running":
+            return None  # already decided (e.g. the sibling's PairLost came first) or dropped
+        lost = "rejected" if sibling_column == "dropped" else "merged_other"
+        return PairOp("decide", result.ticket_id, lost)
+    if result.outcome == "merged_other":
+        if pair_now == "dropped":
+            return None
+        return PairOp("decide", result.winner_ticket_id, "merged_other")
+    if pair_now != "running":
+        return None
+    status = pair_status(result.outcome, sibling_column)
+    if status == "running":
+        return None  # rejected while the sibling goes on alone: its merge decides
+    if status == "decided":  # the sibling was merged first; record that win
+        return PairOp("decide", sibling_id, "merged_other")
+    return PairOp("drop")
+
+
+def pair_locks_releasable(sibling_column: str | None) -> bool:
+    """May ``RELEASE_LOCKS`` release a ticket's locks? A pair is one lock holder (owner
+    ``ticket_a``), so only once the sibling is terminal too. ``None``: no sibling."""
+    return sibling_column is None or sibling_column in TERMINAL
 
 
 # --------------------------------------------------------------------------- rebase (#43)
@@ -584,7 +787,19 @@ __all__ = [
     "CI_GRACE",
     "CI_PENDING_LIMIT",
     "CI_STATUS_NOTES",
+    "FLAG_PAIR_LOST",
     "FLAG_REBASE_CAP",
+    "PairLost",
+    "PairOutcome",
+    "PairRemoved",
+    "PairRequested",
+    "PairOp",
+    "PairResult",
+    "PairStatus",
+    "pair_locks_releasable",
+    "pair_result",
+    "pair_status",
+    "pair_store_op",
     "REBASE_CAP",
     "AIReviewed",
     "Action",
