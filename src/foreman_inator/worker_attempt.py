@@ -12,10 +12,16 @@ Attempt (``attempt_job``), in order:
    Claude; a running writer traffic split (#34, ``experiments.split.pick``) may give a
    ticket's first attempt to the challenger's model and prompt (never a retry,
    escalation, explore or ``tier:N`` ticket; the attempt's ``variant_id`` is then the
-   challenger's), and sends a retry after one back to the champion's model; a cloud
-   writer at the spend cap pauses the ticket before anything runs;
+   challenger's), and sends a retry after one back to the champion's model. Before the
+   split, an ab:pair side B's FIRST attempt runs its pinned opponent
+   (``experiments.pair.pick``, #16; ``local_only`` when the repo may not use cloud
+   models): its model and prompt, and no split (paired tickets never split). Every later
+   side-B attempt escalates, retries, budgets, reviews and follows its profile on its
+   own history like any ticket. A cloud writer at the spend cap pauses the ticket before
+   anything runs;
 3. under the repo's mirror lock: fetch, and the attempt's worktree on
-   ``fman/issue-<n>/a<k>``, starting from the previous attempt's work when there is one;
+   ``fman/issue-<n>/a<k>`` (pair side B: ``fman/issue-<n>-b/a<k>``, ``side=``), starting
+   from the previous attempt's work of the same side when there is one;
 4. find the verify command (the repo's saved override first); none → hand over once;
 5. the sandbox (#40) must be able to run (``sandbox = "on"`` and no backend → the ticket
    is flagged ``sandbox_unavailable``, no attempt row, nothing retried);
@@ -57,6 +63,7 @@ from fde_kit.prompts import PromptRef
 from foreman_inator import prompts, tracing
 from foreman_inator.config import ConfigError, ModelEndpoint
 from foreman_inator.db.store import Attempt, Ticket
+from foreman_inator.experiments import pair as pair_mod
 from foreman_inator.experiments import split as split_mod
 from foreman_inator.experiments import variants
 from foreman_inator.locks import holders_text
@@ -66,7 +73,7 @@ from foreman_inator.routing import escalation as esc
 from foreman_inator.routing import profile as prof
 from foreman_inator.runner import sandbox
 from foreman_inator.runner import verify as verify_mod
-from foreman_inator.runner.worktree import RepoMirror, Worktree, WorktreeError
+from foreman_inator.runner.worktree import RepoMirror, Worktree, WorktreeError, branch_name
 from foreman_inator.tickets import conventions as conventions_mod
 from foreman_inator.tickets import images as images_mod
 from foreman_inator.tickets import lifecycle
@@ -207,7 +214,8 @@ class AttemptSteps:
             )
             return
         endpoint = self._writer_endpoint(step)
-        # #34: a running traffic split may give this first attempt to the challenger
+        # #16: a pair side B's first attempt runs its opponent (checked before the split);
+        # #34: else a running traffic split may give this first attempt to the challenger
         # (its model and prompt), or send a retry after one back to the champion.
         split_pick = self._split_pick(ticket, step, endpoint)
         template = None
@@ -240,6 +248,7 @@ class AttemptSteps:
                 token=token,
                 fetch=False,
                 start_point=_start_point(mirror, ticket, counted),
+                side=_side(ticket),
             )
         except WorktreeError as exc:
             # #53: no attempt row yet; nothing to set aside, the flag stops the ticket.
@@ -294,8 +303,23 @@ class AttemptSteps:
         self._run_and_finish(ticket, att, wt, endpoint, cmd, cancel, template=template)
 
     def _split_pick(self, ticket: Ticket, step: esc.Retry, endpoint: Any) -> Any:
-        """#34 (``experiments.split.pick``): None when no split applies. Never raises: a
-        broken split leaves the attempt as escalation chose it."""
+        """The attempt's model/prompt override: #16's pair pin (``experiments.pair.pick``)
+        first, else #34's split (``experiments.split.pick``); None when neither applies.
+        Never raises: a broken pin or split leaves the attempt as escalation chose it."""
+        if getattr(ticket, "pair_side", None) is not None:
+            try:
+                return pair_mod.pick(
+                    self.store,
+                    self.config,
+                    ticket,
+                    step,
+                    endpoint,
+                    self.history(ticket).attempts,  # type: ignore[attr-defined]
+                    local_only=not self.store.repo_allows_cloud(ticket.repo),
+                )
+            except Exception:
+                log.exception("ticket %d: pair opponent check failed; no pin", ticket.id)
+                return None  # paired tickets never take part in a split
         ex = getattr(self.config, "experiments", None)
         try:
             return split_mod.pick(
@@ -732,19 +756,28 @@ def _start_point(mirror: RepoMirror, ticket: Ticket, attempts: list[Attempt]) ->
         if _branch_exists(mirror, ref):
             return ref
     if ticket.pr_number is not None:
-        ref = f"refs/remotes/origin/{pr_head_branch(ticket)}"
+        # #16: side B's PR head is its own first-attempt branch, never side A's.
+        head = branch_name(ticket.issue_number, 1, "b") if _side(ticket) else pr_head_branch(ticket)
+        ref = f"refs/remotes/origin/{head}"
         if _branch_exists(mirror, ref):
             return ref
     return None
 
 
+def _side(ticket: Ticket) -> str | None:
+    """#16: ``"b"`` for a pair's side B (its own ``-b`` branch and worktree names), else
+    None (side A keeps the unpaired names)."""
+    return "b" if getattr(ticket, "pair_side", None) == "b" else None
+
+
 def _remove_old_worktrees(mirror: RepoMirror, ticket: Ticket, ordinal: int) -> None:
     """Earlier attempts' checkouts are not needed once the next one exists; their local
     branches stay (the next attempt may build on them)."""
+    side = _side(ticket)
     for k in range(1, ordinal):
-        if mirror.attempt_path(ticket.issue_number, k).exists():
+        if mirror.attempt_path(ticket.issue_number, k, side=side).exists():
             try:
-                mirror.open(ticket.issue_number, k).remove(delete_branch=False)
+                mirror.open(ticket.issue_number, k, side=side).remove(delete_branch=False)
             except WorktreeError as exc:
                 log.debug("could not remove attempt %d worktree: %s", k, exc)
 

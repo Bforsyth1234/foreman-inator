@@ -82,6 +82,18 @@ issue's comments once and then:
 Nothing creates a sub-issue or applies a label. A ticket whose flag is cleared later
 runs on its stored tier 3 route.
 
+ab:pair side B (#16)
+--------------------
+Side B of a pair (``ticket.pair_side == 'b'``) is never routed, clarified or split on
+its own: it copies side A's route (``_copy_pair_route``). Once A has a ``routed_tier``,
+B stores the same ``routed_tier``, ``route_reason`` prefixed ``"pair: "``, and A's
+``start:``, ``explore:`` and clarification Q&A cursors, in one transaction (no router
+call, no second question, no split proposal: ``split_proposed`` never applies to B).
+Until A is routed B waits: the route job returns without an attempt, so B costs a store
+read per pass. ``clarify_due`` / ``clarify_parked`` are False for B (A's clarification
+covers the issue). Side B's opponent is pinned later, on its first attempt
+(``experiments.pair.pick``, ``worker_attempt``).
+
 Local-only repos (#49)
 ----------------------
 The router and the clarify check only ever call a local classifier (``routing.route`` and
@@ -117,7 +129,7 @@ from foreman_inator.routing import classifier, explore, knn
 from foreman_inator.routing import profile as prof
 from foreman_inator.routing.escalation import DEFAULT_LIMITS, Limits, with_cloud
 from foreman_inator.tickets import clarify, decompose
-from foreman_inator.tickets.lifecycle import clarify_cursor
+from foreman_inator.tickets.lifecycle import clarify_cursor, clarify_qa_cursor
 
 if TYPE_CHECKING:
     from foreman_inator.worker_queue import Job
@@ -131,6 +143,8 @@ DEFAULT_SPLIT_LARGE = decompose.DEFAULT_ENABLED
 DEFAULT_SPLIT_TIMEOUT = decompose.DEFAULT_TIMEOUT
 #: #51: the ``poll_cursors`` row holding a ticket's (profile-shifted) start tier.
 START_CURSOR_PREFIX = "start:"
+#: #16: what side B's ``route_reason`` starts with (the rest is side A's).
+PAIR_ROUTE_PREFIX = "pair: "
 #: #37: module defaults for the ``classifier_router`` / ``classifier_min_tickets`` keys.
 DEFAULT_CLASSIFIER_ROUTER = classifier.DEFAULT_ENABLED
 DEFAULT_CLASSIFIER_MIN_TICKETS = classifier.DEFAULT_MIN_TICKETS
@@ -139,6 +153,10 @@ _GATE_LOCK = threading.Lock()
 
 def start_cursor(ticket_id: int) -> str:
     return f"{START_CURSOR_PREFIX}{int(ticket_id)}"
+
+
+def _is_side_b(t: Ticket) -> bool:
+    return getattr(t, "pair_side", None) == "b"
 
 
 class RouteSteps:
@@ -157,11 +175,16 @@ class RouteSteps:
         return self.store.get_cursor(t.repo, clarify_cursor(t.id))
 
     def clarify_parked(self, t: Ticket) -> bool:
-        """Waiting on ``needs-info`` (free: a store read)."""
+        """Waiting on ``needs-info`` (free: a store read). Never side B (#16)."""
+        if _is_side_b(t):
+            return False
         return bool(self.config.clarify) and self.clarify_state(t) == "asked"
 
     def clarify_due(self, t: Ticket) -> bool:
-        """The clarification step has not finished for ``t`` (route job needed)."""
+        """The clarification step has not finished for ``t`` (route job needed). Never
+        side B (#16): side A's clarification covers the issue."""
+        if _is_side_b(t):
+            return False
         return bool(self.config.clarify) and self.clarify_state(t) not in CLARIFY_DONE
 
     def before_route(self, t: Ticket) -> bool:
@@ -230,7 +253,12 @@ class RouteSteps:
         t = self.store.get_ticket(job.ticket_id)
         if t.column != "todo" or t.flag_reason:
             return
-        if not self.before_route(t):  # type: ignore[attr-defined]
+        if _is_side_b(t):
+            if t.routed_tier is None:
+                t = self._copy_pair_route(t)
+                if t.routed_tier is None:
+                    return  # #16: side A is not routed yet; B waits, no attempt
+        elif not self.before_route(t):  # type: ignore[attr-defined]
             log.debug("ticket %d: parked before routing", t.id)
             return
         if t.routed_tier is None:
@@ -244,7 +272,10 @@ class RouteSteps:
         """Route ``t`` and store the pick with its explore decision (see the module
         docstring, "Routing"). An override makes no model call (it runs inside a poll
         transaction); a classification does, so it runs in a job and keeps a pick that a
-        ``tier:N`` label stored meanwhile."""
+        ``tier:N`` label stored meanwhile. Side B of a pair (#16) copies side A's route
+        instead (``_copy_pair_route``)."""
+        if _is_side_b(t):
+            return self._copy_pair_route(t)
         if override is not None:
             r = routing.route(t, config=self.config, proxy=None, override=override)
         else:
@@ -294,6 +325,31 @@ class RouteSteps:
             r.source,
             f"; profile {p.writer} starts on tier {start}" if start != r.tier else "",
             "; exploring one tier lower" if ex else "",
+        )
+        return cur
+
+    # ------------------------------------------------------------------ pair (#16)
+
+    def _copy_pair_route(self, t: Ticket) -> Ticket:
+        """Side B: store side A's route (see the module docstring, "ab:pair side B").
+        Returns B unchanged (``routed_tier`` None) while A is not routed, or when B has no
+        pair row; a route B already has is kept."""
+        a = self.store.sibling(t.id)
+        if a is None or a.routed_tier is None:
+            log.debug("ticket %d: pair side B waits for side A's route", t.id)
+            return t
+        with self.store.transaction():
+            cur = self.store.get_ticket(t.id)
+            if cur.routed_tier is not None:
+                return cur
+            reason = f"{PAIR_ROUTE_PREFIX}{a.route_reason or f'tier {a.routed_tier}'}"
+            cur = self.store.update_ticket(t.id, routed_tier=a.routed_tier, route_reason=reason)
+            for name in (start_cursor, explore.explore_cursor, clarify_qa_cursor):
+                value = self.store.get_cursor(a.repo, name(a.id))
+                if value is not None:
+                    self.store.set_cursor(t.repo, value, name(t.id))
+        log.info(
+            "ticket %d: pair side B copies ticket %d's route (tier %d)", t.id, a.id, a.routed_tier
         )
         return cur
 
@@ -436,6 +492,7 @@ __all__ = [
     "DEFAULT_CLASSIFIER_ROUTER",
     "DEFAULT_SPLIT_LARGE",
     "DEFAULT_SPLIT_TIMEOUT",
+    "PAIR_ROUTE_PREFIX",
     "START_CURSOR_PREFIX",
     "RouteSteps",
     "start_cursor",
