@@ -895,8 +895,11 @@ def full_app(
         ),
         *resources_routes(res_path, nav=nav),
         # #67/#69: start, stop, cancel, promote and propose (POSTs behind forms.FormGuard).
+        # config.toml per request (a model removed after start is not offered); the
+        # startup config when the file is missing or cannot be read.
         *experiments_ui.routes(
-            store_path, load_config=(lambda: cfg) if config is not None else None, nav=nav
+            store_path, load_config=_per_request_config(cfg) if config is not None else None,
+            nav=nav,
         ),
         *settings_ui.routes(store_path, nav=nav),  # #73: edit config.toml (FormGuard)
         *tiers_ui.routes(store_path, nav=nav),  # #74: models per tier (FormGuard)
@@ -912,6 +915,25 @@ def full_app(
         ),
     ]  # fmt: skip
     return create_app(store_path, extra_routes=routes, nav=nav, resources_path=res_path)
+
+
+def _per_request_config(startup: Any) -> Any:
+    """A loader that reads config.toml on each call (like /settings, /tiers and
+    /activity), falling back to ``startup`` when the file is missing or invalid."""
+    from foreman_inator import config as config_mod
+    from foreman_inator import paths
+
+    def load() -> Any:
+        path = paths.config_path()
+        if not path.exists():
+            return startup
+        try:
+            return config_mod.load(path)
+        except config_mod.ConfigError as exc:
+            log.warning("experiments page: config.toml unreadable (%s); using startup config", exc)
+            return startup
+
+    return load
 
 
 def retry_github(cfg: Any) -> Any:

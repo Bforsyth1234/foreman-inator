@@ -1,6 +1,7 @@
 # Chat sessions: design (todo #71 / GH #60, page todo #75 / GH #64)
 
-Status: **design only** (wave 18, slot F7). Nothing here is wired. `src/foreman_inator/chat.py`
+Status: **foundations built** (wave 19: store, proxy, OpenCode chat server, spend, locks,
+config keys; all inert until a chat session exists). No chat engine or front end yet. `src/foreman_inator/chat.py`
 holds the types, the settled pure helpers and the `ChatManager` signatures (they raise
 `NotImplementedError`). The open questions at the end need the user before wave C2 starts.
 
@@ -37,7 +38,7 @@ What this costs, and how it is covered:
 | Spend ledger | SQLite, shared by every process | shared; caps hold across processes |
 | Spend reservations | in memory, per process (`spend.py` docstring, "Reservation") | the chat's in-flight calls are invisible to the worker's `Spend` until they settle. Worst case overshoot = one chat call's estimate; same class of gap as `fman experiment run` today |
 | Local GPU | `shared_local_slots` lock files under `<home>/run` (#34) | chat's local calls queue on the same slots, so chat and tickets never load Ollama twice |
-| Repo mirror | `RepoMirror` git calls, an in-process lock in the worker | a cross-process lock file per mirror (`<home>/run/mirror-<owner>-<repo>.lock`, `fcntl`) around fetch and `worktree add/remove`: wave C1 |
+| Repo mirror | `RepoMirror` git calls, an in-process lock in the worker | a cross-process lock file per mirror (`<worktrees>/<owner>/<repo>/.mirror.lock`, `flock`) around fetch and `worktree add/remove`: wave C1 |
 | Store | the metrics app opens it read-only | chat routes open their own writable `Store` |
 
 ## 2. Session lifecycle
@@ -96,14 +97,16 @@ event pump, permission/question rejection and tool recording are the driver's
   or discarded from the page or `fman chat list / pr <id> / discard <id>`. On startup the
   manager marks any `idle`/`busy` row with no live server as `ended` (`end_reason =
   'host_restart'`).
-* **Resume** of an `ended` session: start a new server in the kept worktree. Whether
-  OpenCode 1.18.7 reloads the old session from its `XDG_DATA_HOME` (kept under
-  `<home>/opencode/chats/<id>/`) must be checked against the binary before C2 (rule 12).
-  If it does not, resume opens a new OpenCode session whose first prompt is a short,
-  fenced summary of the earlier turns (from the recording).
+* **Resume** of an `ended` session: start a new server in the kept worktree, on the kept
+  state dir (`<home>/opencode/chats/<id>/`). Checked against OpenCode 1.18.7 (wave C1c,
+  `ChatServer` docstring): sessions persist in `XDG_DATA_HOME/opencode/opencode.db`, and a
+  server reopened on the same data dir resumes the old session id with its full message
+  list (`ChatServer.start(resume=<id>)`); no summary prompt is needed. The chat config
+  must always set `enabled_providers`, or OpenCode falls back to its own hosted model.
 
-**File locks (#19):** a chat holds none while it runs (its files are not known up front).
-Its PR can conflict with a ticket's PR; that is the user's call when merging. Open question 6.
+**File locks (#19):** decision 6 below: a chat locks the files it edits (holder kind
+"chat", `Locks.chat_touch`), never waits on a ticket's locks, and releases them on `/pr`,
+`/discard` or the session's end.
 
 ## 3. Messages in, events out
 
@@ -409,6 +412,10 @@ Message text is not stored in SQLite (it is in the recording, which has a retent
 | `chat_turn_budget_usd` | = `attempt_budget_usd` (1.50) | cloud spend one message may use |
 | `chat_idle_minutes` | 30 | idle session -> `ended` (worktree kept) |
 | `chat_max_sessions` | 1 | open sessions per host process |
+| `chat_local_wait_seconds` | 5.0 | wait for the local slot before a turn falls back to cloud (decision 2) |
+
+Per repo (database, not config.toml): `chat_network`, set with `fman repo set-chat-network
+<repo> on|off` or on `/settings` (decision 4).
 
 ## 14. Implementation plan (waves, disjoint files)
 
@@ -456,3 +463,15 @@ matches `fman status`, `/pr` opens a draft, `/discard` leaves no branch.
 6. Should a chat take file locks on the files it edits, so tickets wait instead of
    producing conflicting PRs?
 7. Is one open session at a time enough (`chat_max_sessions = 1`)?
+
+### Decisions (user, 2026-11-25)
+
+These answer the questions above and override any earlier recommendation in this doc.
+
+1. **Spend:** option C. Chat counts toward `monthly_usd`, capped by `chat_monthly_usd`, default **$20**.
+2. **Local GPU: chat jumps the queue, on a timer.** A chat turn that needs the local slot goes ahead of queued ticket calls (priority, not preemption of a call already running). If the turn would wait more than **5 seconds** (`chat_local_wait_seconds = 5`) for the slot, that turn goes to a **cloud model** instead: the first cloud rung at or above the session's tier. The fallback never applies to a local-only repo (#49, invariant 7c): there the turn keeps waiting. It is also refused, and the turn waits, when the chat sub-cap, the monthly cap or the per-turn budget would be exceeded. The turn's trace and the page say "local slot busy, used <cloud model>". The session's own tier does not change; the next turn tries local again.
+3. **Opening as PR:** a draft PR with **no AI review**: the user was in the loop for every change.
+4. **Network:** closed by default, with a **per-repo opt-in** for chat only (`chat_network`, stored in `repo_settings`, set with `fman repo set-chat-network <repo> on|off` and on `/settings`). When on, the chat sandbox gets the same outbound policy as a first-attempt dependency install (ports 443/80), never the user's credentials or Keychain. Tickets are unaffected.
+5. **Base branch only** at first: a chat never continues an existing `fman/` ticket branch (it could collide with the worker's next attempt).
+6. **File locks: yes.** A chat session takes locks on files it edits (lock holder kind "chat"), so tickets wait instead of producing conflicting PRs; locks are released on `/pr`, `/discard`, or when the session ends. A chat never waits on a ticket's locks to edit (the user decides), but the page shows a warning when a file it edits is held by a ticket.
+7. **One open session** at a time (`chat_max_sessions = 1`).

@@ -506,6 +506,19 @@ def test_after_a_model_edit_the_install_is_offline(tmp_path, index, fake_setup, 
     assert networked and edited not in networked  # network only in the base scratch
 
 
+def _quiet_hits(index: PackageIndex, quiet: float = 1.0, limit: float = 30.0) -> int:
+    """``index.hits`` once no request has arrived for ``quiet`` seconds (at most ``limit``)."""
+    deadline = time.monotonic() + limit
+    last, since = index.hits, time.monotonic()
+    while time.monotonic() < deadline:
+        time.sleep(0.1)
+        if index.hits != last:
+            last, since = index.hits, time.monotonic()
+        elif time.monotonic() - since >= quiet:
+            break
+    return last
+
+
 @macos
 @needs_uv
 @pytest.mark.timeout(300)
@@ -517,7 +530,9 @@ def test_after_a_model_edit_without_refill_a_cold_cache_is_flagged(tmp_path, ind
     att._git("commit", "-qm", "attempt 1", cwd=att.wt.path)
     wt2 = att.attempt(start_point=f"refs/heads/{att.wt.branch}")
     w = FakeWorker(tmp_path, install_refill_cache=False)
-    hits = index.hits
+    # `uv lock` (in _Repo) may leave a request the server thread counts late under load:
+    # take the baseline only once the index has been quiet for a while.
+    hits = _quiet_hits(index)
     with pytest.raises(_SetupFailed) as err:
         w.install_dependencies(_Ticket("o/cold"), 2, wt2)
     assert index.hits == hits  # it never reached the index

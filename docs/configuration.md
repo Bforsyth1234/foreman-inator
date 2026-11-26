@@ -65,6 +65,11 @@ as `"keychain:foreman-inator/<name>"`.
 | `status_comment` | `true` | Keep one comment on the issue up to date while work runs: attempt and tier, verifying, in review, PR opened, handed over, dropped. Edited in place, never one per step. A repo's settings row can turn it off. |
 | `status_label` | `false` | Also add the `fman:working` label while work runs (removed when it stops). It never starts work. |
 | `status_show_cost` | `false` | Put the spend so far in the status comment. Issue comments on a public repo are public. |
+| `chat_local_wait_seconds` | `5.0` | Chat sessions (#71, not usable yet): how long a chat turn waits for the local slot before it goes to the first cloud rung at or above its tier (never for a local-only repo, nor past a cap). 0 to 600. |
+| `chat_start_tier` | `1` | Chat sessions: the tier a new session starts on. 1, 2 or 3. |
+| `chat_turn_budget_usd` | `attempt_budget_usd` | Chat sessions: cloud spend one chat message may use. Above 0. |
+| `chat_idle_minutes` | `30` | Chat sessions: an idle session ends after this (its worktree is kept). 1 to 1440. |
+| `chat_max_sessions` | `1` | Chat sessions open at once. 1 to 16. |
 
 ## `[spend_caps]`
 
@@ -76,6 +81,7 @@ cloud call off.
 | `daily_usd` | `5.0` | Live cloud spend per local calendar day: writers and the AI reviewer. |
 | `monthly_usd` | `50.0` | Live cloud spend per local calendar month. |
 | `experiments_monthly_usd` | `10.0` | Replays and shadow reviews per month. Never draws on the live caps. |
+| `chat_monthly_usd` | `20.0` | Chat sessions' share of `monthly_usd` per month (chat spend counts toward the live caps too). At most `monthly_usd`; the default is lowered to `monthly_usd` when that is smaller. |
 
 ## `[sandbox_network]`
 
@@ -240,13 +246,16 @@ api_key_ref = "keychain:foreman-inator/glm"
 
 ## Per-repo settings in the database
 
-Three settings are kept in the worker's database rather than in `config.toml`:
+These settings are kept in the worker's database rather than in `config.toml`:
 
 * the verify command, set with `fman repo set-verify <owner/name> '<command>'`
   and cleared with `--clear`;
 * the repo profile, set with `fman repo set-profile` (below);
 * the cloud setting, set with `fman repo set-cloud <owner/name> on|off`: `off`
-  keeps the repo's code on this Mac (see [`fman repo set-cloud`](commands.md#fman-repo-set-cloud)).
+  keeps the repo's code on this Mac (see [`fman repo set-cloud`](commands.md#fman-repo-set-cloud));
+* the chat network opt-in, set with `fman repo set-chat-network <owner/name> on|off`
+  (default off; chat sessions only, see
+  [`fman repo set-chat-network`](commands.md#fman-repo-set-chat-network)).
 
 ### Repo profiles
 

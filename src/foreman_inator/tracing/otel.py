@@ -14,7 +14,19 @@ Span layout (SPEC "Tracing"; the ticket is the root):
     └─ github                    github.action; a kickback is a `kickback` event + a link to
                                  the attempt span it judges
 
-Every span carries `ticket.id`. Content attributes (input.value, output.value) go through
+A chat session (docs/chat-design.md section 9) is its own trace, with no ticket:
+
+    chat                         chat.id, chat.repo, chat.base_branch
+    └─ chat.turn                 chat.id, chat.turn, chat.tier, chat.model
+    llm.call                     parented to `chat` (the proxy context captured it at
+                                 registration), with chat.id and the open turn's chat.turn;
+                                 a call sent to cloud because the local slot was busy adds
+                                 llm.local_fallback, and its turn gets a `local_fallback` event
+
+`chat_span(session_id, trace_id=stored)` reopens a stored chat trace the way `ticket_span`
+does (root id `chat_root_span_id(trace_id)`); spans inside a chat carry no `ticket.id`.
+
+Every ticket span carries `ticket.id`. Content attributes (input.value, output.value) go through
 `fde_kit.tracing.trace_content` (truncated at 4,000 chars).
 
 One ticket, one trace, across process restarts. The tickets table stores only the trace id,
@@ -272,6 +284,11 @@ def _remote(trace_id: str, span_id: int) -> SpanContext:
     return SpanContext(
         int(trace_id, 16), span_id, is_remote=True, trace_flags=TraceFlags(TraceFlags.SAMPLED)
     )
+
+
+def chat_root_span_id(trace_id: str) -> str:
+    """The span id of a chat session's root `chat` span, as 16 hex chars."""
+    return trace.format_span_id(_derive(trace_id, "chat"))
 
 
 def ticket_context(trace_id: str) -> Context:
@@ -537,6 +554,99 @@ def add_kickback(s: Span, *, attempt_id: int, by: str, tag: str, note: str | Non
             }
         ),
     )
+
+
+# --------------------------------------------------------------------------- chat sessions
+
+
+@dataclass(frozen=True)
+class ChatTrace:
+    session_id: int
+    trace_id: str
+    """32 hex chars; store this in chat_sessions.trace_id."""
+    resumed: bool
+
+
+_chat_turns: dict[int, tuple[int, Span]] = {}  # session id -> (turn, its open span)
+_chat_lock = threading.Lock()
+
+
+@contextmanager
+def chat_span(
+    session_id: int,
+    *,
+    trace_id: str | None = None,
+    repo: str | None = None,
+    base_branch: str | None = None,
+) -> Iterator[ChatTrace]:
+    """Enter a chat session's trace (section 9). Yields a `ChatTrace`; store `.trace_id`
+    on the session row. Register the session's proxy context inside this block, so its
+    `llm.call` spans are parented here.
+
+    `trace_id=None` starts the trace: one root `chat` span (`chat.id`, `chat.repo`), open
+    for the block. With a stored `trace_id` (a resumed session) no new span is made and
+    everything in the block is parented to the original root. No ticket is current inside,
+    so spans made here carry no `ticket.id`."""
+    tk_token = _ticket.set(None)
+    try:
+        if trace_id is not None:
+            trace_id = trace_id.lower()
+            root = NonRecordingSpan(_remote(trace_id, _derive(trace_id, "chat")))
+            ctx_token = otel_context.attach(trace.set_span_in_context(root))
+            try:
+                yield ChatTrace(session_id, trace_id, resumed=True)
+            finally:
+                otel_context.detach(ctx_token)
+            return
+        tid = secrets.randbits(128) or 1
+        hex_tid = trace.format_trace_id(tid)
+        attrs = _clean({"chat.id": session_id, "chat.repo": repo, "chat.base_branch": base_branch})
+        with _force_ids(tid, _derive(hex_tid, "chat")):
+            s = tracer().start_span("chat", context=Context(), attributes=attrs)
+        with trace.use_span(s, end_on_exit=True):
+            yield ChatTrace(session_id, hex_tid, resumed=False)
+    finally:
+        _ticket.reset(tk_token)
+
+
+@contextmanager
+def chat_turn_span(session_id: int, turn: int, *, tier: int, model: str) -> Iterator[Span]:
+    """One `chat.turn` span per user message; call inside `chat_span` (or with the chat's
+    context). While open, `chat_turn(session_id)` is `turn` (the proxy stamps it on the
+    session's `llm.call` spans) and `chat_turn_event` adds events to it."""
+    attrs = _clean(
+        {"chat.id": session_id, "chat.turn": turn, "chat.tier": tier, "chat.model": model}
+    )
+    with tracer().start_as_current_span("chat.turn", attributes=attrs) as s:
+        with _chat_lock:
+            prev = _chat_turns.get(session_id)
+            _chat_turns[session_id] = (turn, s)
+        try:
+            yield s
+        finally:
+            with _chat_lock:
+                if prev is None:
+                    _chat_turns.pop(session_id, None)
+                else:
+                    _chat_turns[session_id] = prev
+
+
+def chat_turn(session_id: int) -> int | None:
+    """The turn number of the session's open `chat.turn` span, or None."""
+    with _chat_lock:
+        found = _chat_turns.get(session_id)
+    return found[0] if found else None
+
+
+def chat_turn_event(session_id: int, name: str, attributes: Mapping[str, Any]) -> bool:
+    """Add an event to the session's open `chat.turn` span, from any thread. False when no
+    turn is open."""
+    with _chat_lock:
+        found = _chat_turns.get(session_id)
+    if found is None:
+        return False
+    found[1].add_event(name, _clean(dict(attributes)))
+    return True
 
 
 # --------------------------------------------------------------------------- after-the-fact spans

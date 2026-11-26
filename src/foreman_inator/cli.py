@@ -6,7 +6,7 @@ status | promote`` and ``replay`` (#29), ``repo add | remove | list`` (#56), ``p
 (#56), ``repo set-profile`` (#51), ``rules show`` (#42), ``repo set-cloud`` (#49),
 ``experiment split start | stop | status`` (#34), ``experiment run --mode seeded``
 (#35), ``sweep`` (#77), ``experiment propose | approve-draft | discard-draft`` (#49),
-``replay --fork`` (#18), ``retry`` (#73). Later waves
+``replay --fork`` (#18), ``retry`` (#73), ``repo set-chat-network`` (#71). Later waves
 add ``@app.command()`` functions here.
 
 The callback below keeps `app` a multi-command group, so adding commands
@@ -359,6 +359,35 @@ def repo_set_cloud(
             f"Saved. {repo} is local only: its code never goes to a cloud model; a ticket"
             " that runs out of local rungs is handed to you (flag local_only)."
         )
+
+
+@repo_app.command("set-chat-network")
+def repo_set_chat_network(
+    repo: Annotated[str, typer.Argument(help="owner/name")],
+    setting: Annotated[str, typer.Argument(help="on | off (default): chat sessions only")],
+) -> None:
+    """Open (on) or close (off, the default) outbound network for REPO's chat sessions
+    (#71 decision 4): on gives the chat sandbox the dependency-install policy (ports
+    443/80), never your credentials. Tickets are unaffected."""
+    import re
+
+    from foreman_inator import paths
+    from foreman_inator.db.store import Store
+
+    if not re.match(r"^[\w.-]+/[\w.-]+$", repo):
+        raise typer.BadParameter("repo must look like owner/name")
+    value = setting.strip().lower()
+    if value not in ("on", "off"):
+        raise typer.BadParameter("give on or off")
+    with Store(paths.db_path()) as store:
+        store.set_chat_network(repo, value == "on")
+    if value == "on":
+        typer.echo(
+            f"Saved. {repo}'s chat sessions may reach the network on ports 443/80"
+            " (tickets are unaffected)."
+        )
+    else:
+        typer.echo(f"Saved. {repo}'s chat sessions have no network (the default).")
 
 
 experiment_app = typer.Typer(

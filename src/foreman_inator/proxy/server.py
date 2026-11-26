@@ -120,6 +120,23 @@ the time still being waited included; the OpenCode driver adds it to the writer 
 so time in the queue never counts against an attempt; ``forget_queue_wait`` drops it once
 the run ends. ``local_slots()`` is ``(in use, cap)``.
 
+Chat sessions (docs/chat-design.md sections 5 and 9, decision 2): a context registered
+with ``context(chat_session_id=<id>)`` adds no attempt usage, records to the open
+``(id, "chat")`` recorder, stamps ``chat.id`` and the open turn's ``chat.turn`` on its
+``llm.call`` spans, and queues for the local slot under ``("chat", id)``
+(``chat_queue_wait(id)``) with priority: it is granted before any queued ticket call,
+across processes too (a priority marker file, see `LocalSlots`), but never preempts a call
+already running. When such a call has waited ``chat_local_wait_seconds`` (default 5) and a
+``fallback`` hook is set, the proxy asks ``fallback(context)`` once: a configured cloud
+endpoint that passes the fail-closed checks and the spend preflight (its context carries
+``fallback_from=<local model>``) takes the call instead; the span gets
+``llm.local_fallback = "local slot busy, used <model>"``, the open ``chat.turn`` span a
+``local_fallback`` event, and the response the ``x-fman-fallback-model`` header. None, or
+any refusal, keeps the call waiting. Which model, and whether at all (local-only repo,
+caps), is the hook's decision. There is deliberately no "would a slot come?" probe: a
+probe that took the slot and gave it back would hand it to the oldest queued ticket call,
+putting the real chat call behind it; the in-call timer above is decision 2's whole check.
+
 Running: `start()` runs uvicorn on a background thread, bound to 127.0.0.1 (port 0 picks a
 free port; `url` says which); `stop()` shuts it down. `proxy.app` is a plain ASGI app, so
 tests can drive it with ``httpx.ASGITransport`` and no socket. Upstreams are reached with
@@ -175,21 +192,35 @@ ANTHROPIC_PASS_HEADERS = ("anthropic-version", "anthropic-beta")
 DEFAULT_MAX_LOCAL_INFERENCE = 1  # config `max_local_inference`: one local GPU
 LOCK_POLL_S = 0.05  # cross-process slots: how often a queued call retries the lock files
 DISCONNECT_POLL_S = 0.25  # while queued for a local slot, how often to check the client
+PRIORITY_SUFFIX = ".wait"  # cross-process priority markers: local-priority-<pid>-<rand>.wait
+#: Decision 2 (docs/chat-design.md): a chat call queued this long for the local slot asks
+#: the injected ``fallback`` for a cloud endpoint (config ``chat_local_wait_seconds``).
+DEFAULT_CHAT_LOCAL_WAIT_SECONDS = 5.0
+FALLBACK_HEADER = "x-fman-fallback-model"  # the cloud model a chat call was sent to instead
 
 
 class LocalSlots:
-    """A cap on concurrent local-model calls (#34). First come, first served.
+    """A cap on concurrent local-model calls (#34). First come, first served, except that
+    a ``priority`` acquire (a chat turn, decision 2 of docs/chat-design.md: the user is
+    watching) goes ahead of every queued plain acquire. Priority never preempts: a slot
+    already held stays held until its call ends.
 
     In-process mode (``lock_dir=None``, tests): not bound to one event loop
     (``asyncio.Semaphore`` is): the proxy serves on its own thread's loop, and one instance
     may be shared by several proxies, each on its own loop. A released slot is handed
-    straight to the oldest waiter.
+    straight to the oldest priority waiter, else the oldest plain waiter.
 
     Cross-process mode (``lock_dir`` given; the worker and ``fman experiment run``): slot
     ``i`` is an exclusive ``flock`` on ``<lock_dir>/local-slot-<i>.lock``. ``acquire`` tries
     each file in turn (non-blocking) and polls every ``LOCK_POLL_S`` while all are held, so
     every process using the same dir shares one cap. The OS drops a lock when its process
-    dies, so a crash never leaks a slot. ``in_use`` counts the slots this instance holds."""
+    dies, so a crash never leaks a slot. ``in_use`` counts the slots this instance holds.
+    A priority waiter that finds no free file publishes a marker,
+    ``<lock_dir>/local-priority-<pid>-<rand>.wait``, holding an exclusive ``flock`` on it
+    for as long as it waits (it is created under a temporary name, locked, then renamed,
+    so a marker is never seen unlocked while its waiter lives). A plain acquire takes no
+    free slot while any marker is live (its lock is held); a marker whose lock can be
+    taken belongs to a dead process and is removed by whoever finds it."""
 
     def __init__(self, cap: int = DEFAULT_MAX_LOCAL_INFERENCE, *, lock_dir: Path | None = None):
         if int(cap) < 1:
@@ -199,6 +230,7 @@ class LocalSlots:
         self._lock = threading.Lock()
         self._in_use = 0
         self._waiters: deque[tuple[asyncio.AbstractEventLoop, asyncio.Future[None]]] = deque()
+        self._priority: deque[tuple[asyncio.AbstractEventLoop, asyncio.Future[None]]] = deque()
         self._held: list[int] = []  # cross-process mode: fds holding a slot's flock
         self._polling = 0  # cross-process mode: acquires waiting for a free file
 
@@ -210,26 +242,30 @@ class LocalSlots:
     @property
     def waiting(self) -> int:
         with self._lock:
-            return self._polling if self.lock_dir is not None else len(self._waiters)
+            if self.lock_dir is not None:
+                return self._polling
+            return len(self._waiters) + len(self._priority)
 
-    async def acquire(self) -> None:
+    async def acquire(self, *, priority: bool = False) -> None:
         if self.lock_dir is not None:
-            await self._acquire_file()
+            await self._acquire_file(priority)
             return
         loop = asyncio.get_running_loop()
+        queue = self._priority if priority else self._waiters
         with self._lock:
-            if self._in_use < self.cap and not self._waiters:
+            ahead = self._priority if priority else (self._priority or self._waiters)
+            if self._in_use < self.cap and not ahead:
                 self._in_use += 1
                 return
             fut: asyncio.Future[None] = loop.create_future()
             waiter = (loop, fut)
-            self._waiters.append(waiter)
+            queue.append(waiter)
         try:
             await fut
         except BaseException:
             with self._lock:
                 try:
-                    self._waiters.remove(waiter)
+                    queue.remove(waiter)
                     granted = False
                 except ValueError:  # release() already handed us the slot
                     granted = True
@@ -245,30 +281,82 @@ class LocalSlots:
                 _unlock_close(fd)
             return
         with self._lock:
-            while self._waiters:
-                loop, fut = self._waiters.popleft()
-                if loop.is_closed():
-                    continue  # its loop is gone; nobody is waiting there
-                loop.call_soon_threadsafe(_grant, fut)
-                return  # the slot moves to that waiter; in_use is unchanged
+            for queue in (self._priority, self._waiters):
+                while queue:
+                    loop, fut = queue.popleft()
+                    if loop.is_closed():
+                        continue  # its loop is gone; nobody is waiting there
+                    loop.call_soon_threadsafe(_grant, fut)
+                    return  # the slot moves to that waiter; in_use is unchanged
             self._in_use -= 1
 
-    async def _acquire_file(self) -> None:
-        if self._try_files():
+    async def _acquire_file(self, priority: bool = False) -> None:
+        if self._try_files(priority):
             return
         with self._lock:
             self._polling += 1
+        marker = self._publish_marker() if priority else None
         try:
-            while not self._try_files():
+            while not self._try_files(priority):
                 await asyncio.sleep(LOCK_POLL_S)
         finally:
+            if marker is not None:
+                _drop_marker(*marker)
             with self._lock:
                 self._polling -= 1
 
-    def _try_files(self) -> bool:
-        """Take the first free slot file. Synchronous, so a cancel never lands mid-way."""
+    def _publish_marker(self) -> tuple[int, Path]:
+        """Announce a waiting priority acquire to every process sharing ``lock_dir``."""
+        assert self.lock_dir is not None
+        name = f"local-priority-{os.getpid()}-{secrets.token_hex(4)}"
+        tmp = self.lock_dir / f".{name}.tmp"
+        final = self.lock_dir / f"{name}{PRIORITY_SUFFIX}"
+        fd = os.open(tmp, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            os.rename(tmp, final)
+        except BaseException:
+            os.close(fd)
+            with suppress(OSError):
+                tmp.unlink()
+            raise
+        return fd, final
+
+    def priority_waiting(self) -> bool:
+        """Cross-process mode: whether a live priority marker exists (stale ones, left by
+        a dead process, are removed on the way). In-process mode: a queued priority
+        acquire."""
+        if self.lock_dir is None:
+            with self._lock:
+                return bool(self._priority)
+        try:
+            markers = [p for p in self.lock_dir.iterdir() if p.name.endswith(PRIORITY_SUFFIX)]
+        except OSError:
+            return False
+        live = False
+        for path in markers:
+            try:
+                fd = os.open(path, os.O_RDWR)
+            except OSError:
+                continue  # its waiter just finished
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                live = True  # its waiter holds it
+                os.close(fd)
+                continue
+            with suppress(OSError):
+                path.unlink()  # stale: we got its lock, so its process is gone
+            _unlock_close(fd)
+        return live
+
+    def _try_files(self, priority: bool = False) -> bool:
+        """Take the first free slot file. Synchronous, so a cancel never lands mid-way. A
+        plain acquire defers to any live priority waiter."""
         assert self.lock_dir is not None
         self.lock_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if not priority and self.priority_waiting():
+            return False
         for i in range(self.cap):
             path = self.lock_dir / f"local-slot-{i}.lock"
             fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
@@ -284,6 +372,13 @@ class LocalSlots:
                 self._held.append(fd)
             return True
         return False
+
+
+def _drop_marker(fd: int, path: Path) -> None:
+    with suppress(OSError):
+        path.unlink()
+    with suppress(OSError):
+        _unlock_close(fd)
 
 
 def _unlock_close(fd: int) -> None:
@@ -304,6 +399,13 @@ def shared_local_slots(cap: int) -> LocalSlots:
 def _grant(fut: asyncio.Future[None]) -> None:
     if not fut.done():
         fut.set_result(None)
+
+
+def _slot_key(key: Any) -> Any:
+    """A queue-wait key: ``("chat", id)`` as given, anything else as an int id."""
+    if isinstance(key, tuple):
+        return (str(key[0]), int(key[1]))
+    return int(key)
 
 
 def _is_loopback(host: str) -> bool:
@@ -329,6 +431,9 @@ def no_spend_hook(
     return True
 
 
+SlotKey = int | tuple[str, int]  # an attempt / writer-run id, or ("chat", session id)
+
+
 @dataclass(frozen=True)
 class CallContext:
     """Who a model call belongs to. Built from the URL prefix."""
@@ -343,18 +448,40 @@ class CallContext:
     token: str | None = None
     base_url: str | None = None  # set on contexts returned by ModelProxy.context()
     writer_run: int | None = None  # a registered writer run (a replay) that queues (#34)
+    #: A chat session's calls (docs/chat-design.md section 5): no attempt usage, recorder
+    #: ``(chat_session_id, "chat")``, local slot key ``("chat", id)`` with priority.
+    chat_session_id: int | None = None
+    #: Set on the context of a chat call the proxy sent to a cloud model because the local
+    #: slot stayed busy (decision 2): the local model's name. The spend hook sees it.
+    fallback_from: str | None = None
     _captured: contextvars.Context | None = field(default=None, repr=False, compare=False)
 
     @property
     def counts_toward_attempt(self) -> bool:
-        return self.attempt_id is not None and self.review_id is None
+        return self.attempt_id is not None and self.review_id is None and not self.is_chat
 
     @property
-    def slot_key(self) -> int | None:
+    def is_chat(self) -> bool:
+        return self.chat_session_id is not None
+
+    @property
+    def slot_key(self) -> SlotKey | None:
         """#34: the writer run whose local calls queue for a slot (its queue wait is kept
-        under this id): the attempt for ``/a/<id>``/``/x/<id>``, ``writer_run`` for a
-        registered writer context; None for one-shot calls, which never queue."""
+        under this key): the attempt for ``/a/<id>``/``/x/<id>``, ``writer_run`` for a
+        registered writer context, ``("chat", id)`` for a chat session (never equal to an
+        attempt id); None for one-shot calls, which never queue."""
+        if self.chat_session_id is not None:
+            return ("chat", self.chat_session_id)
         return self.attempt_id if self.kind == "attempt" else self.writer_run
+
+    @property
+    def recorder_key(self) -> tuple[int, str] | None:
+        """``get_recorder`` key for this call's recording, or None for no recording."""
+        if self.chat_session_id is not None:
+            return (self.chat_session_id, "chat")
+        if self.attempt_id is not None and self.recorder_role:
+            return (self.attempt_id, self.recorder_role)
+        return None
 
 
 @dataclass(frozen=True)
@@ -376,6 +503,10 @@ class CallUsage:
 
 
 KeyResolver = Callable[[ModelEndpoint], str | None]
+#: Decision 2: ``fallback(context) -> endpoint | None``, asked once when a chat call has
+#: waited ``chat_local_wait_seconds`` for the local slot. A cloud endpoint sends the call
+#: there; None keeps it waiting. The policy (local-only repo, caps) is the caller's.
+Fallback = Callable[["CallContext"], ModelEndpoint | None]
 
 
 def _default_key(endpoint: ModelEndpoint) -> str | None:
@@ -761,6 +892,8 @@ class ModelProxy:
         upstream_timeout: float = 600.0,
         max_local_inference: int = DEFAULT_MAX_LOCAL_INFERENCE,
         local_slots: LocalSlots | None = None,
+        fallback: Fallback | None = None,
+        chat_local_wait_seconds: float = DEFAULT_CHAT_LOCAL_WAIT_SECONDS,
     ):
         models = config.models if isinstance(config, Config) else tuple(config)
         self.models: dict[str, ModelEndpoint] = {m.name: m for m in models}
@@ -781,8 +914,12 @@ class ModelProxy:
         self._refused_lock = threading.Lock()
         # #34: pass one `local_slots` to every proxy in the process to share the cap.
         self._slots = local_slots if local_slots is not None else LocalSlots(max_local_inference)
-        self._waits: dict[int, float] = {}  # attempt id -> finished queue waits (s)
-        self._waiting: dict[int, list[float]] = {}  # attempt id -> monotonic starts
+        self._waits: dict[SlotKey, float] = {}  # slot key -> finished queue waits (s)
+        self._waiting: dict[SlotKey, list[float]] = {}  # slot key -> monotonic starts
+        # Decision 2 (docs/chat-design.md): a chat call queued longer than this for the
+        # local slot asks `fallback(context)` once for a cloud endpoint to use instead.
+        self.fallback = fallback
+        self.chat_local_wait_seconds = float(chat_local_wait_seconds)
         self._wait_lock = threading.Lock()
         self._client: httpx.AsyncClient | None = None
         self._server: uvicorn.Server | None = None
@@ -800,37 +937,63 @@ class ModelProxy:
         """``(in use, cap)`` for local-model calls, process-wide if the slots are shared."""
         return self._slots.in_use, self._slots.cap
 
-    def queue_wait(self, attempt_id: int) -> float:
+    def queue_wait(self, attempt_id: SlotKey) -> float:
         """Seconds this attempt's writer calls have spent queued for a local slot, the
-        current wait included. Thread-safe; the OpenCode driver's ``extra_time``."""
+        current wait included. Thread-safe; the OpenCode driver's ``extra_time``. A chat
+        session's key is ``("chat", id)`` (`chat_queue_wait`)."""
+        key = _slot_key(attempt_id)
         now = time.monotonic()
         with self._wait_lock:
-            done = self._waits.get(int(attempt_id), 0.0)
-            live = sum(now - t for t in self._waiting.get(int(attempt_id), ()))
+            done = self._waits.get(key, 0.0)
+            live = sum(now - t for t in self._waiting.get(key, ()))
         return done + live
 
-    def forget_queue_wait(self, attempt_id: int) -> None:
-        with self._wait_lock:
-            self._waits.pop(int(attempt_id), None)
+    def chat_queue_wait(self, session_id: int) -> float:
+        """`queue_wait` for a chat session: the chat engine extends a turn's timeout by it."""
+        return self.queue_wait(("chat", int(session_id)))
 
-    async def _wait_for_slot(self, request: Request, ctx: CallContext) -> tuple[bool, float]:
-        """Queue for a local slot. ``(got it, seconds waited)``; False when the client
-        disconnected first (then no slot is held)."""
+    def forget_queue_wait(self, attempt_id: SlotKey) -> None:
+        with self._wait_lock:
+            self._waits.pop(_slot_key(attempt_id), None)
+
+    async def _wait_for_slot(
+        self,
+        request: Request,
+        ctx: CallContext,
+        *,
+        switch: Callable[[], Any] | None = None,
+        switch_after: float | None = None,
+    ) -> tuple[bool, float, Any]:
+        """Queue for a local slot (a chat context with priority). ``(got it, seconds
+        waited, switched)``; got it is False when the client disconnected first or the
+        wait was switched (then no slot is held). ``switch``: called once, on the event
+        loop, after ``switch_after`` seconds still queued; a non-None result ends the wait
+        and is returned as ``switched``; None keeps waiting."""
         key = ctx.slot_key
         t0 = time.monotonic()
         if key is not None:
             with self._wait_lock:
                 self._waiting.setdefault(key, []).append(t0)
-        acq = asyncio.ensure_future(self._slots.acquire())
+        acq = asyncio.ensure_future(self._slots.acquire(priority=ctx.is_chat))
+        asked = switch is None or switch_after is None
         try:
             while True:
-                done, _ = await asyncio.wait({acq}, timeout=DISCONNECT_POLL_S)
+                poll = DISCONNECT_POLL_S
+                if not asked:
+                    poll = max(0.0, min(poll, t0 + switch_after - time.monotonic()))
+                done, _ = await asyncio.wait({acq}, timeout=poll)
                 if done:
                     acq.result()
-                    return True, time.monotonic() - t0
+                    return True, time.monotonic() - t0, None
+                if not asked and time.monotonic() - t0 >= switch_after:
+                    asked = True
+                    switched = switch()
+                    if switched is not None:
+                        await self._abandon(acq)
+                        return False, time.monotonic() - t0, switched
                 if await request.is_disconnected():
                     await self._abandon(acq)
-                    return False, time.monotonic() - t0
+                    return False, time.monotonic() - t0, None
         except BaseException:
             await self._abandon(acq)
             raise
@@ -844,6 +1007,41 @@ class ModelProxy:
                     if not starts:
                         self._waiting.pop(key, None)
                     self._waits[key] = self._waits.get(key, 0.0) + waited
+
+    def _try_fallback(
+        self,
+        ctx: CallContext,
+        local: ModelEndpoint,
+        raw: bytes,
+        body: dict[str, Any],
+        rest: str,
+    ) -> tuple[ModelEndpoint, str | None, CallContext] | None:
+        """Decision 2: ask the injected ``fallback`` for a cloud endpoint for this queued
+        chat call. The endpoint must be a configured cloud model; it then goes through
+        the same fail-closed checks and spend preflight as any call (its own estimate;
+        the context carries ``fallback_from``). Any refusal keeps the call waiting for
+        the local slot. Returns ``(endpoint, key, context)`` or None."""
+        if self.fallback is None:
+            return None
+        try:
+            cand = self.fallback(ctx)
+        except Exception as exc:
+            log.warning("proxy: chat fallback hook raised %s; waiting", type(exc).__name__)
+            return None
+        if cand is None:
+            return None
+        ep = self.models.get(getattr(cand, "name", None) or "")
+        if ep is None or ep != cand or ep.kind != "cloud":
+            log.warning("proxy: chat fallback gave no configured cloud model; waiting")
+            return None
+        fctx = replace(ctx, fallback_from=local.name)
+        try:
+            key = self._check_endpoint(ep)
+            self._preflight(ep, self._estimate(ep, raw, body, rest), fctx)
+        except _Refused as r:
+            log.info("proxy: chat fallback to %s refused (%s); waiting", ep.name, r.code)
+            return None
+        return ep, key, fctx
 
     async def _abandon(self, acq: asyncio.Future[None]) -> None:
         if not acq.done():
@@ -877,6 +1075,7 @@ class ModelProxy:
         prompt_version: str | None = None,
         recorder_role: str | None = None,
         writer_run: int | None = None,
+        chat_session_id: int | None = None,
     ) -> Iterator[CallContext]:
         """Register a call context; yields it with ``.base_url`` set. Captures the caller's
         current span and ticket (contextvars), so calls made through ``base_url`` while the
@@ -884,8 +1083,18 @@ class ModelProxy:
         Recorder: ``(attempt_id, recorder_role)``; the role defaults to "review" when
         ``review_id`` is given and "attempt" otherwise. ``writer_run``: the context is a
         writer run's (a replay's), so its local calls queue for a slot (#34) and their wait
-        is ``queue_wait(writer_run)``."""
+        is ``queue_wait(writer_run)``. ``chat_session_id``: a chat session's context
+        (docs/chat-design.md section 5); it takes none of the attempt arguments, its calls
+        add no attempt usage, record to ``(chat_session_id, "chat")``, queue for the local
+        slot ahead of ticket calls under ``("chat", id)``, and may go to the ``fallback``
+        endpoint when that slot stays busy."""
         token = secrets.token_urlsafe(12)
+        if chat_session_id is not None:
+            if attempt_id is not None or review_id is not None or writer_run is not None:
+                raise ValueError("a chat context takes no attempt_id, review_id or writer_run")
+            chat_session_id = int(chat_session_id)
+            recorder_role = "chat"
+            label = label or "chat"
         if recorder_role is None and attempt_id is not None:
             recorder_role = "review" if review_id is not None else "attempt"
         ctx = CallContext(
@@ -899,6 +1108,7 @@ class ModelProxy:
             token=token,
             base_url=f"{self.url}/c/{token}/v1",
             writer_run=writer_run,
+            chat_session_id=chat_session_id,
             _captured=contextvars.copy_context(),
         )
         with self._ctx_lock:
@@ -1048,11 +1258,75 @@ class ModelProxy:
         except _Refused as r:
             return error_response(r.status, r.code, r.message, r.type, anthropic=anthropic)
 
+        call = _Call(self, ctx, ep, rest, body, t0_ns)
+        # #34: only writer runs (/a/<id>, /x/<id>, a replay's writer context) and chat
+        # sessions queue for the local slot. Router, clarify, review and other one-shot
+        # calls carry their own short deadline, which would run out behind a long writer
+        # stream; they are brief, so they go straight on.
+        if ep.kind == "local" and rest != "embeddings" and ctx.slot_key is not None:
+            switch = None
+            if ctx.is_chat and self.fallback is not None:
+
+                def switch():
+                    return self._try_fallback(ctx, ep, raw, body, rest)
+
+            got, waited, switched = await self._wait_for_slot(
+                request, ctx, switch=switch, switch_after=self.chat_local_wait_seconds
+            )
+            call.queue_wait_s = waited
+            if switched is not None:
+                local_name = ep.name
+                ep, key, ctx = switched
+                call.ep, call.ctx = ep, ctx
+                call.fallback_note = f"local slot busy, used {ep.name}"
+                log.info(
+                    "proxy: chat %s: local slot busy (%s), used %s",
+                    ctx.chat_session_id,
+                    local_name,
+                    ep.name,
+                )
+                _note_chat_fallback(ctx, local_name, ep.name)
+            elif not got:
+                call.finish(status=499, error="incomplete: client left while queued (local)")
+                return error_response(
+                    499,
+                    "client_disconnected",
+                    "client left while queued",
+                    "api_error",
+                    anthropic=anthropic,
+                )
+            else:
+                call.release = self._slots.release
+        url, headers, passthrough = self._target(request, ep, key, body, raw, rest, stream)
+        try:
+            response = await self._forward(
+                call, ep, url, headers, body, stream, key, passthrough=passthrough
+            )
+        except BaseException:
+            call.release_slot()
+            raise
+        if not isinstance(response, _TeeStream):
+            call.release_slot()  # finish() did already; a no-op then
+        if call.fallback_note is not None:
+            response.headers[FALLBACK_HEADER] = ep.name
+        return response
+
+    @staticmethod
+    def _target(
+        request: Request,
+        ep: ModelEndpoint,
+        key: str | None,
+        body: dict[str, Any],
+        raw: bytes,
+        rest: str,
+        stream: bool,
+    ) -> tuple[str, dict[str, str], bytes | None]:
+        """The upstream URL, headers and (Messages route) passthrough bytes."""
         headers = {"content-type": "application/json", "accept-encoding": "identity"}
         if stream:
             headers["accept"] = "text/event-stream"
         passthrough: bytes | None = None
-        if anthropic:
+        if rest == MESSAGES_PATH:
             # #52: x-api-key, never a bearer token; only the version and beta headers of
             # the client's own go along (its x-api-key is the placeholder "fman-proxy").
             for name in ANTHROPIC_PASS_HEADERS:
@@ -1064,35 +1338,7 @@ class ModelProxy:
             passthrough = raw if body.get("model") == ep.model else _with_model(body, ep.model)
         elif key:
             headers["authorization"] = f"Bearer {key}"
-        url = ep.base_url.rstrip("/") + "/" + rest
-        call = _Call(self, ctx, ep, rest, body, t0_ns)
-        # #34: only writer runs (/a/<id>, /x/<id>, a replay's writer context) queue for the
-        # local slot. Router, clarify, review and other one-shot calls carry their own
-        # short deadline, which would run out behind a long writer stream; they are brief,
-        # so they go straight on.
-        if ep.kind == "local" and rest != "embeddings" and ctx.slot_key is not None:
-            got, waited = await self._wait_for_slot(request, ctx)
-            call.queue_wait_s = waited
-            if not got:
-                call.finish(status=499, error="incomplete: client left while queued (local)")
-                return error_response(
-                    499,
-                    "client_disconnected",
-                    "client left while queued",
-                    "api_error",
-                    anthropic=anthropic,
-                )
-            call.release = self._slots.release
-        try:
-            response = await self._forward(
-                call, ep, url, headers, body, stream, key, passthrough=passthrough
-            )
-        except BaseException:
-            call.release_slot()
-            raise
-        if not isinstance(response, _TeeStream):
-            call.release_slot()  # finish() did already; a no-op then
-        return response
+        return ep.base_url.rstrip("/") + "/" + rest, headers, passthrough
 
     async def _forward(
         self,
@@ -1340,6 +1586,7 @@ class _Call:
         self.error_text: str | None = None  # the provider's error message, scrubbed
         self.queue_wait_s: float | None = None  # #34: time queued for a local slot
         self.release: Callable[[], None] | None = None  # gives the local slot back
+        self.fallback_note: str | None = None  # decision 2: "local slot busy, used <model>"
 
     def release_slot(self) -> None:
         """Give the local slot back (once). Safe to call when none is held."""
@@ -1436,6 +1683,12 @@ class _Call:
                     "llm.token_count.prompt_details.cache_read": cache_read or None,
                     "llm.token_count.prompt_details.cache_write": cache_write or None,
                     "llm.wire": "anthropic" if self.rest == MESSAGES_PATH else None,
+                    "chat.id": ctx.chat_session_id,
+                    "chat.turn": (
+                        tracing.otel.chat_turn(ctx.chat_session_id) if ctx.is_chat else None
+                    ),
+                    "llm.local_fallback": self.fallback_note,
+                    "llm.fallback_from": ctx.fallback_from,
                 },
             )
 
@@ -1447,8 +1700,9 @@ class _Call:
         except Exception as exc:
             log.warning("proxy: llm.call span failed: %s", type(exc).__name__)
 
-        if self.rest != "embeddings" and ctx.attempt_id is not None and ctx.recorder_role:
-            rec = tracing.get_recorder(ctx.attempt_id, ctx.recorder_role)
+        rec_key = ctx.recorder_key
+        if self.rest != "embeddings" and rec_key is not None:
+            rec = tracing.get_recorder(*rec_key)
             if rec is not None:
                 if not complete:
                     stop = "incomplete"
@@ -1511,6 +1765,24 @@ class _Call:
             self.proxy.spend_hook(self.ep, cost, ctx, phase="actual")
         except Exception as exc:
             log.warning("proxy: spend hook (actual) failed: %s", type(exc).__name__)
+
+
+def _note_chat_fallback(ctx: CallContext, local: str, cloud: str) -> None:
+    """Decision 2: put "local slot busy, used <cloud>" on the chat's open turn span."""
+    if ctx.chat_session_id is None:
+        return
+    try:
+        tracing.otel.chat_turn_event(
+            ctx.chat_session_id,
+            "local_fallback",
+            {
+                "message": f"local slot busy, used {cloud}",
+                "llm.fallback_from": local,
+                "llm.model_name": cloud,
+            },
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        log.warning("proxy: chat fallback note failed: %s", type(exc).__name__)
 
 
 def _recorder_cache_kwargs(rec: Any, cache_read: int, cache_write: int) -> dict[str, int]:
@@ -1591,7 +1863,10 @@ class _TeeStream:
 __all__ = [
     "CallContext",
     "CallUsage",
+    "DEFAULT_CHAT_LOCAL_WAIT_SECONDS",
     "DEFAULT_MAX_LOCAL_INFERENCE",
+    "FALLBACK_HEADER",
+    "Fallback",
     "LocalSlots",
     "ModelProxy",
     "SpendHook",

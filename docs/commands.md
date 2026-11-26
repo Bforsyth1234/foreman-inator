@@ -18,6 +18,7 @@ current text. `fman --version` prints the version.
 | [`fman repo set-verify`](#fman-repo-set-verify) | Save the command that verifies a repo. |
 | [`fman repo set-profile`](#fman-repo-set-profile) | Set a repo's profile: how hard the writer tries and how much review a change gets. |
 | [`fman repo set-cloud`](#fman-repo-set-cloud) | Allow or forbid cloud models for a repo (off: local only). |
+| [`fman repo set-chat-network`](#fman-repo-set-chat-network) | Open or close network access for a repo's chat sessions. |
 | [`fman rules show`](#fman-rules-show) | Print the writer's and reviewer's rules blocks for a repo, as built. |
 | [`fman sweep`](#fman-sweep) | Label a repo's open issues for the worker in waves, after a preview. |
 | [`fman experiment run`](#fman-experiment-run) | Replay the champion against a challenger on past tickets. |
@@ -200,6 +201,18 @@ review is skipped with a note on the PR; the spend gate refuses cloud calls for
 it; kNN routing and the embedding backfill do not use a cloud embedder; shadow
 reviews, replays with a cloud model and the failure labeler leave it out.
 `fman status` lists local-only repos. `on` (the default) undoes it.
+
+## `fman repo set-chat-network`
+
+```bash
+fman repo set-chat-network <owner/name> on|off
+```
+
+Chat sessions (#71; the chat itself is not usable yet) run sandboxed with no
+network by default. `on` gives that repo's chat sandbox the same outbound policy
+as a first-attempt dependency install (ports 443/80), never your credentials or
+Keychain. Tickets are unaffected. `off` (the default) closes it again. The
+`/settings` page has the same switch per repo.
 
 ## `fman rules show`
 
