@@ -24,7 +24,7 @@ guessed string.
 
 **Pseudonymised** (stable within one export, numbered by first appearance): repos
 (``repo-1``), logins (``user-1``), file paths (``path-3.py``; only a short extension is
-kept), branches (``branch-1``; the worker's own ``fman/issue-<n>/a<m>`` and
+kept), branches (``branch-1``; the worker's own ``fman/issue-<n>[-b]/a<m>`` and
 ``main``/``master``/``trunk``/``develop`` are kept), commits (``commit-1``), unknown keys
 inside unknown values (``key-1``), function names in coverage findings (``fn-1``).
 
@@ -112,7 +112,7 @@ _HEX = re.compile(r"(?:0x)?[0-9a-fA-F]{1,64}", re.ASCII)
 _EXT = re.compile(r"\.[a-z0-9]{1,8}", re.ASCII)
 _KEY = re.compile(r"[a-z_][a-z0-9_]{0,47}(?:\.[a-z0-9_]{1,47}){0,4}", re.ASCII)
 _RUN_ID = re.compile(r"t[0-9]{1,18}-a[0-9]{1,18}(?:-[a-z][a-z_\-]{0,31})?", re.ASCII)
-_WORKER_BRANCH = re.compile(r"fman/issue-[0-9]{1,18}/a[0-9]{1,18}", re.ASCII)
+_WORKER_BRANCH = re.compile(r"fman/issue-[0-9]{1,18}(?:-b)?/a[0-9]{1,18}", re.ASCII)
 _BASE_BRANCHES = frozenset({"main", "master", "trunk", "develop"})
 _ACTORS = frozenset({"", "user", "reviewer", "worker", "model", "system", "assistant"})
 _STRUCTURAL_FILE = re.compile(r"[0-9]{1,8}-[a-z]{1,16}\.txt|attempt-[0-9]{1,18}-[a-z]{1,16}\.log")
@@ -806,6 +806,20 @@ _TICKET = Schema(
         "route_reason": TEXT,
         "trace_id": HEX,
         "flag_reason": FLAG,
+        "pair_side": CODE,  # #34: 'a' / 'b' / null
+    }
+)
+#: #34: the ticket's ``pairs`` row (``ab:pair``), only on a paired ticket.
+_PAIR = Schema(
+    {
+        **dict.fromkeys(
+            ("id", "issue_number", "ticket_a", "ticket_b", "experiment_id", "winner_ticket_id"),
+            INT,
+        ),
+        **dict.fromkeys(("opponent_reason", "status", "loser_outcome"), CODE),
+        **dict.fromkeys(("created_at", "decided_at"), TIME),
+        "repo": REPO,
+        "opponent_variant": TOKEN,
     }
 )
 _ATTEMPT = Schema(
@@ -854,6 +868,7 @@ ROWS = Schema(
         "kickbacks": list_of(_KICKBACK),
         "reviews": list_of(_REVIEW),
         "shadow_reviews": list_of(_REVIEW),
+        "pair": _PAIR,
         "uncounted": list_of(INT),
         "explore": BOOL,
     }
@@ -1031,6 +1046,10 @@ def store_rows(store: Any, ticket_id: int, *, ladder: Sequence[Any] = ()) -> dic
         replay.ticket_rows(store, ticket_id, ladder=ladder, explore=explore.decode(flag))
     )
     data["shadow_reviews"] = _row_json(store.list_reviews(ticket_id=ticket_id, shadow=True))
+    pair_for = getattr(store, "pair_for_ticket", None)  # #34; absent on older stand-ins
+    found = pair_for(ticket_id) if pair_for is not None else None
+    if found is not None:  # an unpaired ticket's rows are unchanged
+        data["pair"] = _row_json(found)
     return data
 
 
