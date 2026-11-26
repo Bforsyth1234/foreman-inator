@@ -66,6 +66,20 @@ Rules
   wait-for graph. Its ``owned_files`` are kept, so after ``clear_flag`` its next
   ``may_start`` re-acquires them (or waits, if another ticket took them meanwhile). A
   flagged ticket with an open pull request is never dormant: it keeps its locks.
+* **Chat holders** (#71 decision 6, wave C1e): a ``file_locks`` row has exactly one
+  holder: a ticket (``ticket_id``) or a chat session (``chat_session_id``, migration
+  012, with a CHECK that exactly one is set). A chat takes a lock on each file it edits
+  (``chat_touch``), so a ticket that wants that file waits exactly as it would on another
+  ticket (``Conflict.kind == "chat"``; ``LockResult.chats`` / ``Waiter.chats``). A chat
+  never waits: ``chat_touch`` locks the free paths and returns the tickets holding the
+  others, for the page's warning; the chat edits them anyway (the user decides). A chat
+  is never a node of the wait-for graph (it waits on nothing), so it cannot be on a
+  deadlock cycle and never yields. ``release_chat`` drops its rows on ``/pr``,
+  ``/discard`` or session end; ``acquire`` and ``sweep`` also drop the rows of a session
+  whose ``chat_sessions.state`` is final (``CHAT_FINAL_STATES``). ``LockResult.blockers``
+  and ``Waiter.blockers`` stay ticket ids only, so callers that look tickets up by them
+  are unchanged. Before migration 012 there is no chat column and every chat call is a
+  no-op (``chat_touch`` returns no holders and locks nothing).
 """
 
 from __future__ import annotations
@@ -73,10 +87,16 @@ from __future__ import annotations
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass
+from typing import Literal
 
-from foreman_inator.db.store import FileLock, Store, Ticket
+from foreman_inator.db.store import Store, Ticket
 
 OPEN_COLUMNS = ("todo", "in_progress", "testing")
+
+#: Who holds a lock row: a ticket or an interactive chat session (#71 decision 6).
+HolderKind = Literal["ticket", "chat"]
+#: chat_sessions.state values (migration 012) after which a session holds no locks.
+CHAT_FINAL_STATES = ("opened_pr", "discarded", "ended", "failed")
 
 # Flag reasons (the part before the first ":") that stop all further work on a ticket
 # with no pull request (#55). Literal strings, not imports: the flag constants live in
@@ -363,11 +383,21 @@ def predict_files(title: str, body: str, extra: Iterable[str] = ()) -> tuple[str
 
 @dataclass(frozen=True, slots=True)
 class Conflict:
-    """``path`` (wanted by the ticket) is blocked by lock ``held`` of ticket ``holder``."""
+    """``path`` (wanted by the ticket) is blocked by lock ``held`` of ``holder``: a ticket
+    id, or a chat session id when ``kind == "chat"``."""
 
     path: str
     held: str
     holder: int
+    kind: HolderKind = "ticket"
+
+
+def _ticket_ids(conflicts: Iterable[Conflict]) -> tuple[int, ...]:
+    return tuple(sorted({c.holder for c in conflicts if c.kind == "ticket"}))
+
+
+def _chat_ids(conflicts: Iterable[Conflict]) -> tuple[int, ...]:
+    return tuple(sorted({c.holder for c in conflicts if c.kind == "chat"}))
 
 
 @dataclass(frozen=True, slots=True)
@@ -387,16 +417,54 @@ class LockResult:
 
     @property
     def blockers(self) -> tuple[int, ...]:
-        return tuple(sorted({c.holder for c in self.conflicts}))
+        """Tickets holding what this ticket wants (chat sessions are in ``chats``)."""
+        return _ticket_ids(self.conflicts)
+
+    @property
+    def chats(self) -> tuple[int, ...]:
+        """Chat sessions holding what this ticket wants."""
+        return _chat_ids(self.conflicts)
+
+
+def holders_text(blockers: Iterable[int], chats: Iterable[int] = ()) -> str:
+    """For log lines: ``ticket(s) #3, #5``, ``chat session 2`` or both, joined by "and"."""
+    parts = []
+    bs, cs = list(blockers), list(chats)
+    if bs:
+        parts.append("ticket(s) " + ", ".join(f"#{b}" for b in bs))
+    if cs:
+        word = "chat session" if len(cs) == 1 else "chat sessions"
+        parts.append(f"{word} " + ", ".join(str(c) for c in cs))
+    return " and ".join(parts) or "nobody"
 
 
 @dataclass(frozen=True, slots=True)
 class Waiter:
-    """An open ticket that wants paths other tickets hold."""
+    """An open ticket that wants paths other tickets (``blockers``) or chat sessions
+    (``chats``) hold."""
 
     ticket_id: int
     blockers: tuple[int, ...]
     conflicts: tuple[Conflict, ...]
+    chats: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class TicketHolder:
+    """A ticket holding files a chat edited (``chat_touch``): the page's warning."""
+
+    ticket_id: int
+    issue_number: int
+    paths: tuple[str, ...]  # the chat's paths (lock keys) this ticket's locks cover
+
+
+@dataclass(frozen=True, slots=True)
+class _Row:
+    """One ``file_locks`` row, with its single holder."""
+
+    path: str
+    ticket_id: int | None
+    chat_session_id: int | None
 
 
 # ------------------------------------------------------------------------------ locks
@@ -431,7 +499,7 @@ class Locks:
                 continue
             cs = _conflicts(t.id, _missing(t, rows), rows)
             if cs:
-                out.append(Waiter(t.id, tuple(sorted({c.holder for c in cs})), cs))
+                out.append(Waiter(t.id, _ticket_ids(cs), cs, _chat_ids(cs)))
         return out
 
     # -- writes --
@@ -459,7 +527,11 @@ class Locks:
                     if missing:
                         left = self.store.acquire_locks(t.id, t.repo, missing)
                         if left:  # cannot happen: the overlap check covers exact paths
-                            cs = tuple(Conflict(r.path, r.path, r.ticket_id) for r in left)
+                            cs = tuple(
+                                Conflict(r.path, r.path, r.ticket_id)
+                                for r in left
+                                if r.ticket_id is not None
+                            )
                             return LockResult(t.id, self.held(t.id), cs, tuple(yielded))
                     return LockResult(t.id, self.held(t.id), yielded=tuple(yielded))
                 if t.id in yielded:
@@ -492,20 +564,71 @@ class Locks:
         return self.store.release_locks(_tid(ticket))
 
     def sweep(self) -> int:
-        """Delete lock rows of tickets that are done, dropped or dormant; return how many."""
+        """Delete lock rows of tickets that are done, dropped or dormant, and of chat
+        sessions in a final state; return how many."""
         n = 0
         with self.store.transaction():
             for repo in {lk.repo for lk in self.store.list_locks()}:
                 n += self._sweep_repo(repo)
         return n
 
+    # -- chat holders (#71 decision 6) --
+
+    def chat_touch(self, session_id: int, repo: str, paths: Iterable[str]) -> list[TicketHolder]:
+        """A chat session edited ``paths``: lock the free ones for it, never wait.
+
+        Returns the tickets holding the others (oldest ticket first), whose locks the chat
+        does not take; the chat goes on editing (the user decides) and the page warns.
+        A path another chat session holds is left to it (one holder per path).
+        """
+        keys = [lock_key(p) for p in clean_paths(paths)]
+        if not keys:
+            return []
+        by_ticket: dict[int, list[str]] = {}
+        with self.store.transaction():
+            self._sweep_repo(repo)
+            rows = self._rows(repo)
+            mine = [r.path for r in rows if r.chat_session_id == session_id]
+            free: list[str] = []
+            for k in keys:
+                if covered(k, mine):
+                    continue
+                others = [
+                    r for r in rows if r.chat_session_id != session_id and overlaps(k, r.path)
+                ]
+                if not others:
+                    free.append(k)
+                    rows.append(_Row(k, None, session_id))
+                    mine.append(k)
+                    continue
+                for tid in sorted({r.ticket_id for r in others if r.ticket_id is not None}):
+                    by_ticket.setdefault(tid, []).append(k)
+            self.store.insert_chat_locks(session_id, repo, free)
+        return [
+            TicketHolder(tid, self.store.get_ticket(tid).issue_number, tuple(ps))
+            for tid, ps in sorted(by_ticket.items())
+        ]
+
+    def chat_held(self, session_id: int) -> tuple[str, ...]:
+        """The lock keys a chat session holds, in path order."""
+        held = self.store.chat_lock_rows(session_id)
+        return tuple(lk.path for lk in sorted(held, key=lambda lk: (lk.repo, lk.path)))
+
+    def release_chat(self, session_id: int) -> int:
+        """Drop every lock the chat session holds (``/pr``, ``/discard``, session end).
+        Idempotent; returns how many rows went."""
+        return self.store.delete_chat_locks(session_id)
+
     # -- internals --
 
     def _ticket(self, ticket: Ticket | int) -> Ticket:
         return self.store.get_ticket(ticket) if isinstance(ticket, int) else ticket
 
-    def _rows(self, repo: str) -> list[FileLock]:
-        return self.store.list_locks(repo=repo)
+    def _rows(self, repo: str) -> list[_Row]:
+        return [
+            _Row(lk.path, lk.ticket_id, lk.chat_session_id)
+            for lk in sorted(self.store.list_locks(repo=repo), key=lambda lk: lk.path)
+        ]
 
     def _want(self, t: Ticket, add: list[str]) -> Ticket:
         wanted = clean_paths([*t.owned_files, *add])
@@ -514,15 +637,22 @@ class Locks:
         return t
 
     def _sweep_repo(self, repo: str, keep: int | None = None) -> int:
-        """Release the rows of closed and dormant tickets in ``repo`` (never ``keep``'s)."""
+        """Release the rows of closed and dormant tickets in ``repo`` (never ``keep``'s),
+        and of chat sessions in a final state."""
         n = 0
         live = {
             t.id
             for t in self.store.list_tickets(column=OPEN_COLUMNS, repo=repo)
             if not dormant(t) or t.id == keep
         }
-        for tid in sorted({lk.ticket_id for lk in self._rows(repo)} - live):
+        rows = self._rows(repo)
+        held = {r.ticket_id for r in rows if r.ticket_id is not None}
+        for tid in sorted(held - live):
             n += self.store.release_locks(tid)
+        chats = sorted({r.chat_session_id for r in rows if r.chat_session_id is not None})
+        for sid in chats:
+            if self.store.get_chat_session(sid).state in CHAT_FINAL_STATES:
+                n += self.release_chat(sid)
         return n
 
     def _cycle_through(self, start: Ticket) -> list[int] | None:
@@ -532,7 +662,8 @@ class Locks:
         for t in self.store.list_tickets(column=OPEN_COLUMNS, repo=start.repo):
             if dormant(t) and t.id != start.id:
                 continue
-            edges[t.id] = {c.holder for c in _conflicts(t.id, _missing(t, rows), rows)}
+            # a chat never waits, so it is never on a cycle: ticket edges only
+            edges[t.id] = set(_ticket_ids(_conflicts(t.id, _missing(t, rows), rows)))
         parent: dict[int, int] = {}
         frontier = [start.id]
         seen = {start.id}
@@ -558,16 +689,20 @@ def _tid(ticket: Ticket | int) -> int:
     return ticket if isinstance(ticket, int) else ticket.id
 
 
-def _missing(t: Ticket, rows: list[FileLock]) -> list[str]:
+def _missing(t: Ticket, rows: list[_Row]) -> list[str]:
     mine = [r.path for r in rows if r.ticket_id == t.id]
     keys = dict.fromkeys(lock_key(p) for p in t.owned_files)
     return [k for k in keys if not covered(k, mine)]
 
 
-def _conflicts(tid: int, keys: Iterable[str], rows: list[FileLock]) -> tuple[Conflict, ...]:
+def _conflicts(tid: int, keys: Iterable[str], rows: list[_Row]) -> tuple[Conflict, ...]:
     out = []
     for k in keys:
         for r in rows:
-            if r.ticket_id != tid and overlaps(k, r.path):
+            if r.ticket_id == tid or not overlaps(k, r.path):
+                continue
+            if r.chat_session_id is not None:
+                out.append(Conflict(k, r.path, r.chat_session_id, "chat"))
+            elif r.ticket_id is not None:
                 out.append(Conflict(k, r.path, r.ticket_id))
     return tuple(out)

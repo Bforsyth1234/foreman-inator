@@ -38,6 +38,11 @@ Layout (every key optional; missing keys take the defaults below)::
     # relay_url = "https://smee.io/<channel>"  # #15: webhook relay (nudges a poll)
     # relay_secret_ref = "keychain:foreman-inator/relay-webhook-secret"
     # relay_min_poll_gap_seconds = 15  # #15: floor between nudged polls (nudges coalesce)
+    chat_local_wait_seconds = 5.0  # #71: a chat turn waits this long for the local slot
+    chat_start_tier = 1      # #71: the tier a new chat session starts on
+    # chat_turn_budget_usd = 1.50  # #71: one chat turn's cloud spend (default attempt_budget_usd)
+    chat_idle_minutes = 30   # #71: an idle chat session ends after this (worktree kept)
+    chat_max_sessions = 1    # #71: open chat sessions at once
 
     [experiments]        # replays (#25) and the shadow reviewer (#26), wave 9 (#29)
     run_budget_usd = 2.0
@@ -63,6 +68,7 @@ Layout (every key optional; missing keys take the defaults below)::
     daily_usd = 5.0
     monthly_usd = 50.0
     experiments_monthly_usd = 10.0
+    chat_monthly_usd = 20.0  # #71: chat sessions' share of monthly_usd (option C)
 
     [[models]]           # one table per model; order inside a tier = try order
     name = "glm"
@@ -111,6 +117,8 @@ SANDBOX_INSTALLS = ("on", "off")
 DEFAULT_ATTEMPT_BUDGET_USD = 1.50
 DEFAULT_ATTEMPT_MAX_INPUT_TOKENS_CLOUD = 1_500_000
 DEFAULT_ATTEMPT_MAX_INPUT_TOKENS_LOCAL = 4_000_000
+#: #71: chat sessions' monthly sub-cap (``spend_caps.chat_monthly_usd``), option C.
+DEFAULT_CHAT_MONTHLY_USD = 20.0
 #: #56: days an unmerged ticket's recordings, traces and stale scratch are kept.
 DEFAULT_RETENTION_DAYS = 90.0
 
@@ -225,6 +233,16 @@ class SpendCaps:
     daily_usd: float = 5.0
     monthly_usd: float = 50.0
     experiments_monthly_usd: float = 10.0
+    #: #71 (option C): chat spend counts toward ``monthly_usd`` and is capped by this.
+    #: The default (20) is lowered to ``monthly_usd`` when that is smaller; any other
+    #: value above ``monthly_usd`` is a ConfigError.
+    chat_monthly_usd: float = DEFAULT_CHAT_MONTHLY_USD
+
+    def __post_init__(self) -> None:
+        if self.chat_monthly_usd == DEFAULT_CHAT_MONTHLY_USD and self.monthly_usd >= 0:
+            object.__setattr__(
+                self, "chat_monthly_usd", min(self.chat_monthly_usd, self.monthly_usd)
+            )
 
 
 @dataclass(frozen=True)
@@ -423,6 +441,21 @@ class Config:
     status_comment: bool = True
     status_label: bool = False  # also add `fman:working` while active
     status_show_cost: bool = False  # issue comments on a public repo are public
+    #: #71 chat sessions (docs/chat-design.md; inert until the chat engine lands). A chat
+    #: turn that would wait longer than this for the local slot goes to a cloud model.
+    chat_local_wait_seconds: float = 5.0
+    chat_start_tier: int = 1  # the tier a new session starts on
+    #: One chat turn's cloud spend; None = ``attempt_budget_usd`` (``chat_turn_budget``).
+    chat_turn_budget_usd: float | None = None
+    chat_idle_minutes: float = 30.0  # an idle session ends (worktree kept) after this
+    chat_max_sessions: int = 1  # open chat sessions at once
+
+    @property
+    def chat_turn_budget(self) -> float:
+        """One chat turn's cloud budget: ``chat_turn_budget_usd``, else the attempt's."""
+        if self.chat_turn_budget_usd is None:
+            return self.attempt_budget_usd
+        return self.chat_turn_budget_usd
 
     def __post_init__(self) -> None:
         for name in ("sandbox_network", "sandbox_install", "rules_file"):
@@ -558,6 +591,7 @@ def _validate(cfg: Config) -> None:
         raise ConfigError("writer_timeout_seconds must be > 0 and <= 86400")
     _validate_learning(cfg)
     _validate_wave17(cfg)
+    _validate_chat(cfg)
     names = [m.name for m in cfg.models]
     if len(set(names)) != len(names):
         raise ConfigError("model names must be unique")
@@ -642,6 +676,22 @@ def _validate_wave17(cfg: Config) -> None:
         raise ConfigError("experiments.fork_writer_timeout_s must be > 0")
     if ex.proposer_model and ex.proposer_model not in {m.name for m in cfg.models}:
         raise ConfigError(f"experiments.proposer_model names unknown model {ex.proposer_model!r}")
+
+
+def _validate_chat(cfg: Config) -> None:
+    """#71 chat keys and ``spend_caps.chat_monthly_usd``."""
+    if cfg.spend_caps.chat_monthly_usd > cfg.spend_caps.monthly_usd:
+        raise ConfigError("spend_caps.chat_monthly_usd must be <= spend_caps.monthly_usd")
+    if not 0 <= cfg.chat_local_wait_seconds <= 600:
+        raise ConfigError("chat_local_wait_seconds must be between 0 and 600")
+    if cfg.chat_start_tier not in TIERS:
+        raise ConfigError(f"chat_start_tier must be one of {TIERS}")
+    if cfg.chat_turn_budget_usd is not None and not cfg.chat_turn_budget_usd > 0:
+        raise ConfigError("chat_turn_budget_usd must be > 0")
+    if not 1 <= cfg.chat_idle_minutes <= 24 * 60:
+        raise ConfigError("chat_idle_minutes must be between 1 and 1440")
+    if not 1 <= cfg.chat_max_sessions <= MAX_PARALLEL_PER_REPO:
+        raise ConfigError(f"chat_max_sessions must be between 1 and {MAX_PARALLEL_PER_REPO}")
 
 
 def _validate_model(m: ModelEndpoint) -> None:
@@ -785,6 +835,9 @@ def from_dict(data: Mapping[str, Any]) -> Config:
         "retention_days",
         "cold_load_timeout_seconds",
         "split_timeout_seconds",
+        "chat_local_wait_seconds",
+        "chat_turn_budget_usd",
+        "chat_idle_minutes",
     ):
         if key in data:
             kw[key] = float(_typed(data[key], (int, float), key))
@@ -793,6 +846,8 @@ def from_dict(data: Mapping[str, Any]) -> Config:
         "attempt_max_input_tokens_local",
         "max_local_inference",
         "max_open_prs_per_repo",
+        "chat_start_tier",
+        "chat_max_sessions",
     ):
         if key in data:
             kw[key] = _typed(data[key], int, key)
@@ -901,6 +956,12 @@ def to_dict(cfg: Config) -> dict[str, Any]:
     out["attempt_max_input_tokens_local"] = cfg.attempt_max_input_tokens_local
     out["retention_days"] = cfg.retention_days
     out["writer_timeout_seconds"] = cfg.writer_timeout_seconds
+    out["chat_local_wait_seconds"] = cfg.chat_local_wait_seconds
+    out["chat_start_tier"] = cfg.chat_start_tier
+    if cfg.chat_turn_budget_usd is not None:
+        out["chat_turn_budget_usd"] = cfg.chat_turn_budget_usd
+    out["chat_idle_minutes"] = cfg.chat_idle_minutes
+    out["chat_max_sessions"] = cfg.chat_max_sessions
     for key in _LEARNING_TYPES:
         if getattr(cfg, key) is not None:
             out[key] = getattr(cfg, key)

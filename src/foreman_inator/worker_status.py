@@ -67,6 +67,7 @@ def _line(
     store: Store | None = None,
     budget_usd: float | None = None,
     open_pr_cap: int | None = None,
+    chat_waits: dict[int, tuple[int, ...]] | None = None,
 ) -> str:
     title = " ".join(t.title.split())
     if len(title) > TITLE_WIDTH:
@@ -91,9 +92,19 @@ def _line(
         held = ", ".join(f"#{b}" for b in blockers)
         line += f"\n         WAITING: on files held by ticket(s) {held}"
         line += _release_hint(blockers, store)
+    chats = (chat_waits or {}).get(t.id)
+    if chats:
+        line += f"\n         WAITING: on files held by {_chat_holders(chats)}"
+        line += " (released on /pr, /discard or when the session ends)"
     for why in _waits(t, attempts, store, open_pr_cap):
         line += f"\n         WAITING: {why}"
     return line
+
+
+def _chat_holders(chats: Sequence[int]) -> str:
+    """#71 decision 6: ``chat session 3`` or ``chat sessions 3, 4``."""
+    ids = ", ".join(str(c) for c in chats)
+    return f"chat session {ids}" if len(chats) == 1 else f"chat sessions {ids}"
 
 
 def _release_hint(blockers: Sequence[int], store: Store | None) -> str:
@@ -149,11 +160,9 @@ def render_status(
     lines. Both are off by default, so no caller asks Ollama by accident."""
     tickets = store.list_tickets()
     locks = Locks(store)
-    waits = {
-        w.ticket_id: w.blockers
-        for repo in sorted({t.repo for t in tickets})
-        for w in locks.waiting(repo)
-    }
+    waiters = [w for repo in sorted({t.repo for t in tickets}) for w in locks.waiting(repo)]
+    waits = {w.ticket_id: w.blockers for w in waiters}  # () when only a chat holds the files
+    chat_waits = {w.ticket_id: w.chats for w in waiters if w.chats}
     budget = config.attempt_budget_usd if config is not None else None
     cap = int(config.max_open_prs_per_repo) if config is not None else None
     by_col: dict[str, list[Ticket]] = {c: [] for c in COLUMNS}
@@ -169,7 +178,10 @@ def render_status(
         if len(shown) < len(items):
             header += f", latest {len(shown)}"
         out.append(header)
-        out.extend(_line(t, store.list_attempts(t.id), waits, store, budget, cap) for t in shown)
+        out.extend(
+            _line(t, store.list_attempts(t.id), waits, store, budget, cap, chat_waits)
+            for t in shown
+        )
         if not items:
             out.append("  (none)")
         out.append("")

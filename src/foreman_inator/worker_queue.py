@@ -51,6 +51,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from foreman_inator.db.store import Store, Ticket
+from foreman_inator.locks import holders_text
 from foreman_inator.routing import escalation
 from foreman_inator.runner.worktree import RepoMirror
 
@@ -186,7 +187,8 @@ class QueueSteps:
         self._backoff: dict[str, float] = {}  # repo -> last error delay
         self._sweep: set[str] = set()
         self._repo_locks: dict[str, threading.RLock] = {}
-        self._waiting: dict[int, tuple[int, ...]] = {}  # ticket -> lock blockers (logging)
+        # ticket -> lock holders (logging): ticket ids, chat session ids negated
+        self._waiting: dict[int, tuple[int, ...]] = {}
         self._pr_capped: set[int] = set()  # tickets waiting at the open-PR cap (logging)
         # #77: repo -> lock held across the open-PR gate and the PR's creation, so two
         # publishes at cap - 1 (max_parallel_per_repo > 1) cannot both open one.
@@ -287,12 +289,13 @@ class QueueSteps:
             if self._waiting.pop(t.id, None) is not None:
                 log.info("ticket %d: file locks free; resuming", t.id)
             return True
-        if self._waiting.get(t.id) != r.blockers:
-            self._waiting[t.id] = r.blockers
+        holders = (*r.blockers, *(-c for c in r.chats))  # chats negated: one cache key
+        if self._waiting.get(t.id) != holders:
+            self._waiting[t.id] = holders
             log.info(
-                "ticket %d: waiting on files held by ticket(s) %s",
+                "ticket %d: waiting on files held by %s",
                 t.id,
-                ", ".join(f"#{b}" for b in r.blockers),
+                holders_text(r.blockers, r.chats),
             )
         return False
 

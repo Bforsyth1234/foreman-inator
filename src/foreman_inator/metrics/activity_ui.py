@@ -224,6 +224,7 @@ def _ticket_notes(
     attempts: Sequence[Attempt],
     waits: dict[int, tuple[int, ...]],
     cap: int | None,
+    chat_waits: dict[int, tuple[int, ...]] | None = None,
 ) -> list[str]:
     """``fman status``'s FLAGGED / WAITING lines for one ticket (``worker_status._line``)."""
     ws = _ws()
@@ -240,6 +241,9 @@ def _ticket_notes(
         notes.append(
             f"WAITING: on files held by ticket(s) {held}{ws._release_hint(blockers, store)}"
         )
+    chats = (chat_waits or {}).get(t.id)
+    if chats:
+        notes.append(f"WAITING: on files held by {ws._chat_holders(chats)}")
     notes.extend(f"WAITING: {why}" for why in ws._waits(t, attempts, store, cap))
     return notes
 
@@ -249,11 +253,9 @@ def _columns(store: Store, config: Config | None, closed_limit: int) -> tuple[st
     ws = _ws()
     tickets = store.list_tickets()
     locks = Locks(store)
-    waits = {
-        w.ticket_id: w.blockers
-        for repo in sorted({t.repo for t in tickets})
-        for w in locks.waiting(repo)
-    }
+    waiters = [w for repo in sorted({t.repo for t in tickets}) for w in locks.waiting(repo)]
+    waits = {w.ticket_id: w.blockers for w in waiters}  # () when only a chat holds the files
+    chat_waits = {w.ticket_id: w.chats for w in waiters if w.chats}
     budget = config.attempt_budget_usd if config is not None else None
     cap = int(config.max_open_prs_per_repo) if config is not None else None
     out = ["<h2>Tickets by state</h2>"]
@@ -271,7 +273,7 @@ def _columns(store: Store, config: Config | None, closed_limit: int) -> tuple[st
         rows = []
         for t in items:
             attempts = store.list_attempts(t.id)
-            notes = _ticket_notes(store, t, attempts, waits, cap)
+            notes = _ticket_notes(store, t, attempts, waits, cap, chat_waits)
             if t.column not in ("done", "dropped"):
                 spend = (t.flag_reason or "").startswith(FLAG_SPEND_CAP)
                 flagged += bool(t.flag_reason) and not spend

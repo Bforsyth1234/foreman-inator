@@ -101,6 +101,29 @@ CI_STATUSES: tuple[str, ...] = (
     "no_permission",
 )
 
+#: chat_sessions.state (#60, migration 012; docs/chat-design.md section 2).
+ChatState = Literal[
+    "starting", "idle", "busy", "closing", "opened_pr", "discarded", "ended", "failed"
+]
+CHAT_STATES: tuple[str, ...] = (
+    "starting",
+    "idle",
+    "busy",
+    "closing",
+    "opened_pr",
+    "discarded",
+    "ended",
+    "failed",
+)
+#: A session in one of these states is over for good: no state change leaves it.
+CHAT_FINAL_STATES: tuple[str, ...] = ("opened_pr", "discarded", "failed")
+#: States that stamp ``ended_at`` (``ended`` keeps its worktree and can be resumed,
+#: opened as a PR or discarded).
+CHAT_ENDED_STATES: tuple[str, ...] = ("opened_pr", "discarded", "ended", "failed")
+#: chat_turns.status (#60, migration 012). NULL while the turn runs.
+ChatTurnStatus = Literal["finished", "aborted", "timed_out", "errored", "refused"]
+CHAT_TURN_STATUSES: tuple[str, ...] = ("finished", "aborted", "timed_out", "errored", "refused")
+
 DEFAULT_CURSOR = "default"
 
 
@@ -278,6 +301,8 @@ class RepoSettings:
     # migration 010 (#49): False means "local only": the repo's code never goes to a
     # cloud model. Rows from before 010 (and repos with no row) are True.
     cloud: bool = True
+    # migration 012 (#60): True lets the repo's chat sandbox reach the network (443/80).
+    chat_network: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -290,6 +315,7 @@ class SpendEntry:
     attempt_id: int | None
     experiment_id: int | None
     created_at: datetime
+    chat_session_id: int | None = None  # migration 012 (#60)
 
 
 @dataclass(frozen=True, slots=True)
@@ -302,10 +328,62 @@ class SpendApproval:
 
 @dataclass(frozen=True, slots=True)
 class FileLock:
+    """One locked path. Exactly one of ``ticket_id`` / ``chat_session_id`` is set
+    (migration 012, #60: a chat session can hold locks too)."""
+
     repo: str
     path: str
-    ticket_id: int
+    ticket_id: int | None
     acquired_at: datetime
+    chat_session_id: int | None = None
+
+    @property
+    def holder(self) -> tuple[Literal["ticket", "chat"], int]:
+        """``("ticket", id)`` or ``("chat", id)``."""
+        if self.chat_session_id is not None:
+            return ("chat", self.chat_session_id)
+        assert self.ticket_id is not None
+        return ("ticket", self.ticket_id)
+
+
+@dataclass(frozen=True, slots=True)
+class ChatSession:
+    """#60 (migration 012): one interactive chat session."""
+
+    id: int
+    repo: str
+    base_branch: str
+    base_commit: str | None
+    branch: str
+    worktree: str | None
+    state: ChatState
+    tier: int
+    model: str
+    opencode_session_id: str | None
+    trace_id: str | None
+    pr_number: int | None
+    end_reason: str | None
+    started_at: datetime
+    ended_at: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
+class ChatTurn:
+    """#60 (migration 012): one user message in a chat session and the work on it."""
+
+    id: int
+    session_id: int
+    seq: int
+    tier: int
+    model: str
+    status: ChatTurnStatus | None
+    tokens_in: int
+    tokens_out: int
+    cost_usd: float
+    tool_calls: int
+    edits: int
+    started_at: datetime
+    ended_at: datetime | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -331,7 +409,15 @@ class Migration:
 # --- Conversions ----------------------------------------------------------------------
 
 _BOOL_FIELDS = frozenset(
-    {"tests_passed", "build_passed", "tests_nonvacuous", "shadow", "ci_passed", "cloud"}
+    {
+        "tests_passed",
+        "build_passed",
+        "tests_nonvacuous",
+        "shadow",
+        "ci_passed",
+        "cloud",
+        "chat_network",
+    }
 )
 _JSON_TUPLE_FIELDS = frozenset({"owned_files"})
 
@@ -1411,6 +1497,30 @@ class Store:
         rows = self.query("SELECT repo FROM repo_settings WHERE cloud = 0")
         return frozenset(r["repo"] for r in rows)
 
+    def set_chat_network(self, repo: str, on: bool) -> RepoSettings:
+        """Save ``repo``'s chat network opt-in (#60, decision 4). True gives the repo's
+        chat sandbox the dependency-install outbound policy (ports 443/80); tickets are
+        unaffected."""
+        now = _ts(self.now())
+        with self.transaction() as conn:
+            conn.execute(
+                "INSERT INTO repo_settings (repo, chat_network, updated_at) VALUES (?, ?, ?)"
+                " ON CONFLICT (repo) DO UPDATE SET chat_network = excluded.chat_network,"
+                " updated_at = excluded.updated_at",
+                (repo, int(bool(on)), now),
+            )
+        settings = self.get_repo_settings(repo)
+        assert settings is not None
+        return settings
+
+    def repo_allows_chat_network(self, repo: str | None) -> bool:
+        """True only when ``repo`` opted in with ``set_chat_network``. Closed by default:
+        a repo with no settings row, or None, gets no network (fail closed, 7g)."""
+        if not repo:
+            return False
+        settings = self.get_repo_settings(repo)
+        return False if settings is None else bool(settings.chat_network)
+
     def mark_verify_prompted(self, repo: str) -> bool:
         """Record the one-time "no verify command" flag. True only on the first call."""
         now = _ts(self.now())
@@ -1453,19 +1563,22 @@ class Store:
         ticket_id: int | None = None,
         attempt_id: int | None = None,
         experiment_id: int | None = None,
+        chat_session_id: int | None = None,
     ) -> SpendEntry:
-        entry_id = self._insert(
-            "spend_ledger",
-            {
-                "bucket": bucket,
-                "cost_usd": float(cost_usd),
-                "model": model,
-                "ticket_id": ticket_id,
-                "attempt_id": attempt_id,
-                "experiment_id": experiment_id,
-                "created_at": self.now(),
-            },
-        )
+        """One ledger row. ``chat_session_id`` (#60) tags a chat call's row; chat rows are
+        bucket ``live`` (option C) but nothing here enforces that (``spend`` does)."""
+        values: dict[str, Any] = {
+            "bucket": bucket,
+            "cost_usd": float(cost_usd),
+            "model": model,
+            "ticket_id": ticket_id,
+            "attempt_id": attempt_id,
+            "experiment_id": experiment_id,
+            "created_at": self.now(),
+        }
+        if chat_session_id is not None:
+            values["chat_session_id"] = chat_session_id
+        entry_id = self._insert("spend_ledger", values)
         row = self._one("SELECT * FROM spend_ledger WHERE id = ?", (entry_id,))
         assert row is not None
         return _row_to(SpendEntry, row)
@@ -1477,6 +1590,27 @@ class Store:
         sql = "SELECT COALESCE(SUM(cost_usd), 0.0) AS total FROM spend_ledger"
         sql += " WHERE bucket = ? AND created_at >= ?"
         params: list[Any] = [bucket, _ts(since)]
+        if until is not None:
+            sql += " AND created_at < ?"
+            params.append(_ts(until))
+        row = self._one(sql, params)
+        return float(row["total"]) if row else 0.0
+
+    def chat_spend(self, session_id: int) -> float:
+        """Every ledger row's cost for one chat session (#60), all time."""
+        row = self._one(
+            "SELECT COALESCE(SUM(cost_usd), 0.0) AS total FROM spend_ledger"
+            " WHERE chat_session_id = ?",
+            (session_id,),
+        )
+        return float(row["total"]) if row else 0.0
+
+    def chat_spend_total(self, since: datetime, until: datetime | None = None) -> float:
+        """Sum of every chat session's spend with ``since <= created_at < until`` (#60;
+        the chat sub-cap, option C). Any bucket: chat rows are ``live`` by contract."""
+        sql = "SELECT COALESCE(SUM(cost_usd), 0.0) AS total FROM spend_ledger"
+        sql += " WHERE chat_session_id IS NOT NULL AND created_at >= ?"
+        params: list[Any] = [_ts(since)]
         if until is not None:
             sql += " AND created_at < ?"
             params.append(_ts(until))
@@ -1514,8 +1648,9 @@ class Store:
     def acquire_locks(self, ticket_id: int, repo: str, paths: Iterable[str]) -> list[FileLock]:
         """All-or-nothing: lock every path for the ticket, or none.
 
-        Returns the conflicting locks held by other tickets (empty = acquired). Paths the
-        ticket already holds are kept. Path normalisation is the caller's job (#19).
+        Returns the conflicting locks held by other tickets or by chat sessions (empty =
+        acquired). Paths the ticket already holds are kept. Path normalisation is the
+        caller's job (#19).
         """
         wanted = sorted(set(paths))
         if not wanted:
@@ -1524,7 +1659,7 @@ class Store:
         with self.transaction() as conn:
             rows = conn.execute(
                 f"SELECT * FROM file_locks WHERE repo = ? AND path IN ({marks})"
-                " AND ticket_id != ? ORDER BY path",
+                " AND ticket_id IS NOT ? ORDER BY path",
                 [repo, *wanted, ticket_id],
             ).fetchall()
             if rows:
@@ -1538,8 +1673,13 @@ class Store:
         return []
 
     def list_locks(
-        self, *, repo: str | None = None, ticket_id: int | None = None
+        self,
+        *,
+        repo: str | None = None,
+        ticket_id: int | None = None,
+        chat_session_id: int | None = None,
     ) -> list[FileLock]:
+        """Lock rows, ticket and chat holders alike unless filtered."""
         where, params = [], []
         if repo is not None:
             where.append("repo = ?")
@@ -1547,6 +1687,9 @@ class Store:
         if ticket_id is not None:
             where.append("ticket_id = ?")
             params.append(ticket_id)
+        if chat_session_id is not None:
+            where.append("chat_session_id = ?")
+            params.append(chat_session_id)
         sql = "SELECT * FROM file_locks"
         if where:
             sql += " WHERE " + " AND ".join(where)
@@ -1557,6 +1700,229 @@ class Store:
         with self.transaction() as conn:
             cur = conn.execute("DELETE FROM file_locks WHERE ticket_id = ?", (ticket_id,))
             return cur.rowcount
+
+    # Chat holders (#60, decision 6). Low-level rows only: policy (what to lock, warnings
+    # when a ticket holds a file the chat edits, release on /pr, /discard, end) is locks.py's.
+
+    def chat_lock_rows(self, session_id: int) -> list[FileLock]:
+        """Every lock the chat session holds, by repo and path."""
+        return self.list_locks(chat_session_id=session_id)
+
+    def insert_chat_locks(self, session_id: int, repo: str, paths: Iterable[str]) -> list[FileLock]:
+        """Lock each free path for the chat session; return the locks others hold.
+
+        Not all-or-nothing, unlike ``acquire_locks``: a chat never waits on a ticket's
+        locks (decision 6), so it takes what is free and the caller warns about the rest.
+        Paths the session already holds are kept; one holder per (repo, path) stands.
+        """
+        wanted = sorted(set(paths))
+        if not wanted:
+            return []
+        marks = ", ".join("?" for _ in wanted)
+        with self.transaction() as conn:
+            now = _ts(self.now())
+            conn.executemany(
+                "INSERT INTO file_locks (repo, path, chat_session_id, acquired_at)"
+                " VALUES (?, ?, ?, ?) ON CONFLICT (repo, path) DO NOTHING",
+                [(repo, p, session_id, now) for p in wanted],
+            )
+            rows = conn.execute(
+                f"SELECT * FROM file_locks WHERE repo = ? AND path IN ({marks})"
+                " AND chat_session_id IS NOT ? ORDER BY path",
+                [repo, *wanted, session_id],
+            ).fetchall()
+        return [_row_to(FileLock, r) for r in rows]
+
+    def delete_chat_locks(self, session_id: int, paths: Iterable[str] | None = None) -> int:
+        """Drop the chat session's locks (all of them, or just ``paths``); return how
+        many. Never touches another holder's row."""
+        with self.transaction() as conn:
+            if paths is None:
+                cur = conn.execute(
+                    "DELETE FROM file_locks WHERE chat_session_id = ?", (session_id,)
+                )
+                return cur.rowcount
+            wanted = sorted(set(paths))
+            if not wanted:
+                return 0
+            marks = ", ".join("?" for _ in wanted)
+            cur = conn.execute(
+                f"DELETE FROM file_locks WHERE chat_session_id = ? AND path IN ({marks})",
+                [session_id, *wanted],
+            )
+            return cur.rowcount
+
+    # -- chat sessions and turns (#60, migration 012) --
+
+    _CHAT_UPDATABLE = frozenset(
+        {"base_commit", "worktree", "tier", "model", "opencode_session_id", "trace_id"}
+    )
+
+    def create_chat_session(
+        self,
+        repo: str,
+        *,
+        base_branch: str,
+        tier: int,
+        model: str,
+        branch: str | None = None,
+        base_commit: str | None = None,
+        worktree: str | None = None,
+    ) -> ChatSession:
+        """A new session row in state ``starting``. ``branch`` defaults to
+        ``fman/chat/<id>`` (the id is known only after the insert, so it is set in the
+        same transaction)."""
+        with self.transaction() as conn:
+            session_id = self._insert(
+                "chat_sessions",
+                {
+                    "repo": repo,
+                    "base_branch": base_branch,
+                    "base_commit": base_commit,
+                    "branch": branch or "fman/chat/new",
+                    "worktree": worktree,
+                    "tier": tier,
+                    "model": model,
+                    "started_at": self.now(),
+                },
+            )
+            if branch is None:
+                conn.execute(
+                    "UPDATE chat_sessions SET branch = ? WHERE id = ?",
+                    (f"fman/chat/{session_id}", session_id),
+                )
+        return self.get_chat_session(session_id)
+
+    def get_chat_session(self, session_id: int) -> ChatSession:
+        row = self._one("SELECT * FROM chat_sessions WHERE id = ?", (session_id,))
+        if row is None:
+            raise NotFoundError(f"no chat session {session_id}")
+        return _row_to(ChatSession, row)
+
+    def list_chat_sessions(
+        self, *, repo: str | None = None, states: Iterable[str] | None = None
+    ) -> list[ChatSession]:
+        """Sessions, newest first; optionally only ``repo``'s or those in ``states``."""
+        where, params = [], []
+        if repo is not None:
+            where.append("repo = ?")
+            params.append(repo)
+        if states is not None:
+            wanted = list(states)
+            if not wanted:
+                return []
+            where.append(f"state IN ({', '.join('?' for _ in wanted)})")
+            params.extend(wanted)
+        sql = "SELECT * FROM chat_sessions"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        return [_row_to(ChatSession, r) for r in self.query(sql + " ORDER BY id DESC", params)]
+
+    def update_chat_session(self, session_id: int, **values: Any) -> ChatSession:
+        """Set descriptive fields (see ``_CHAT_UPDATABLE``); the state goes through
+        ``set_chat_state``."""
+        self._update("chat_sessions", "id", session_id, values, self._CHAT_UPDATABLE)
+        return self.get_chat_session(session_id)
+
+    def set_chat_state(
+        self,
+        session_id: int,
+        state: ChatState,
+        *,
+        end_reason: str | None = None,
+        pr_number: int | None = None,
+    ) -> ChatSession:
+        """Move a session to ``state``.
+
+        ``opened_pr`` / ``discarded`` / ``failed`` are final: leaving one raises
+        ``StoreError``. Entering any of ``CHAT_ENDED_STATES`` stamps ``ended_at`` and
+        stores ``end_reason``; going back to a live state (resuming an ``ended`` session)
+        clears both. ``pr_number`` is required for ``opened_pr``.
+        """
+        if state not in CHAT_STATES:
+            raise ValueError(f"unknown chat state {state!r}; valid: {CHAT_STATES}")
+        if state == "opened_pr" and pr_number is None:
+            raise ValueError("opened_pr needs the pr_number")
+        with self.transaction():
+            current = self.get_chat_session(session_id)
+            if current.state in CHAT_FINAL_STATES and state != current.state:
+                raise StoreError(
+                    f"chat session {session_id} is {current.state}; cannot move to {state}"
+                )
+            values: dict[str, Any] = {"state": state}
+            if state in CHAT_ENDED_STATES:
+                values["ended_at"] = current.ended_at or self.now()
+                values["end_reason"] = end_reason
+            else:
+                values["ended_at"] = None
+                values["end_reason"] = None
+            if pr_number is not None:
+                values["pr_number"] = pr_number
+            self._update("chat_sessions", "id", session_id, values, frozenset(values))
+        return self.get_chat_session(session_id)
+
+    def add_chat_turn(self, session_id: int, *, tier: int, model: str) -> ChatTurn:
+        """A new running turn (status NULL) with the next ``seq`` for the session."""
+        with self.transaction() as conn:
+            self.get_chat_session(session_id)  # NotFoundError before the FK error
+            row = conn.execute(
+                "SELECT COALESCE(MAX(seq), 0) + 1 AS n FROM chat_turns WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            turn_id = self._insert(
+                "chat_turns",
+                {
+                    "session_id": session_id,
+                    "seq": int(row["n"]),
+                    "tier": tier,
+                    "model": model,
+                    "started_at": self.now(),
+                },
+            )
+        return self.get_chat_turn(turn_id)
+
+    def get_chat_turn(self, turn_id: int) -> ChatTurn:
+        row = self._one("SELECT * FROM chat_turns WHERE id = ?", (turn_id,))
+        if row is None:
+            raise NotFoundError(f"no chat turn {turn_id}")
+        return _row_to(ChatTurn, row)
+
+    def list_chat_turns(self, session_id: int) -> list[ChatTurn]:
+        rows = self.query(
+            "SELECT * FROM chat_turns WHERE session_id = ? ORDER BY seq", (session_id,)
+        )
+        return [_row_to(ChatTurn, r) for r in rows]
+
+    def finish_chat_turn(
+        self,
+        turn_id: int,
+        status: ChatTurnStatus,
+        *,
+        tokens_in: int | None = None,
+        tokens_out: int | None = None,
+        cost_usd: float | None = None,
+        tool_calls: int | None = None,
+        edits: int | None = None,
+    ) -> ChatTurn:
+        """Stamp ``ended_at`` and the status, and set the turn's totals (None keeps the
+        stored value). A turn finishes once: a second call raises ``StoreError``."""
+        if status not in CHAT_TURN_STATUSES:
+            raise ValueError(f"unknown chat turn status {status!r}; valid: {CHAT_TURN_STATUSES}")
+        given = {
+            "tokens_in": tokens_in,
+            "tokens_out": tokens_out,
+            "cost_usd": None if cost_usd is None else float(cost_usd),
+            "tool_calls": tool_calls,
+            "edits": edits,
+        }
+        values: dict[str, Any] = {k: v for k, v in given.items() if v is not None}
+        values["status"] = status
+        values["ended_at"] = self.now()
+        with self.transaction():
+            if self.get_chat_turn(turn_id).status is not None:
+                raise StoreError(f"chat turn {turn_id} has already finished")
+            self._update("chat_turns", "id", turn_id, values, frozenset(values))
+        return self.get_chat_turn(turn_id)
 
     # -- post-merge signals (#24, migration 009) --
 
