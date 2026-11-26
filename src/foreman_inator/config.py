@@ -74,7 +74,7 @@ Layout (every key optional; missing keys take the defaults below)::
     name = "glm"
     tier = 2             # #70: tier 2 is open-weights cloud by default
     kind = "cloud"       # local | cloud
-    model = "glm-5.3"
+    model = "glm-5.4"
     base_url = "https://api.z.ai/api/coding/paas/v4"
     family = "glm"       # reviewer must be a different family from the writer
     api_key_ref = "keychain:foreman-inator/glm"
@@ -310,7 +310,7 @@ def default_models() -> tuple[ModelEndpoint, ...]:
     opt-in local tier 2."""
     return (
         ModelEndpoint("inkling-2-mini", 1, "local", "inkling-2-mini", OLLAMA_URL, "inkling"),
-        ModelEndpoint("glm", 2, "cloud", "glm-5.3", GLM_URL, "glm", key_ref("glm")),
+        ModelEndpoint("glm", 2, "cloud", "glm-5.4", GLM_URL, "glm", key_ref("glm")),
         ModelEndpoint(
             "claude-opus",
             3,

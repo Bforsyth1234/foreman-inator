@@ -150,6 +150,9 @@ PRICES: dict[str, Price] = {
     "claude-haiku-4-5": _a(1, 5, 0.10),
     # Z.ai GLM (pay-as-you-go list prices; see the module note on the Coding Plan):
     # input, output, cached input per MTok
+    # glm-5.4 has no pay-as-you-go price on the pricing page (2026-11-25); it is a
+    # Coding Plan model there. Logged at glm-5.3's list price as a stand-in.
+    "glm-5.4": _z(1.4, 4.4, 0.26),
     "glm-5.3": _z(1.4, 4.4, 0.26),
     "glm-5.3-flash": _z(0.15, 0.50, 0.03),
     "glm-5.3-flashx": _z(0.37, 1.25, 0.075),

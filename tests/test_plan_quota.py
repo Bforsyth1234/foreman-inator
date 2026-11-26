@@ -254,7 +254,7 @@ def plan_env(tmp_path: Path, code: str, reset_in: timedelta) -> tuple[Env, dict[
 
     async def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content) if request.content else {}
-        if body.get("model") == "glm-5.3":
+        if body.get("model") == "glm-5.4":
             seen["glm"] += 1
             if seen["fail"]:
                 seen["fail"] -= 1

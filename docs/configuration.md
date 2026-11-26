@@ -182,7 +182,7 @@ The defaults:
 | `name` | `tier` | `kind` | `model` | `base_url` | `family` | `api_key_ref` |
 | --- | --- | --- | --- | --- | --- | --- |
 | `inkling-2-mini` | 1 | local | `inkling-2-mini` | `http://127.0.0.1:11434/v1` | inkling | |
-| `glm` | 2 | cloud | `glm-5.3` | `https://api.z.ai/api/coding/paas/v4` | glm | `keychain:foreman-inator/glm` |
+| `glm` | 2 | cloud | `glm-5.4` | `https://api.z.ai/api/coding/paas/v4` | glm | `keychain:foreman-inator/glm` |
 | `claude-opus` | 3 | cloud | `claude-opus-5-5` | `https://api.anthropic.com/v1` | claude | `keychain:foreman-inator/anthropic` |
 | `claude-fable` | 3 | cloud | `claude-fable-5-2` | `https://api.anthropic.com/v1` | claude | `keychain:foreman-inator/anthropic` |
 
@@ -240,7 +240,7 @@ file with `[[models]]` lists every model itself, one table each:
 name = "glm"
 tier = 3
 kind = "cloud"
-model = "glm-5.3"
+model = "glm-5.4"
 base_url = "https://api.z.ai/api/coding/paas/v4"
 family = "glm"
 api_key_ref = "keychain:foreman-inator/glm"
