@@ -527,6 +527,7 @@ _NAV_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("Configure", ("/experiments/manage", "/settings", "/tiers")),
 )
 
+
 def _active_href(links: Sequence[tuple[str, str]], path: str) -> str | None:
     """The link for ``path``: an exact match, else the longest ``href/`` prefix."""
     hits = [h for h, _ in links if h == path or (h != "/" and path.startswith(h + "/"))]
