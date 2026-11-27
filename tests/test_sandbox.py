@@ -643,6 +643,27 @@ def test_verify_missing_executable_is_127_in_the_sandbox(att):
 
 
 @macos
+def test_verify_command_may_bind_loopback_but_not_connect_out(att):
+    """A check may start a server on 127.0.0.1:0 (as the writer's sandbox allows), but
+    still cannot open outbound connections."""
+    script = (
+        "import socket\n"
+        "from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer\n"
+        "s = ThreadingHTTPServer(('127.0.0.1', 0), BaseHTTPRequestHandler); print('BO' + 'UND')\n"
+        "try:\n"
+        "    socket.create_connection(s.server_address, timeout=2); print('CON' + 'NECTED')\n"
+        "except OSError as e:\n"
+        "    print('NO' + 'CONNECT', e.errno)\n"
+    )
+    cmd = verify.VerifyCommand.of([sys.executable, "-I", "-c", script], "override")
+    res = verify.run(cmd, att.wt.path, timeout=30, output_path=att.tmp / "b.log",
+                     sandbox=att.policy())  # fmt: skip
+    log = res.output_path.read_text()
+    # the log echoes the command, so the markers are split in the script
+    assert "BOUND\n" in log and "NOCONNECT" in log and "\nCONNECTED" not in log, log[-2000:]
+
+
+@macos
 def test_verify_command_cannot_read_secrets(att):
     cmd = verify.VerifyCommand.from_override(
         f"cat {att.fhome / 'app.pem'}; cat {att.home / '.ssh' / 'id_ed25519'}; echo done"

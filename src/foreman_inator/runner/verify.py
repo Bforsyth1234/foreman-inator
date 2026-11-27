@@ -28,6 +28,7 @@ once, under that policy; a failed install is a failed run with the install log's
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import json
 import os
 import re
@@ -375,7 +376,10 @@ def _sandboxed(
     launch (exit 127) instead of ``sandbox-exec``'s own exit 71."""
     if policy is None or policy.mode == "off":
         return list(argv), env, False
-    bound = policy.bind(cwd, argv0=argv[0])
+    # Checks may bind and accept on loopback, like the writer's own sandbox (opencode
+    # serve): a test that starts a local server on 127.0.0.1:0 must not pass for the
+    # writer and fail here. Outbound stays limited to the policy's ports.
+    bound = dataclasses.replace(policy.bind(cwd, argv0=argv[0]), listen_loopback=True)
     wrapped = sandbox_mod.wrap(argv, bound)  # SandboxUnavailable: fail closed, nothing ran
     full = sandbox_mod.apply_env(env, bound)
     exe = argv[0]
