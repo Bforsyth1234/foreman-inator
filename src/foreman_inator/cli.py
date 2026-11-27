@@ -962,7 +962,12 @@ def prune_command(
 
 @app.command("retry")
 def retry_command(
-    ticket: Annotated[str, typer.Argument(help="owner/repo#issue, or a ticket id.")],
+    ticket: Annotated[
+        str,
+        typer.Argument(
+            help="owner/repo#issue, owner/repo#issue:a|b (ab:pair side), or a ticket id."
+        ),
+    ],
     tier: Annotated[
         int | None,
         typer.Option("--tier", help="Retry on this tier (1-3).", show_default=False),

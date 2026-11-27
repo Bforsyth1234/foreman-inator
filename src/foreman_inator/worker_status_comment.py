@@ -27,6 +27,16 @@ is mixed into ``Worker``.
 * Failures (GitHub errors, a bad call) are logged and swallowed: a status comment never
   blocks or fails work.
 
+ab:pair (#34, GH #16, wave 23): the two sides of a pair are two tickets on one issue but
+share ONE status comment, keyed by side A's marker (``ticket=<ticket_a>``, so a pair
+added late turns A's existing comment into the pair's). It has one heading line per side
+(``**Side A:** ...`` / ``**Side B:** ...``); an update rewrites only its own side's line
+and keeps the other's (from memory, or after a restart from the comment's current body).
+Once both sides have a PR, one note is posted once (``post_once``'s marker, key
+``pair_prs``): "Two PRs: #x, #y. Merge the one you prefer; the other is closed." With
+``status_label``, ``fman:working`` is removed only when neither side is active. An
+unpaired ticket's comment is unchanged.
+
 The bot's own comments are already left out by author everywhere bot comments are:
 ``tickets.clarify.answers`` (a reply by the asking bot is never an answer) and
 ``tickets.prompt`` issue-comments context (``_same_login(author, bot_login)``), so the
@@ -37,6 +47,7 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
 from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
@@ -54,6 +65,13 @@ STATUS_LABEL = False
 STATUS_SHOW_COST = False
 
 REASON_MAX = 160
+
+#: ``worker_actions.NOTE_MARKER``'s format (``post_once``), so either path finds the note.
+NOTE_MARKER = "<!-- foreman-inator:note ticket={ticket_id} key={key} -->"
+PAIR_NOTE_KEY = "pair_prs"
+PAIR_NOTE = "Two PRs: #{a}, #{b}. Merge the one you prefer; the other is closed."
+SIDE_HEADING = "**Side {side}:** "
+SIDE_NOT_STARTED = "not started yet."
 
 ACTIVE_STATES = frozenset({"attempt_started", "escalated", "verifying", "reviewing"})
 TERMINAL_STATES = frozenset({"pr_opened", "handed_over", "dropped"})
@@ -127,6 +145,51 @@ def render_status(
     return text
 
 
+def side_line(side: str, text: str) -> str:
+    return SIDE_HEADING.format(side=side) + text
+
+
+def pair_body(ticket_a: int, side_a: str | None, side_b: str | None) -> str:
+    """The pair's one comment: side A's marker, then one heading line per side."""
+    return "\n".join(
+        (
+            status_marker(ticket_a),
+            side_line("A", side_a or SIDE_NOT_STARTED),
+            side_line("B", side_b or SIDE_NOT_STARTED),
+        )
+    )
+
+
+def side_text(body: str | None, side: str) -> str | None:
+    """A side's text from an existing comment body. Side A also takes the one line of an
+    unpaired comment (a pair added after A's comment was posted)."""
+    if not body:
+        return None
+    lines = [x for x in body.splitlines() if x.strip() and "<!--" not in x]
+    heading = SIDE_HEADING.format(side=side)
+    for x in lines:
+        if x.startswith(heading):
+            return x[len(heading) :] or None
+    if side == "A" and lines and not any(x.startswith("**Side ") for x in lines):
+        return lines[0]
+    return None
+
+
+#: One lock per pair (keyed by side A's ticket id): sides A and B run as concurrent
+#: jobs and both check-then-post the pair's one status comment and the pair note.
+_PAIR_LOCKS: dict[int, threading.Lock] = {}
+_PAIR_LOCKS_GUARD = threading.Lock()
+
+
+def _pair_lock(pair: Any) -> threading.Lock:
+    key = int(pair.ticket_a)
+    with _PAIR_LOCKS_GUARD:
+        lock = _PAIR_LOCKS.get(key)
+        if lock is None:
+            lock = _PAIR_LOCKS[key] = threading.Lock()
+        return lock
+
+
 class StatusCommentSteps:
     # Provided by Worker.
     api: Any
@@ -159,9 +222,9 @@ class StatusCommentSteps:
             if not self.status_enabled(ticket):
                 return
             show_cost = self._status_flag("status_show_cost", STATUS_SHOW_COST)
-            body = (
-                f"{status_marker(ticket.id)}\n{render_status(state, show_cost=show_cost, **facts)}"
-            )
+            text = render_status(state, show_cost=show_cost, **facts)
+            pair = self._status_pair(ticket)
+            body = f"{status_marker(ticket.id)}\n{text}"
         except Exception as exc:
             log.warning(
                 "status comment for ticket %s skipped: %s: %s", ticket.id, type(exc).__name__, exc
@@ -170,7 +233,10 @@ class StatusCommentSteps:
 
         def write() -> None:
             try:
-                self._status_write(ticket, state, body)
+                if pair is None:
+                    self._status_write(ticket, state, body)
+                else:
+                    self._status_write_pair(ticket, pair, state, text, facts.get("pr_number"))
             except Exception as exc:
                 log.warning(
                     "status comment for ticket %s failed: %s: %s",
@@ -216,13 +282,130 @@ class StatusCommentSteps:
         if self._status_flag("status_label", STATUS_LABEL):
             self._status_label(ticket, state, labeled)
 
-    def _status_find(self, ticket: Any) -> Any | None:
-        marker = status_marker(ticket.id)
+    def _status_find(self, ticket: Any, key: int | None = None) -> Any | None:
+        marker = status_marker(ticket.id if key is None else key)
         bot = (self.api.bot_login() or "").casefold()
         for c in self.api.list_issue_comments(ticket.repo, ticket.issue_number):
             if (c.author or "").casefold() == bot and marker in (c.body or ""):
                 return c
         return None
+
+    # ------------------------------------------------------------- ab:pair (#34)
+
+    def _status_pair(self, ticket: Any) -> Any | None:
+        """The ticket's pair (any status), or None: unpaired, or a store without pairs."""
+        find = getattr(self.store, "pair_for_ticket", None)
+        if find is None:
+            return None
+        try:
+            return find(ticket.id)
+        except Exception:
+            return None
+
+    def _status_pair_state(self) -> tuple[dict[int, str], dict[int, str], set[int]]:
+        d = self.__dict__
+        return (
+            d.setdefault("_status_side_text", {}),
+            d.setdefault("_status_side_state", {}),
+            d.setdefault("_status_pair_noted", set()),
+        )
+
+    def _status_write_pair(
+        self, ticket: Any, pair: Any, state: str, text: str, pr_number: int | None
+    ) -> None:
+        """Rewrite this side's line of the pair's one comment (module docstring)."""
+        with _pair_lock(pair):
+            self._status_write_pair_locked(ticket, pair, state, text)
+        if state == "pr_opened":
+            self._status_pair_note(ticket, pair, pr_number)
+
+    def _status_write_pair_locked(self, ticket: Any, pair: Any, state: str, text: str) -> None:
+        ids, last, labeled = self._status_state()
+        sides, states, _ = self._status_pair_state()
+        key = int(pair.ticket_a)
+        sides[ticket.id] = text
+        states[ticket.id] = state
+        repo, number = ticket.repo, ticket.issue_number
+        cid = ids.get(key)
+        prev = last.get(key)
+        if cid is None:
+            found = self._status_find(ticket, key)
+            if found is not None:
+                cid = found.id
+                ids[key] = cid
+                prev = found.body or ""
+        for tid, side in ((pair.ticket_a, "A"), (pair.ticket_b, "B")):
+            if tid not in sides:
+                got = side_text(prev, side)
+                if got is not None:
+                    sides[tid] = got
+        body = pair_body(key, sides.get(pair.ticket_a), sides.get(pair.ticket_b))
+        if prev != body:
+            if cid is None:
+                ids[key] = self.api.post_comment(repo, number, body).id
+            else:
+                try:
+                    self.api.update_comment(repo, cid, body)
+                except GitHubNotFound:  # someone deleted it: post a fresh one
+                    ids[key] = self.api.post_comment(repo, number, body).id
+        last[key] = body
+        if self._status_flag("status_label", STATUS_LABEL):
+            self._status_pair_label(ticket, pair, state, labeled)
+
+    def _status_side_active(self, ticket_id: int) -> bool:
+        """The side's last written state is active; unknown (a restart): in progress."""
+        _, states, _ = self._status_pair_state()
+        if ticket_id in states:
+            return states[ticket_id] in ACTIVE_STATES
+        try:
+            return self.store.get_ticket(ticket_id).column == "in_progress"
+        except Exception:
+            return False
+
+    def _status_pair_label(self, ticket: Any, pair: Any, state: str, labeled: set[int]) -> None:
+        key = int(pair.ticket_a)
+        if state in ACTIVE_STATES and key not in labeled:
+            self.api.add_labels(ticket.repo, ticket.issue_number, [WORKING_LABEL])
+            labeled.add(key)
+        elif state in TERMINAL_STATES and not self._status_side_active(pair.other(ticket.id)):
+            self.api.remove_label(ticket.repo, ticket.issue_number, WORKING_LABEL)
+            labeled.discard(key)
+
+    def _status_pair_note(self, ticket: Any, pair: Any, pr_number: int | None) -> None:
+        """Post "Two PRs: #x, #y. ..." once both sides of a running pair have a PR."""
+        with _pair_lock(pair):
+            self._status_pair_note_locked(ticket, pair, pr_number)
+
+    def _status_pair_note_locked(self, ticket: Any, pair: Any, pr_number: int | None) -> None:
+        _, _, noted = self._status_pair_state()
+        if pair.id in noted:
+            return
+        try:
+            fresh = self.store.get_pair(pair.id)
+        except Exception:
+            fresh = pair
+        if getattr(fresh, "status", "running") != "running":
+            return
+        prs: dict[int, int | None] = {}
+        for tid in (pair.ticket_a, pair.ticket_b):
+            try:
+                prs[tid] = self.store.get_ticket(tid).pr_number
+            except Exception:
+                prs[tid] = None
+        if pr_number is not None:
+            prs[ticket.id] = int(pr_number)
+        a, b = prs[pair.ticket_a], prs[pair.ticket_b]
+        if a is None or b is None:
+            return
+        marker = NOTE_MARKER.format(ticket_id=int(pair.ticket_a), key=PAIR_NOTE_KEY)
+        bot = (self.api.bot_login() or "").casefold()
+        for c in self.api.list_issue_comments(ticket.repo, ticket.issue_number):
+            if (c.author or "").casefold() == bot and marker in (c.body or ""):
+                noted.add(pair.id)
+                return
+        note = PAIR_NOTE.format(a=int(a), b=int(b))
+        self.api.post_comment(ticket.repo, ticket.issue_number, f"{marker}\n{note}")
+        noted.add(pair.id)
 
     def _status_label(self, ticket: Any, state: str, labeled: set[int]) -> None:
         if state in ACTIVE_STATES and ticket.id not in labeled:
@@ -235,6 +418,8 @@ class StatusCommentSteps:
 
 __all__ = [
     "ACTIVE_STATES",
+    "PAIR_NOTE",
+    "PAIR_NOTE_KEY",
     "STATES",
     "STATUS_COMMENT",
     "STATUS_LABEL",
@@ -243,6 +428,8 @@ __all__ = [
     "TERMINAL_STATES",
     "WORKING_LABEL",
     "StatusCommentSteps",
+    "pair_body",
     "render_status",
+    "side_text",
     "status_marker",
 ]

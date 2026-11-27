@@ -341,6 +341,27 @@ failure step.
 
 Interactive chat sessions are described under [Chat sessions](#chat-sessions).
 
+## Head-to-head (ab:pair)
+
+Label an issue `agent` and `ab:pair` (an allowed user's labels only) and it
+becomes two tickets on one issue. Side A is routed, escalated and reviewed as
+usual. Side B copies A's route (no second router call) and its first attempt
+runs an opponent chosen once A is routed: the running writer experiment's
+challenger when it fits A's tier (a local ticket's code never goes to the cloud
+through it), else the next rung up the ladder, else the rung below; a
+local-only repo pairs only local models, and with no second model there is one
+comment and a single ticket. From then on each side retries, escalates, is
+reviewed, rebases and spends on its own, on its own branch
+(`fman/issue-<n>-b/a<k>` for side B). Each PR names the other.
+
+You pick by merging: the worker never merges. When you merge one PR it closes
+the other, deletes that side's `fman/` branch and records the win; closing one
+PR alone records that side as lost and the other continues; closing the issue
+or removing `agent` drops both; removing `ab:pair` drops side B. If side A
+proposes a split, side B is dropped with a note. Pair wins show in `fman
+status`, `/activity`, `/metrics` and the experiment results (W-L and cost per
+win, both sides' spend charged to the win) but never gate promotion.
+
 ## Metrics and the trace viewer
 
 `fman metrics` serves a local page on 127.0.0.1:8642, with no JavaScript

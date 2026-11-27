@@ -27,6 +27,10 @@ and the live checks are listed in [todo.md](todo.md#live-checks).
 5. You approve and merge it, or request changes to send it back with your
    comment. The outcome is recorded per model, so the routing improves over time.
 
+Add `ab:pair` as well for a head-to-head: two models write the issue, you get
+two PRs, merge the one you prefer, and the worker closes the other and records
+the win.
+
 | Tier | Default model | Where | Used for |
 | --- | --- | --- | --- |
 | 1 | Inkling 2 Mini | Local, Ollama | Small, mechanical changes |

@@ -72,6 +72,17 @@ for you; do not run a second one beside it.
 | --- | --- |
 | `--once` | One poll-and-work pass (one job per repo), then exit. |
 
+**The `ab:pair` label (head-to-head).** Add `ab:pair` together with `agent`
+(or later, until the ticket is done) and the worker opens two PRs for the
+issue, written by two different models: side A is the normal ticket, side B
+runs the opponent (a running writer experiment's challenger on the same tier,
+else the next rung up the ladder, else the rung below). Merge the one you
+prefer; the worker closes the other PR and deletes its `fman/` branch, and the
+result counts in `fman metrics` and experiment results (it never gates
+promotion). Closing one PR alone loses that side; the other carries on.
+Removing `ab:pair` drops side B and closes its PR. Only a label applied by an
+allowed user counts; `pair_enabled = false` ignores it with one comment.
+
 ## `fman status`
 
 Tickets by column with their current attempt, flags, waits and PR numbers,
@@ -417,8 +428,12 @@ on any difference.
 ## `fman retry`
 
 ```bash
-fman retry <owner/repo#issue | ticket id> [--tier N | --up]
+fman retry <owner/repo#issue | owner/repo#issue:a|b | ticket id> [--tier N | --up]
 ```
+
+For an `ab:pair` issue, `owner/repo#issue` is ambiguous: name the side as
+`owner/repo#issue:a` or `owner/repo#issue:b`, or by its ticket id (`fman
+status` lists both). A dropped side of a pair is not put back.
 
 Retry a flagged or dropped ticket, keeping its history: the same ticket, its
 attempts, traces, reviews and PR branch. Same tier by default; `--tier N` or

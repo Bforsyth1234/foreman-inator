@@ -1006,6 +1006,33 @@ class Store:
             )
         return self.get_pair(pair_id)
 
+    def set_pair_opponent(
+        self,
+        pair_id: int,
+        *,
+        opponent_variant: str,
+        opponent_reason: OpponentReason,
+        experiment_id: int | None = None,
+    ) -> Pair:
+        """Re-choose a running pair's opponent (#16: once side A is routed, before side
+        B's first attempt). A decided or dropped pair raises ``StoreError``."""
+        with self.transaction():
+            pair = self.get_pair(pair_id)
+            if pair.status != "running":
+                raise StoreError(f"pair {pair_id} is {pair.status}")
+            self._update(
+                "pairs",
+                "id",
+                pair_id,
+                {
+                    "opponent_variant": opponent_variant,
+                    "opponent_reason": opponent_reason,
+                    "experiment_id": experiment_id,
+                },
+                frozenset({"opponent_variant", "opponent_reason", "experiment_id"}),
+            )
+        return self.get_pair(pair_id)
+
     def drop_pair(self, pair_id: int) -> Pair:
         """End a running pair with no result (both PRs closed, issue closed, a label
         removed). Dropping a dropped pair is a no-op; a decided pair keeps its result

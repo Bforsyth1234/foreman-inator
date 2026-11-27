@@ -556,6 +556,26 @@ def _pipeline(rep: q.Report) -> str:
     )
 
 
+def _pairs(rep: q.Report) -> str:
+    """#16: head-to-head (``ab:pair``) W-L and cost per win per model pair (escaped)."""
+    if not rep.pairs:
+        return '<p class="empty">No decided head-to-head pairs in this range.</p>'
+
+    def cpw(x: float | None) -> str:
+        return NO_DATA if x is None else e(format_cost(x))
+
+    rows = "".join(
+        f"<tr><td>{e(r.a)}</td><td>{e(r.b)}</td><td>{r.a_wins}-{r.b_wins}</td>"
+        f"<td>{cpw(r.a_cost_per_win)}</td><td>{cpw(r.b_cost_per_win)}</td></tr>"
+        for r in rep.pairs
+    )
+    return (
+        '<div class="scroll"><table><tr><th>Side A</th><th>Side B (opponent)</th>'
+        "<th>W-L (A-B)</th><th>A cost / win</th><th>B cost / win</th></tr>"
+        f"{rows}</table></div>"
+    )
+
+
 def _recent(rep: q.Report) -> str:
     if not rep.recent:
         return '<p class="empty">No closed tickets in this range.</p>'
@@ -642,6 +662,8 @@ def render_report(
         + _reviewer_table(rep)
         + "<h2>Writer + reviewer vs. strong writer alone</h2>"
         + _pipeline(rep)
+        + "<h2>Head-to-head (ab:pair)</h2>"
+        + _pairs(rep)
         + f"<h2>Trends (by {e(rep.bucket)} the ticket was created)</h2>"
         + '<div class="charts"><div><h3>Cost per accepted ticket</h3>'
         + line_chart(cost_points, label="Cost per accepted ticket", fmt=format_cost)

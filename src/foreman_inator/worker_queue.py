@@ -36,15 +36,15 @@ jobs run at once (one per ticket); mirror operations stay serialised per repo
 Open-PR cap (#77): a ticket with no PR yet publishes (opens its draft PR) only while
 its repo has fewer than ``config.max_open_prs_per_repo`` open ``fman/`` PRs (0 = no
 cap). Open PRs are counted from the store: open tickets with a ``pr_number`` (the poller
-moves a merged or closed PR's ticket to done/dropped). At the cap the ticket *waits*
-like at the lock gate: the passed attempt is kept, nothing is counted or flagged, and
-the ``publish`` job is due again once a PR merges or closes. Attempts still run; a
-ticket that already has a PR (a kickback's retry) is never held.
+moves a merged or closed PR's ticket to done/dropped). An ab:pair (#16) is two tickets,
+so each side's PR counts as one; side B waits at the cap like any other ticket. At the
+cap the ticket *waits* like at the lock gate: the passed attempt is kept, nothing is
+counted or flagged, and the ``publish`` job is due again once a PR merges or closes.
+Attempts still run; a ticket that already has a PR (a kickback's retry) is never held.
 """
 
 from __future__ import annotations
 
-import contextlib
 import logging
 import threading
 from dataclasses import dataclass, field
@@ -53,7 +53,7 @@ from typing import Any, Literal
 from foreman_inator.db.store import Store, Ticket
 from foreman_inator.locks import holders_text
 from foreman_inator.routing import escalation
-from foreman_inator.runner.worktree import RepoMirror
+from foreman_inator.runner.worktree import RepoMirror, parse_attempt_dir
 
 log = logging.getLogger("foreman_inator.worker")
 
@@ -145,9 +145,9 @@ class SerialMirror(RepoMirror):
         with self._serial:
             return super().scratch(*args, **kw)
 
-    def cleanup_issue(self, issue: int) -> None:
+    def cleanup_issue(self, issue: int, side: str | None = None) -> None:
         with self._serial:
-            super().cleanup_issue(issue)
+            super().cleanup_issue(issue, side)
 
     def _remove_path(self, path: Any) -> None:
         with self._serial:
@@ -376,16 +376,27 @@ class QueueSteps:
 
     def _sweep_worktrees(self, repo: str) -> None:
         """Remove worktrees of issues with no open ticket (after merge, drop or a crash),
-        and scratch worktrees a killed review left behind."""
+        and scratch worktrees a killed review left behind.
+
+        ab:pair (#16): a worktree belongs to one side (``parse_attempt_dir``): side B's
+        ``issue-<n>-b-a<k>``, else side A / unpaired ``issue-<n>-a<k>``. Each side is
+        removed only when that side has no open ticket, so a lost or dropped side's
+        worktrees go while its sibling runs on, and a running side's never do."""
         mirror = self._mirror(repo)
-        issues: set[int] = set()
+        found: set[tuple[int, str | None]] = set()
         for p in mirror.repo_dir.glob("issue-*-a*"):
-            with contextlib.suppress(ValueError):
-                issues.add(int(p.name.split("-")[1]))
-        for n in sorted(issues):
-            if self.store.find_open_ticket(repo, n) is None:
-                mirror.cleanup_issue(n)
-                log.info("%s#%d: worktrees removed", repo, n)
+            parsed = parse_attempt_dir(p.name)
+            if parsed is not None:
+                found.add((parsed[0], parsed[1]))
+        for n, side in sorted(found, key=lambda x: (x[0], x[1] or "")):
+            open_sides = {
+                "b" if t.pair_side == "b" else None
+                for t in self.store.open_tickets_for_issue(repo, n)
+            }
+            if side not in open_sides:
+                mirror.cleanup_issue(n, side)
+                label = f"{repo}#{n}" + (" side B" if side == "b" else "")
+                log.info("%s: worktrees removed", label)
         if mirror.mirror_path.exists() and mirror.remove_scratch():
             log.info("%s: leftover review worktrees removed", repo)
 

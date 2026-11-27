@@ -48,6 +48,13 @@ a local-only repo (#49), up from the top tier, or to a tier with no model; the r
 limit; a dropped ticket whose issue is closed, lost its ``agent`` label, has another open
 ticket, or whose PR was closed or merged.
 
+**ab:pair (#16).** Each side of a pair is its own ticket, so a retry acts on one side
+only: its flag, its mark (``retry:<ticket id>``), its column; the sibling ticket, its
+attempts and its PR are never touched. ``owner/repo#issue`` is ambiguous for a pair and
+refused with both ticket ids; name a side by its ticket id or as ``owner/repo#issue:a`` /
+``owner/repo#issue:b``. A dropped side of a pair is not put back (the pair is over:
+relabel to start over).
+
 A ``publish_failed`` ticket whose last attempt passed its checks gets no new attempt:
 the retry clears the flag and the queue publishes that attempt again (same tier only).
 
@@ -294,7 +301,8 @@ def retry(
 ) -> RetryResult:
     """Retry a flagged ticket, or a dropped one whose issue still has the agent label.
 
-    ``ticket_ref``: a ticket id, ``"<id>"`` or ``"<owner>/<repo>#<issue>"``. ``tier``:
+    ``ticket_ref``: a ticket id, ``"<id>"``, ``"<owner>/<repo>#<issue>"`` or, for one
+    side of an ab:pair (#16), ``"<owner>/<repo>#<issue>:a"`` / ``":b"``. ``tier``:
     None or ``"same"`` (the last attempt's rung), ``"up"`` (the next rung) or a tier
     number. ``api``: a GitHub client, needed only for a dropped ticket (its issue and PR
     are checked). ``spend``: the cap checker (default ``Spend(store, config)``).
@@ -375,12 +383,19 @@ def retry(
     )
 
 
-_REF = re.compile(r"^(?P<repo>[\w.-]+/[\w.-]+)#(?P<n>\d+)$")
+_REF = re.compile(r"^(?P<repo>[\w.-]+/[\w.-]+)#(?P<n>\d+)(?::(?P<side>[abAB]))?$")
 
 
 def resolve_ticket(store: Store, ref: int | str) -> Ticket:
-    """The ticket ``ref`` names: an id, or ``owner/repo#issue`` (its open ticket, else
-    its latest). Raises LookupError with a message to show."""
+    """The ticket ``ref`` names: an id, ``owner/repo#issue`` (its open ticket, else its
+    latest), or ``owner/repo#issue:a`` / ``owner/repo#issue:b`` (one side of an ab:pair,
+    #16: its open ticket on that side, else its latest). Raises LookupError with a
+    message to show.
+
+    ab:pair: ``owner/repo#issue`` is ambiguous when it matches both sides (both open, or
+    none open and the latest ticket is paired); the error lists both ticket ids and the
+    ``:a`` / ``:b`` form. With one side still open, that side is meant (the other is over:
+    it cannot be retried while its sibling runs)."""
     if isinstance(ref, int) or str(ref).strip().isdigit():
         try:
             return store.get_ticket(int(ref))
@@ -388,15 +403,47 @@ def resolve_ticket(store: Store, ref: int | str) -> Ticket:
             raise LookupError(f"no ticket {ref}") from None
     m = _REF.match(str(ref).strip())
     if m is None:
-        raise LookupError(f"{ref!r} is not a ticket id or <owner>/<repo>#<issue>")
+        raise LookupError(
+            f"{ref!r} is not a ticket id, <owner>/<repo>#<issue> or <owner>/<repo>#<issue>:a|b"
+        )
     repo, n = m["repo"], int(m["n"])
-    t = store.find_open_ticket(repo, n)
-    if t is None:
-        tickets = store.tickets_for_issue(repo, n)
-        if not tickets:
-            raise LookupError(f"no ticket for {repo}#{n}")
-        t = tickets[-1]
+    if m["side"]:
+        return _resolve_side(store, repo, n, m["side"].lower())
+    open_now = store.open_tickets_for_issue(repo, n)
+    if len(open_now) > 1:
+        raise LookupError(_ambiguous(repo, n, open_now))
+    if open_now:
+        return open_now[0]
+    tickets = store.tickets_for_issue(repo, n)
+    if not tickets:
+        raise LookupError(f"no ticket for {repo}#{n}")
+    t = tickets[-1]
+    pair = store.pair_for_ticket(t.id)
+    if pair is not None:
+        raise LookupError(
+            _ambiguous(repo, n, [store.get_ticket(pair.ticket_a), store.get_ticket(pair.ticket_b)])
+        )
     return t
+
+
+def _resolve_side(store: Store, repo: str, n: int, side: str) -> Ticket:
+    """``owner/repo#n:a|b``: that pair side's open ticket, else its latest."""
+    tickets = [t for t in store.tickets_for_issue(repo, n) if t.pair_side == side]
+    if not tickets:
+        raise LookupError(
+            f"{repo}#{n} has no ab:pair side {side.upper()}; use {repo}#{n} or a ticket id"
+        )
+    open_side = [t for t in tickets if t.column in OPEN_COLUMNS]
+    return (open_side or tickets)[-1]
+
+
+def _ambiguous(repo: str, n: int, sides: Sequence[Ticket]) -> str:
+    """The refusal for ``owner/repo#n`` naming an ab:pair: both ids, and how to pick."""
+    named = ", ".join(f"side {(t.pair_side or 'a').upper()} = ticket {t.id}" for t in sides)
+    return (
+        f"{repo}#{n} is an ab:pair ({named}); name one side: a ticket id "
+        f"(`fman retry {sides[0].id}`) or {repo}#{n}:a / {repo}#{n}:b"
+    )
 
 
 def _refusal(store: Store, config: Any, t: Ticket, api: Any, spend: Spend | None) -> str | None:
@@ -404,6 +451,13 @@ def _refusal(store: Store, config: Any, t: Ticket, api: Any, spend: Spend | None
     if t.column == "done":
         return f"ticket {t.id} is merged; nothing to retry"
     if t.column == "dropped":
+        pair = store.pair_for_ticket(t.id)
+        if pair is not None:  # #16: its sibling is never touched, nor the pair revived
+            return (
+                f"ticket {t.id} was side {(t.pair_side or 'a').upper()} of an ab:pair that is "
+                f"over (ticket {pair.other(t.id)} was the other side); remove the `agent` "
+                "label and add it again to start over"
+            )
         other = store.find_open_ticket(t.repo, t.issue_number)
         if other is not None:
             return f"{t.repo}#{t.issue_number} already has an open ticket ({other.id}); retry that"

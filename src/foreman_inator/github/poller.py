@@ -106,6 +106,38 @@ Edge cases (decisions, todo #11)
   actor-checked (merging needs write access; an issue's author may withdraw it).
 * ``tier:N`` (N in 1–3) by an allowed user: the newest one wins; removing it does not
   re-route.
+
+Head-to-head pairs (#34, ``ab:pair``, GH #16)
+---------------------------------------------
+Each side of a pair is its own ticket, so an issue can have two open tickets
+(``store.open_tickets_for_issue``, side A first). ``ab:pair`` counts only if an allowed
+user applied it (7b, the same ``_applied_labels`` path as ``agent``); cursor
+``pair:<n>`` = the ``ab:pair`` labeled-event id already handled.
+
+* ``agent`` + ``ab:pair`` → ``TicketRequested(pair=True)``. A label still on from an
+  earlier ticket counts too (like ``tier:N``).
+* ``ab:pair`` added later to an issue whose open ticket has no pair → ``PairRequested``
+  (open tickets are never ``done``, so "until side A is done" holds).
+* ``ab:pair`` re-added (a new labeled event) while the open ticket is already in a pair
+  of any status → ``PairReapplied`` (defined here, once per labeled event). A ticket can
+  be in only one pair ever, so it changes nothing; the worker answers it with one
+  comment. ``lifecycle.apply`` has no transition for it (the worker must handle it
+  before ``apply``; unwired, it is logged as an ignored event and acked).
+* ``ab:pair`` removed by an allowed user while the pair is running → ``PairRemoved``
+  for the open side B (an undecided side B; a decided pair has no open side B), only
+  while side A is still open: once A was rejected/dropped, B just continues alone.
+* Both open sides' PRs are read in the same poll, before the issue state, so the
+  "Closes #n" issue close can't pre-empt the pick: a merged side → ``Merged(paired=True)``
+  and ``PairLost`` for each unmerged open sibling. A sibling already ``done`` in the store
+  (its ``Merged`` handled, this side's ``PairLost`` not yet) → ``PairLost`` again.
+* One side's PR closed unmerged → ``ClosedUnmerged(what="pr", paired=True)`` for that
+  side only; the other goes on (decision 4). Issue closed or ``agent`` removed → one
+  ``ClosedUnmerged(what="issue")`` / ``AgentLabelRemoved`` per open side, ``paired=True``.
+* The other per-ticket events (``IssueEdited``, ``TierOverride``, clarify, reviews, CI,
+  conflicts) are derived per open side with the issue's events read once.
+* A ticket whose pair was dropped is polled exactly as an unpaired ticket.
+Requests for a paired issue: ``+1`` ``get_pr`` per open side with a PR (plus the usual
+per-side review/CI reads); ``list_issue_events`` once per changed issue.
 """
 
 from __future__ import annotations
@@ -119,7 +151,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from foreman_inator.config import Config
-from foreman_inator.db.store import OPEN_COLUMNS, Attempt, Store, Ticket
+from foreman_inator.db.store import OPEN_COLUMNS, Attempt, Pair, Store, Ticket
 from foreman_inator.github.app_auth import GitHubError
 from foreman_inator.github.client import (
     GitHubAPI,
@@ -140,6 +172,9 @@ from foreman_inator.tickets.lifecycle import (
     LineComment,
     Merged,
     NeedsInfoAnswered,
+    PairLost,
+    PairRemoved,
+    PairRequested,
     ReviewSubmitted,
     TicketRequested,
     TierOverride,
@@ -150,6 +185,7 @@ from foreman_inator.tickets.lifecycle import (
 )
 
 AGENT_LABEL = "agent"
+PAIR_LABEL = "ab:pair"
 REVIEW_SKIP_LABEL = "review:skip"
 ISSUES_CURSOR = "issues_since"
 DEFAULT_OVERLAP = timedelta(seconds=60)
@@ -181,6 +217,24 @@ def review_cursor(pr_number: int) -> str:
 
 def conflict_cursor(pr_number: int) -> str:
     return f"conflict:{pr_number}"
+
+
+def pair_cursor(issue_number: int) -> str:
+    """#34: the ``ab:pair`` labeled-event id already handled for this issue."""
+    return f"pair:{issue_number}"
+
+
+@dataclass(frozen=True)
+class PairReapplied(GitHubEvent):
+    """#34: ``ab:pair`` applied again (a new labeled event, by an allowed user) while the
+    issue's open ticket ``ticket_id`` is already in pair ``pair_id`` (any status). A
+    ticket can be in only one pair ever, so this is a no-op the worker answers with one
+    comment. Not a lifecycle event: ``lifecycle.apply`` raises on it."""
+
+    ticket_id: int
+    pair_id: int
+    labeled_by: str
+    label_event_id: int
 
 
 @dataclass
@@ -232,12 +286,15 @@ class Poller:
         ci: bool = False,
         conflicts: bool = False,
         clock: Callable[[], datetime] | None = None,
+        pair_label: str = PAIR_LABEL,
     ) -> None:
         self.api = api
         self.store = store
         self.config = config
         self.repos = tuple(repos if repos is not None else config.repos)
         self.agent_label = agent_label
+        #: #34: the head-to-head label (counts only when an allowed user applied it).
+        self.pair_label = pair_label
         self.overlap = overlap
         #: #41: read GitHub CI for tickets waiting on it (off until the worker wires it).
         self.ci = ci
@@ -298,9 +355,9 @@ class Poller:
     # ------------------------------------------------------------------ per repo
 
     def _poll_repo(self, api: Any, repo: str, out: list[GitHubEvent]) -> str | None:
-        open_tickets = {
-            t.issue_number: t for t in self.store.list_tickets(column=OPEN_COLUMNS, repo=repo)
-        }
+        # #34: an issue with an ab:pair has two open tickets (side A first).
+        numbers = {t.issue_number for t in self.store.list_tickets(column=OPEN_COLUMNS, repo=repo)}
+        open_tickets = {n: self.store.open_tickets_for_issue(repo, n) for n in sorted(numbers)}
         newest, seen = _load_cursor(self.store.get_cursor(repo, ISSUES_CURSOR))
         if newest is None:
             issues: list[Issue] = list(api.list_issues(repo, label=self.agent_label))
@@ -321,7 +378,7 @@ class Poller:
             if number not in open_tickets:
                 self._maybe_request(api, repo, changed[number], out)
         for number in sorted(open_tickets):
-            self._ticket_events(api, repo, open_tickets[number], changed.get(number), out)
+            self._issue_events(api, repo, open_tickets[number], changed.get(number), out)
         if newest is None:
             return None
         window = {
@@ -345,6 +402,9 @@ class Poller:
         tier = self._tier(applied)
         if tier is not None:
             cursors.append((tier_cursor(issue.number), str(tier[1].id)))
+        pair_ev = self._pair_ev(applied)
+        if pair_ev is not None:
+            cursors.append((pair_cursor(issue.number), str(pair_ev.id)))
         skip_ev = applied.get(REVIEW_SKIP_LABEL)
         out.append(
             TicketRequested(
@@ -356,13 +416,39 @@ class Poller:
                 label_event_id=label_ev.id,
                 tier_override=tier[0] if tier else None,
                 review_skip=skip_ev is not None and self._allowed(skip_ev.actor),
+                pair=pair_ev is not None,
                 cursors=tuple(cursors),
             )
         )
 
-    def _ticket_events(
-        self, api: Any, repo: str, t: Ticket, issue: Issue | None, out: list[GitHubEvent]
+    def _issue_events(
+        self,
+        api: Any,
+        repo: str,
+        tickets: list[Ticket],
+        issue: Issue | None,
+        out: list[GitHubEvent],
     ) -> None:
+        """Events for one issue's open tickets: one ticket, or the open sides of a pair."""
+        pairs = [self.store.pair_for_ticket(t.id) for t in tickets]
+        live = next((p for p in pairs if p is not None and p.status != "dropped"), None)
+        if live is not None:
+            self._pair_events(api, repo, tickets, live, issue, out)
+            return
+        for t, pair in zip(tickets, pairs, strict=True):
+            self._ticket_events(api, repo, t, issue, out, pair=pair)
+
+    def _ticket_events(
+        self,
+        api: Any,
+        repo: str,
+        t: Ticket,
+        issue: Issue | None,
+        out: list[GitHubEvent],
+        *,
+        pair: Pair | None = None,
+    ) -> None:
+        """An unpaired ticket (or one whose pair was dropped)."""
         n = t.issue_number
         pr = api.get_pr(repo, t.pr_number) if t.pr_number else None
         if pr is not None and pr.merged:
@@ -375,6 +461,7 @@ class Poller:
             out.append(ClosedUnmerged(repo, n, ticket_id=t.id, pr_number=pr.number, what="pr"))
             return
         events: list[IssueEvent] | None = None
+        applied: dict[str, IssueEvent] = {}
         if issue is not None:
             events = api.list_issue_events(repo, n)
             if not _has(issue.labels, self.agent_label):
@@ -382,9 +469,169 @@ class Poller:
                 if self._allowed(remover):
                     out.append(AgentLabelRemoved(repo, n, ticket_id=t.id, removed_by=remover or ""))
                     return
+            applied = _applied_labels(events, issue.labels)
+        self._side_events(api, repo, t, pr, issue, events, applied, out)
+        self._pair_label_added(repo, t, pair, applied, out)
+
+    def _pair_label_added(
+        self,
+        repo: str,
+        t: Ticket,
+        pair: Pair | None,
+        applied: dict[str, IssueEvent],
+        out: list[GitHubEvent],
+    ) -> None:
+        """#34: a new ``ab:pair`` labeling → PairRequested (no pair yet) or PairReapplied."""
+        n = t.issue_number
+        ev = self._pair_ev(applied)
+        if ev is None or self.store.get_cursor(repo, pair_cursor(n)) == str(ev.id):
+            return
+        cursors = ((pair_cursor(n), str(ev.id)),)
+        if pair is None:
+            out.append(
+                PairRequested(
+                    repo,
+                    n,
+                    ticket_id=t.id,
+                    labeled_by=ev.actor or "",
+                    label_event_id=ev.id,
+                    cursors=cursors,
+                )
+            )
+        else:
+            out.append(
+                PairReapplied(
+                    repo,
+                    n,
+                    ticket_id=t.id,
+                    pair_id=pair.id,
+                    labeled_by=ev.actor or "",
+                    label_event_id=ev.id,
+                    cursors=cursors,
+                )
+            )
+
+    def _pair_events(
+        self,
+        api: Any,
+        repo: str,
+        sides: list[Ticket],
+        pair: Pair,
+        issue: Issue | None,
+        out: list[GitHubEvent],
+    ) -> None:
+        """#34: the open sides of a running (or just decided) pair, both PRs read first."""
+        n = pair.issue_number
+        prs = {t.id: (api.get_pr(repo, t.pr_number) if t.pr_number else None) for t in sides}
+        merged = [t for t in sides if (pr := prs[t.id]) is not None and pr.merged]
+        winner: Ticket | None = merged[0] if merged else None
+        if winner is None:  # the sibling's Merged was handled, this side's PairLost not yet
+            open_ids = {t.id for t in sides}
+            for tid in (pair.ticket_a, pair.ticket_b):
+                if tid not in open_ids and (other := self.store.get_ticket(tid)).column == "done":
+                    winner = other
+        if winner is not None:
+            for t in merged:
+                pr = prs[t.id]
+                assert pr is not None
+                out.append(
+                    Merged(
+                        repo,
+                        n,
+                        ticket_id=t.id,
+                        pr_number=pr.number,
+                        merged_at=pr.merged_at,
+                        paired=True,
+                    )
+                )
+            for t in sides:
+                if t not in merged:
+                    out.append(
+                        PairLost(
+                            repo,
+                            n,
+                            ticket_id=t.id,
+                            sibling_ticket_id=winner.id,
+                            sibling_pr_number=winner.pr_number or 0,
+                            pr_number=t.pr_number,
+                        )
+                    )
+            return
+        if issue is not None and issue.state == "closed":
+            for t in sides:
+                out.append(
+                    ClosedUnmerged(
+                        repo, n, ticket_id=t.id, pr_number=t.pr_number, what="issue", paired=True
+                    )
+                )
+            return
+        live: list[Ticket] = []
+        for t in sides:
+            pr = prs[t.id]
+            if pr is not None and pr.state == "closed":  # decision 4: this side only
+                out.append(
+                    ClosedUnmerged(
+                        repo, n, ticket_id=t.id, pr_number=pr.number, what="pr", paired=True
+                    )
+                )
+            else:
+                live.append(t)
+        if not live:
+            return
+        events: list[IssueEvent] | None = None
+        applied: dict[str, IssueEvent] = {}
+        if issue is not None:
+            events = api.list_issue_events(repo, n)
+            if not _has(issue.labels, self.agent_label):
+                remover = _last_unlabel_actor(events, self.agent_label)
+                if self._allowed(remover):
+                    for t in live:
+                        out.append(
+                            AgentLabelRemoved(
+                                repo, n, ticket_id=t.id, removed_by=remover or "", paired=True
+                            )
+                        )
+                    return
+            a_open = any(t.id == pair.ticket_a for t in live)
+            if pair.status == "running" and a_open and not _has(issue.labels, self.pair_label):
+                # Side A already rejected/dropped: B is the only side left, so it just
+                # carries on as a normal ticket (dropping it would orphan the issue).
+                remover = _last_unlabel_actor(events, self.pair_label)
+                if self._allowed(remover):
+                    for t in [t for t in live if t.pair_side == "b"]:
+                        out.append(
+                            PairRemoved(
+                                repo,
+                                n,
+                                ticket_id=t.id,
+                                removed_by=remover or "",
+                                pr_number=t.pr_number,
+                            )
+                        )
+                        live.remove(t)
+            applied = _applied_labels(events, issue.labels)
+        for t in live:
+            self._side_events(api, repo, t, prs[t.id], issue, events, applied, out)
+        if live:
+            self._pair_label_added(repo, live[0], pair, applied, out)
+
+    def _side_events(
+        self,
+        api: Any,
+        repo: str,
+        t: Ticket,
+        pr: PullRequest | None,
+        issue: Issue | None,
+        events: list[IssueEvent] | None,
+        applied: dict[str, IssueEvent],
+        out: list[GitHubEvent],
+    ) -> None:
+        """The per-ticket events of a ticket that is still open after this poll."""
+        n = t.issue_number
+        if issue is not None:
             if (issue.title, issue.body) != (t.title, t.request):
                 out.append(IssueEdited(repo, n, ticket_id=t.id, title=issue.title, body=issue.body))
-            tier = self._tier(_applied_labels(events, issue.labels))
+            tier = self._tier(applied)
             if tier is not None and self.store.get_cursor(repo, tier_cursor(n)) != str(tier[1].id):
                 out.append(
                     TierOverride(
@@ -599,6 +846,12 @@ class Poller:
         """Invariant 7b: an allowed user, and never the App's own bot."""
         return login is not None and login != self._bot and self.config.is_allowed_user(login)
 
+    def _pair_ev(self, applied: dict[str, IssueEvent]) -> IssueEvent | None:
+        """#34 (7b): the event that applied ``ab:pair``, if it is on and an allowed user
+        applied it."""
+        ev = applied.get(self.pair_label.lower())
+        return ev if ev is not None and self._allowed(ev.actor) else None
+
     def _tier(self, applied: dict[str, IssueEvent]) -> tuple[int, IssueEvent] | None:
         best: tuple[int, IssueEvent] | None = None
         for name, ev in applied.items():
@@ -672,11 +925,14 @@ __all__ = [
     "CI_PERMISSION_WARNING",
     "DEFAULT_OVERLAP",
     "ISSUES_CURSOR",
+    "PAIR_LABEL",
     "REVIEW_SKIP_LABEL",
+    "PairReapplied",
     "PollResult",
     "Poller",
     "agent_cursor",
     "conflict_cursor",
+    "pair_cursor",
     "review_cursor",
     "tier_cursor",
 ]
