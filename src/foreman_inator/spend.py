@@ -235,7 +235,12 @@ class Refusal:
         """For cap ``attempt``: what the attempt used against which limit."""
         if self.token_limit is not None:
             return f"sent {self.tokens_in or 0:,} input tokens of {self.token_limit:,}"
-        return f"spent ${self.spent_usd:.2f} of ${self.cap_usd:.2f}"
+        # The check runs before the call, so say what the refused call would have added.
+        ahead = self.reserved_usd + self.estimate_usd
+        return (
+            f"spent ${self.spent_usd:.2f} of ${self.cap_usd:.2f} "
+            f"(next call estimated at ${ahead:.2f})"
+        )
 
     @property
     def flag_reason(self) -> str:

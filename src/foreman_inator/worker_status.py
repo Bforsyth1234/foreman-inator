@@ -44,7 +44,11 @@ _TITLES = {
 TITLE_WIDTH = 40
 
 
-def _attempt_text(attempts: Sequence[Attempt], budget_usd: float | None = None) -> str:
+def _attempt_text(
+    attempts: Sequence[Attempt],
+    budget_usd: float | None = None,
+    plan_models: frozenset[str] = frozenset(),
+) -> str:
     if not attempts:
         return "not started"
     a = attempts[-1]
@@ -55,7 +59,9 @@ def _attempt_text(attempts: Sequence[Attempt], budget_usd: float | None = None) 
     else:
         state = a.outcome.replace("_", " ")
     cost = f", ${a.cost_usd:.2f}" if a.cost_usd else ""
-    if cost and budget_usd is not None:  # #58: the attempt's spend against its budget
+    # #58: the attempt's spend against its budget. A flat-fee plan model's calls skip the
+    # USD budget (their cost is list price only), so no "of $budget" for them.
+    if cost and budget_usd is not None and a.model not in plan_models:
         cost += f" of ${budget_usd:.2f}"
     return f"attempt {len(attempts)} ({a.trigger}, {a.model}, tier {a.tier}{cost}): {state}"
 
@@ -68,13 +74,14 @@ def _line(
     budget_usd: float | None = None,
     open_pr_cap: int | None = None,
     chat_waits: dict[int, tuple[int, ...]] | None = None,
+    plan_models: frozenset[str] = frozenset(),
 ) -> str:
     title = " ".join(t.title.split())
     if len(title) > TITLE_WIDTH:
         title = title[: TITLE_WIDTH - 1] + "…"
     parts = [
         f"  #{t.id:<4} {t.repo}#{t.issue_number:<5} {title:<{TITLE_WIDTH}}",
-        _attempt_text(attempts, budget_usd),
+        _attempt_text(attempts, budget_usd, plan_models),
     ]
     if t.pr_number is not None:
         parts.append(f"PR #{t.pr_number}")
@@ -164,6 +171,8 @@ def render_status(
     waits = {w.ticket_id: w.blockers for w in waiters}  # () when only a chat holds the files
     chat_waits = {w.ticket_id: w.chats for w in waiters if w.chats}
     budget = config.attempt_budget_usd if config is not None else None
+    models = config.models if config is not None else ()
+    plans = frozenset(m.name for m in models if m.plan_usd_month is not None)
     cap = int(config.max_open_prs_per_repo) if config is not None else None
     by_col: dict[str, list[Ticket]] = {c: [] for c in COLUMNS}
     for t in tickets:
@@ -179,7 +188,7 @@ def render_status(
             header += f", latest {len(shown)}"
         out.append(header)
         out.extend(
-            _line(t, store.list_attempts(t.id), waits, store, budget, cap, chat_waits)
+            _line(t, store.list_attempts(t.id), waits, store, budget, cap, chat_waits, plans)
             for t in shown
         )
         if not items:
