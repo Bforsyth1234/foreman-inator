@@ -305,6 +305,7 @@ The worker is the only piece that runs code. It authenticates as the GitHub App,
 | PR review: Request changes | Kickback: comment becomes the note, `kickback:<tag>` label gives the tag; new attempt |
 | PR review: Approve, then merge | Accept: record outcome, close issue, post summary comment |
 | Issue closed without merge | Drop the ticket |
+| `ab:pair` label (by an allowed user) with or after `agent` | Open side B: a second ticket and PR on another model; merging one closes the other |
 
 The PR stays a draft through AI review. Only a reviewer-approved PR (or one handed over after the loop cap) is marked ready for review, which is what notifies you.
 
@@ -361,6 +362,30 @@ as a ticket. It lives in the process that shows it, never in the worker. Design 
 
 Chat sessions lock the files they edit (tickets wait; released on `/pr`, `/discard` or the end
 of the session); one session is open at a time (`chat_max_sessions = 1`).
+
+## Head-to-head pairs (ab:pair)
+
+`ab:pair` makes an issue two sibling tickets linked by a `pairs` row: side A is the
+normal ticket, side B copies A's route and runs an opponent on its first attempt (the
+running writer experiment's challenger when it fits A's tier, else the next rung up,
+else the rung below), then each side escalates, is reviewed and spends on its own.
+Design: todo #34 / GH #16. How each invariant holds:
+
+- **7a Nothing merges without the user.** The worker never merges either PR. You pick by
+  merging one; only then does the worker close the other PR, and it closes and deletes
+  only its own `fman/` PR and branch (the client refuses any head outside `fman/`).
+- **7b Only allowed users start work.** `ab:pair` counts only when an allowed user applied
+  it, like `agent`; the bot's own labels never count. Re-adding it to a ticket that was
+  already paired starts nothing (one comment).
+- **7c Local by default.** A local-only repo pairs only local models; with no second local
+  model there is no pair. A challenger opponent never sends a local ticket's code to the
+  cloud. Both sides count toward the spend caps; thrifty approvals are per side.
+- **7d Secrets never in the repo.** Unchanged: both sides run behind the same proxy.
+- **7e No silent loops.** Each side has its own retry, escalation, kickback and rebase caps;
+  side B is dropped (not run alone) when side A proposes a split.
+- **7f The reviewer is independent.** Each side gets its own AI review by a model of another
+  family than its writer, and never sees the other side's diff.
+- **7g Model-written code runs sandboxed.** Both sides run under the same sandbox policies.
 
 ## Open source and distribution
 

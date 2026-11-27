@@ -83,6 +83,22 @@ PAIR_ONCE_TEXT = (
     "remove the `agent` label and add it again together with `ab:pair`."
 )
 
+#: #16: the one comment when ``ab:pair`` is re-added to an issue whose ticket already had
+#: a pair (``poller.PairReapplied``).
+PAIR_REAPPLIED_TEXT = (
+    "`ab:pair`: this issue already had a pair; re-adding `ab:pair` starts nothing."
+)
+#: #16: the one comment when ``ab:pair`` is applied while ``pair_enabled = false``.
+PAIR_DISABLED_TEXT = (
+    "`ab:pair` is turned off on this worker (`pair_enabled = false` in config.toml), so the "
+    "label is ignored and the issue runs as a single ticket."
+)
+#: #16: side B is dropped (never run alone) when side A is flagged ``split_proposed``.
+PAIR_SPLIT_TEXT = (
+    "`ab:pair`: side A proposed splitting this issue, so side B was dropped instead of "
+    "running alone. Label the sub-issues you create with `ab:pair` to pair them."
+)
+
 
 @dataclass
 class Ctx:
@@ -186,6 +202,7 @@ class ActionHandlers:
         log.info("ticket %d: PR #%d %s (draft until reviewed)", t.id, res.pr.number, res.action)
         if res.action == "created":
             self.status_update(ctx.ticket, "pr_opened", pr_number=res.pr.number)  # type: ignore[attr-defined]  # #77
+            self._pair_line_on_sibling(ctx.ticket)  # #16: A's body names B's new PR
         if res.action in ("closed", "merged"):
             ctx.stop = True  # a person closed or merged it; the poller reports that next
 
@@ -427,16 +444,8 @@ class ActionHandlers:
                 self.post_once(a, "pair_once", PAIR_ONCE_TEXT, name="pair_refused")
             log.info("ticket %d: already in pair #%d (%s)", a.id, existing.id, existing.status)
             return
-        local_only = not self.store.repo_allows_cloud(a.repo)
-        ladder = esc.build_ladder(self.config.models)
         start_tier = getattr(self, "start_tier", lambda _t: None)(a)
-        want = start_tier if start_tier is not None else a.routed_tier
-        start = pair_start_rung(ladder, want, local_only=local_only)
-        opp = None
-        if start is not None:
-            opp = pair_mod.choose_opponent(
-                ladder, start, experiment=split.active_split(self.store), local_only=local_only
-            )
+        opp, exp_id = self.choose_pair_opponent(a)
         if opp is None:
             self.post_once(a, "pair_no_opponent", PAIR_NO_OPPONENT_TEXT, name="pair_no_opponent")
             log.info("ticket %d: ab:pair found no second model; single ticket", a.id)
@@ -452,7 +461,8 @@ class ActionHandlers:
                 routed_tier=a.routed_tier if routed else None, route_reason=reason,
                 pair_side="b",
             )  # fmt: skip
-            pair = self.store.create_pair(ticket_a=a.id, ticket_b=b.id, **pair_mod.create_args(opp))
+            args = {**pair_mod.create_args(opp), "experiment_id": exp_id}
+            pair = self.store.create_pair(ticket_a=a.id, ticket_b=b.id, **args)
             if start_tier is not None:  # #51: the same profile-shifted start as side A
                 from foreman_inator.worker_route import start_cursor
 
@@ -462,6 +472,55 @@ class ActionHandlers:
             "ticket %d: ab:pair side B is ticket %d (pair #%d, opponent %s, %s)",
             a.id, b.id, pair.id, opp.label, opp.reason,
         )  # fmt: skip
+
+    def choose_pair_opponent(self, a: Ticket) -> tuple[Any, int | None]:
+        """Side B's opponent for side A ``a`` from A's start rung (its profile-shifted
+        ``start:`` cursor, else its routed tier, else the lowest rung while A is not
+        routed), and the ``mode='pair'`` experiment it counts toward
+        (``worker_experiments.ensure_pair``; None for a rung opponent). ``(None, None)``:
+        no second model."""
+        from foreman_inator.experiments import variants
+        from foreman_inator.worker_experiments import ensure_pair
+
+        local_only = not self.store.repo_allows_cloud(a.repo)
+        ladder = esc.build_ladder(self.config.models)
+        start_tier = getattr(self, "start_tier", lambda _t: None)(a)
+        want = start_tier if start_tier is not None else a.routed_tier
+        start = pair_start_rung(ladder, want, local_only=local_only)
+        if start is None:
+            return None, None
+        opp = pair_mod.choose_opponent(
+            ladder, start, experiment=split.active_split(self.store), local_only=local_only
+        )
+        if opp is None:
+            return None, None
+        champ = variants.champion(self.store, "writer")
+        exp = ensure_pair(self.store, opp, champion=champ.id) if champ is not None else None
+        return opp, (exp.id if exp is not None else None)
+
+    def refresh_pair_opponent(self, b: Ticket) -> None:
+        """#16 (wave 24): once side A is routed, choose side B's opponent again from A's
+        real start rung and store it on the running pair row, before B's first attempt
+        (``CREATE_PAIR_SIDE`` may have run before A was routed)."""
+        pair = self.store.pair_for_ticket(b.id)
+        if pair is None or pair.status != "running" or self.store.list_attempts(b.id):
+            return
+        opp, exp_id = self.choose_pair_opponent(self.store.get_ticket(pair.ticket_a))
+        if opp is None:
+            return  # keep the opponent chosen at creation
+        args = pair_mod.create_args(opp)
+        if (pair.opponent_variant, pair.opponent_reason, pair.experiment_id) == (
+            args["opponent_variant"], args["opponent_reason"], exp_id,
+        ):  # fmt: skip
+            return
+        self.store.set_pair_opponent(
+            pair.id,
+            opponent_variant=args["opponent_variant"],
+            opponent_reason=args["opponent_reason"],
+            experiment_id=exp_id,
+        )
+        log.info("ticket %d: pair #%d opponent is %s (%s), from side A's route",
+                 b.id, pair.id, opp.label, opp.reason)  # fmt: skip
 
     def _a_close_own_pr(self, ctx: Ctx) -> None:
         """Close the event's own side's PR (never the sibling's). ``close_pr`` refuses a
@@ -521,6 +580,10 @@ class ActionHandlers:
             )
         elif op is not None:
             self.store.drop_pair(pair.id)
+        if op is not None and op.kind == "decide" and pair.experiment_id is not None:
+            from foreman_inator.worker_experiments import refresh_pair_note
+
+            refresh_pair_note(self.store, pair.experiment_id)  # W-L and cost per win
         if result.flag_reason:
             self.store.flag_ticket(t.id, result.flag_reason)
         ctx.ticket = self.store.get_ticket(t.id)
@@ -529,6 +592,27 @@ class ActionHandlers:
             t.id, pair.id, t.pair_side, result.outcome,
             f"{op.kind} winner {op.winner_ticket_id}" if op else "nothing stored",
         )  # fmt: skip
+
+    def _pair_line_on_sibling(self, t: Ticket) -> None:
+        """#16 (wave 24): this side's PR just opened: the other side's open PR body gets
+        the head-to-head line now (``Publisher.add_pair_line``), not on its next publish."""
+        pair = self.store.pair_for_ticket(t.id)
+        if pair is None or pair.status != "running":
+            return
+        sibling = self.store.get_ticket(pair.other(t.id))
+        add = getattr(self.publisher, "add_pair_line", None)
+        if sibling.pr_number is None or add is None:
+            return
+
+        def update() -> None:
+            try:
+                if add(sibling) is not None:
+                    log.info("ticket %d: PR #%d names PR #%s (ab:pair)",
+                             sibling.id, sibling.pr_number, t.pr_number)  # fmt: skip
+            except Exception as exc:  # the next full publish renders the line anyway
+                log.warning("ticket %d: pair line not added: %s", sibling.id, exc)
+
+        self._gh(sibling, "pair_line", update, pr_number=sibling.pr_number)  # type: ignore[attr-defined]
 
     # ------------------------------------------------------------------ helpers
 
@@ -721,8 +805,11 @@ __all__ = [
     "ActionHandlers",
     "Ctx",
     "HandedToUser",
+    "PAIR_DISABLED_TEXT",
     "PAIR_NO_OPPONENT_TEXT",
     "PAIR_ONCE_TEXT",
+    "PAIR_REAPPLIED_TEXT",
+    "PAIR_SPLIT_TEXT",
     "flag_comment",
     "pair_start_rung",
     "reviewer_reason",

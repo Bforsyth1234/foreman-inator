@@ -125,10 +125,11 @@ from typing import TYPE_CHECKING, Any
 from foreman_inator import routing
 from foreman_inator.db.store import Ticket
 from foreman_inator.github.app_auth import GitHubNotFound
+from foreman_inator.locks import flag_kind
 from foreman_inator.routing import classifier, explore, knn
 from foreman_inator.routing import profile as prof
 from foreman_inator.routing.escalation import DEFAULT_LIMITS, Limits, with_cloud
-from foreman_inator.tickets import clarify, decompose
+from foreman_inator.tickets import clarify, decompose, lifecycle
 from foreman_inator.tickets.lifecycle import clarify_cursor, clarify_qa_cursor
 
 if TYPE_CHECKING:
@@ -335,6 +336,8 @@ class RouteSteps:
         Returns B unchanged (``routed_tier`` None) while A is not routed, or when B has no
         pair row; a route B already has is kept."""
         a = self.store.sibling(t.id)
+        if a is not None and flag_kind(a.flag_reason) == decompose.FLAG_SPLIT_PROPOSED:
+            return self._drop_side_b_split(t)
         if a is None or a.routed_tier is None:
             log.debug("ticket %d: pair side B waits for side A's route", t.id)
             return t
@@ -348,10 +351,25 @@ class RouteSteps:
                 value = self.store.get_cursor(a.repo, name(a.id))
                 if value is not None:
                     self.store.set_cursor(t.repo, value, name(t.id))
+            # #16 (wave 24): A is routed now: B's opponent is chosen from A's real start
+            # rung, in the same transaction, before B's first attempt.
+            self.refresh_pair_opponent(cur)  # type: ignore[attr-defined]
         log.info(
             "ticket %d: pair side B copies ticket %d's route (tier %d)", t.id, a.id, a.routed_tier
         )
         return cur
+
+    def _drop_side_b_split(self, t: Ticket) -> Ticket:
+        """#16 (wave 24): side A proposed a split (flagged ``split_proposed``), so side B
+        is dropped with one note instead of running alone at tier 3."""
+        from foreman_inator.worker_actions import PAIR_SPLIT_TEXT
+
+        log.info("ticket %d: side A proposed a split; pair side B dropped", t.id)
+        ev = lifecycle.PairRemoved(t.repo, t.issue_number, ticket_id=t.id, removed_by="split")
+        self._event(t.id, ev)  # type: ignore[attr-defined]
+        b = self.store.get_ticket(t.id)
+        self.post_once(b, "pair_split", PAIR_SPLIT_TEXT, name="pair_split")  # type: ignore[attr-defined]
+        return b
 
     # ------------------------------------------------------------------ split (#50)
 

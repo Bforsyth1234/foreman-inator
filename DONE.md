@@ -938,3 +938,17 @@ Deviations: the migration is 015 (`015_approval_attempt.sql`), not 013: 012 chat
 Live (user): approve a ticket, `launchctl kickstart -k` the worker mid-attempt; the next attempt runs on the same approval and `fman status` shows what is left.
 
 Runner at close (wave 21): the design's wave C4 (wiring) was folded into this wave, so there is no wave 22; see the wave 21 row in todo.md. Cross-slot fixes: none needed (the merged branch was green before wiring).
+
+## Wave 23 (2026-11-26)
+
+#34 — Head-to-head (`ab:pair`) writer experiments [~] live · Added: 2026-11-23 · Source: spec · GH #16
+Wave: 22 (building blocks), 23 (poller, actions, route, status, results, retry), wave 24 wiring folded into 23 · Done: 2026-11-26 · Commit/PR: branch `wave-23`
+- ✅ Wave 22: `pairs` table and `tickets.pair_side` (migration 016), side-B branch/worktree names (`fman/issue-<n>-b/a<k>`), `close_pr` / `delete_branch` (`fman/` only), `experiments/pair.py` (opponent, first-attempt pin, W-L score), pair lifecycle events and actions, pair sides as one lock holder.
+- ✅ Wave 23 slots: pair-aware poller (`ab:pair` by an allowed user, `PairRequested` / `PairRemoved` / `PairLost` / `PairReapplied`, both PRs read together); pair action handlers; side B copies A's route and runs its opponent on its own branch; status, activity, issue comment and summary pair lines; pair results in metrics, experiments, promote and export; `fman retry owner/repo#n:a|b`; per-side worktree sweep.
+- ✅ Wiring (wave 24, folded in): `Worker.actions` maps `CREATE_PAIR_SIDE`, `CLOSE_OWN_PR`, `DELETE_OWN_BRANCH`, `RECORD_PAIR_RESULT`; `_handle_event` answers `PairReapplied` with one comment before `lifecycle.apply`; config `pair_enabled` (default true; false ignores the label with one comment); side B's opponent is chosen again once side A is routed (`worker_route._copy_pair_route` → `refresh_pair_opponent` → `store.set_pair_opponent`), before B's first attempt; `worker_experiments.ensure_pair` gives `create_pair` the pair experiment id (not the split's) and `refresh_pair_note` runs after `decide_pair`; `worker_rebase` passes `side=` to `replay_onto_base`; `worker_attempt._start_point` uses the side-aware `pr_head_branch`; side A flagged `split_proposed` drops side B with a note; side A's PR body gets the head-to-head line when side B's PR opens (`Publisher.add_pair_line`); `fman retry` help; `/metrics` head-to-head card (escaped).
+- ✅ Docs: commands (`ab:pair` label, `retry :a/:b`), how-it-works ("Head-to-head (ab:pair)"), configuration (`pair_enabled`), SPEC (pairs under 7a–7g, GitHub mapping row), README.
+- ✅ Tests: `tests/test_pair_e2e.py` (real Worker, fake GitHub and models: label → two tickets, two models, two PRs → merge one → the other closed, its branch deleted, pair decided, status won/lost; a stranger's `ab:pair` does nothing; closing one PR alone loses that side and the other wins on merge; removing `ab:pair` drops side B). `tests/test_pair_wiring.py`: one test per wiring point; each was checked to fail with its wiring reverted.
+Deviations: the opponent is chosen at side B's creation (to know whether a second model exists at all) and chosen again when B copies A's route; the pair row is updated only while B has no attempt.
+Live (user): label a real issue `agent` + `ab:pair`; merge one PR; the other is closed and its branch deleted.
+
+Runner at close (wave 23): wave 24 (wiring) was folded into this wave, so there is no wave 24; see the wave 23 row in todo.md. Cross-slot fixes: none needed (the merged branch was green before wiring).

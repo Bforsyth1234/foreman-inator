@@ -73,7 +73,7 @@ from foreman_inator.routing import escalation as esc
 from foreman_inator.routing import profile as prof
 from foreman_inator.runner import sandbox
 from foreman_inator.runner import verify as verify_mod
-from foreman_inator.runner.worktree import RepoMirror, Worktree, WorktreeError, branch_name
+from foreman_inator.runner.worktree import RepoMirror, Worktree, WorktreeError
 from foreman_inator.tickets import conventions as conventions_mod
 from foreman_inator.tickets import images as images_mod
 from foreman_inator.tickets import lifecycle
@@ -756,9 +756,7 @@ def _start_point(mirror: RepoMirror, ticket: Ticket, attempts: list[Attempt]) ->
         if _branch_exists(mirror, ref):
             return ref
     if ticket.pr_number is not None:
-        # #16: side B's PR head is its own first-attempt branch, never side A's.
-        head = branch_name(ticket.issue_number, 1, "b") if _side(ticket) else pr_head_branch(ticket)
-        ref = f"refs/remotes/origin/{head}"
+        ref = f"refs/remotes/origin/{pr_head_branch(ticket)}"  # #16: side-aware
         if _branch_exists(mirror, ref):
             return ref
     return None

@@ -162,6 +162,7 @@ class RebaseSteps:
                 previous=f"refs/remotes/origin/{pr_head_branch(t)}",
                 token=token,
                 fetch=False,
+                side=t.pair_side,  # #16: side B replays onto its own -b names
             )
         except WorktreeError as exc:
             self._event(  # type: ignore[attr-defined]

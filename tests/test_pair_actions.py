@@ -149,12 +149,21 @@ def test_challenger_is_the_opponent_when_it_fits(
         traffic_share=0.5,
     )  # fmt: skip
     monkeypatch.setattr(split, "active_split", lambda store: exp)
+    # wave 24: the pair counts toward a mode='pair' experiment (ensure_pair), not the split
+    from types import SimpleNamespace
+
+    from foreman_inator.experiments import variants
+
+    monkeypatch.setattr(variants, "champion", lambda store, role: SimpleNamespace(id="w-two"))
     host = Host(store, gh, mods)
     a, _ = make_pair(host, store, gh)
     pair = store.pair_for_ticket(a.id)
     assert pair is not None
-    assert (pair.opponent_variant, pair.opponent_reason, pair.experiment_id) == (
-        "w-alt", "challenger", exp.id,
+    assert (pair.opponent_variant, pair.opponent_reason) == ("w-alt", "challenger")
+    assert pair.experiment_id is not None and pair.experiment_id != exp.id
+    pexp = store.get_experiment(pair.experiment_id)
+    assert (pexp.mode, pexp.champion_variant, pexp.challenger_variant) == (
+        "pair", "w-two", "w-alt",
     )  # fmt: skip
 
 

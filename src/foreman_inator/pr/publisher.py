@@ -397,6 +397,27 @@ class Publisher:
             return None
         return self.store.get_ticket(pair.other(ticket.id)).pr_number
 
+    def add_pair_line(self, ticket: Ticket) -> PullRequest | None:
+        """#16: put the head-to-head line into ``ticket``'s open PR body now that the
+        other side's PR exists (right under ``Closes #n``), without re-rendering the
+        rest. A no-op (None) with no PR, no running pair or sibling PR, a closed PR, or a
+        body that already has the line; the next full publish renders it anyway."""
+        ticket = self.store.get_ticket(ticket.id)
+        sibling = self._sibling_pr(ticket)
+        if ticket.pr_number is None or sibling is None:
+            return None
+        pr = self.gh.get_pr(ticket.repo, ticket.pr_number)
+        line = pair_line(sibling)
+        body = pr.body or ""
+        if pr.state != "open" or line in body:
+            return None
+        closes = f"Closes #{ticket.issue_number}"
+        if closes in body:
+            new = body.replace(closes, f"{closes}\n\n{line}", 1)
+        else:
+            new = f"{line}\n\n{body}"
+        return self.gh.update_pr(ticket.repo, pr.number, body=new)
+
     def _profile_line(self, repo: str) -> str | None:
         """#51: the repo profile line, or None for the default profile."""
         from foreman_inator.routing import profile as prof

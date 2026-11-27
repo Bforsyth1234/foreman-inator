@@ -395,6 +395,9 @@ class Config:
     #: #50: propose sub-issues (one tier 3 call, posted as a comment) for an issue the
     #: router calls large, instead of working it as one ticket.
     split_large: bool = True
+    #: #16: honour the ``ab:pair`` label (two models, two PRs, you merge one). False:
+    #: the label is ignored with one comment on the issue.
+    pair_enabled: bool = True
     #: #50: whole-call bound for that one proposal call.
     split_timeout_seconds: float = 180.0
     #: #72: how the AI reviewer is picked: "configured" (``reviewer_models`` order, as
@@ -558,6 +561,8 @@ def _validate(cfg: Config) -> None:
         raise ConfigError("split_timeout_seconds must be > 0 and <= 1800")
     if not isinstance(cfg.split_large, bool):
         raise ConfigError("split_large must be true or false")
+    if not isinstance(cfg.pair_enabled, bool):
+        raise ConfigError("pair_enabled must be true or false")
     from foreman_inator.review.reviewer import REVIEWER_ORDERS
 
     if cfg.reviewer_order not in REVIEWER_ORDERS:
@@ -864,6 +869,8 @@ def from_dict(data: Mapping[str, Any]) -> Config:
         kw["clarify"] = _typed(data["clarify"], bool, "clarify")
     if "split_large" in data:
         kw["split_large"] = _typed(data["split_large"], bool, "split_large")
+    if "pair_enabled" in data:
+        kw["pair_enabled"] = _typed(data["pair_enabled"], bool, "pair_enabled")
     if "reviewer_order" in data:
         kw["reviewer_order"] = _typed(data["reviewer_order"], str, "reviewer_order")
     if "install_refill_cache" in data:
@@ -987,6 +994,7 @@ def to_dict(cfg: Config) -> dict[str, Any]:
     out["cold_load_timeout_seconds"] = cfg.cold_load_timeout_seconds
     out["max_local_inference"] = cfg.max_local_inference
     out["split_large"] = cfg.split_large
+    out["pair_enabled"] = cfg.pair_enabled
     out["split_timeout_seconds"] = cfg.split_timeout_seconds
     out["reviewer_order"] = cfg.reviewer_order
     out["install_timeout_seconds"] = cfg.install_timeout_seconds
