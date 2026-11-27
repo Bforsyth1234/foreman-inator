@@ -65,7 +65,7 @@ in the item, and put the shape you rely on behind one small adapter so a
 change touches one file.
 ============================================================ -->
 
-Next ID: #86
+Next ID: #88
 Legend: `[ ]` todo · `[~]` in progress · `[~] live` built, waiting on its live check · `[x]` done (move to DONE.md)
 
 ## Wave plan
@@ -415,6 +415,36 @@ Why: `https://github.com/user-attachments/assets/<id>` redirects to a pre-signed
 DECISIONS (assistant, 2026-11-25): allow that exact S3 host only as a redirect target from a `github.com/user-attachments/` URL, never as a starting URL found in issue text; https, no port or userinfo. The App token still goes only to `github.com`. Size, type and redirect caps unchanged, so the no-SSRF rule holds. Check GitHub's docs first and record the URL and date here (rule 12).
 Files: ⚬ EDITED: src/foreman_inator/tickets/images.py, its tests.
 Verify: fake transport `user-attachments` → 302 to the S3 host → 200 PNG is used; the same S3 URL given directly in issue text is refused; a redirect to another `*.s3.amazonaws.com` bucket is refused. Non-vacuous: remove the redirect-target allowance, first test fails. Live (user): re-run a ticket whose issue has a screenshot; no "redirect off" warning in `worker.out.log`. pytest + ruff gate (rule 8).
+Deviations:
+
+### Unscheduled (traces page, 2026-11-26)
+
+#87 — Show dates on the traces page (recorded tickets list) [ ] · Added: 2026-11-26 · Source: user (screenshot of `/traces`: rows show title, repo, column, but no date; tickets 9–11 are the same issue with no way to tell them apart) · GH #94
+Why: several runs of one issue look identical in the list; the user can't tell when each ran or which is latest without opening each.
+DECISIONS (assistant, 2026-11-26):
+1. Render-only: `Ticket.created_at` and `Ticket.done_at` already exist (`db/store.py` ~line 156); show created date on every row, done date when set. Local time, short format (e.g. `Nov 26 14:05`).
+2. Optional: same dates on the per-ticket page header and each Timeline recording.
+Files: ⚬ EDITED: src/foreman_inator/metrics/trace_view.py (`render_list` ~line 329), its tests.
+Verify:
+⚬ `render_list` with `created_at` + `done_at` set shows both; `done_at = None` shows only created.
+⚬ Non-vacuous: drop the date from the row, the test fails. pytest + ruff gate (rule 8).
+Live (user): open `/traces`; every row has a date.
+Deviations:
+
+### Unscheduled (chat, 2026-11-26)
+
+#86 — Chat echoes the user's message back as a "model" reply before the real answer [ ] · Added: 2026-11-26 · Source: user (screenshot of `/chat/<id>`: "hello" → MODEL "hello" → MODEL "Hello! How can I help you today?"; "test" → MODEL "test") · GH #93
+Why: OpenCode publishes `message.part.updated` for the text part of the *user* message too. `runner/opencode.py` `parse_event` (~line 641) turns every non-synthetic text part into a `TextEvent` without looking at which message it belongs to, and `chat.py` `_on_event` (~line 1352) emits it as model `text`. The page then opens a "model" block holding the user's own words, and the real reply follows in a second block. The same echo likely lands in the turn's recording and reloaded transcript.
+DECISIONS (assistant, 2026-11-26):
+1. Fix in the chat engine, not the page: track message roles from `MessageEvent` (`message.updated` carries `role`) per session and drop `TextEvent`s whose `message_id` belongs to a `user` message. If a part can arrive before its `message.updated`, hold it until the role is known (drop it if the role is `user`).
+2. Check the same filter in the worker's attempt path (`runner/opencode.py` consumers) so the writer's recorded transcript doesn't log the prompt as model output.
+Files: ⚬ EDITED: src/foreman_inator/chat.py, src/foreman_inator/runner/opencode.py (if the role check lives there), tests/fakes/opencode.py, tests/test_chat*.py.
+Verify:
+⚬ fake OpenCode stream emits user-message `message.updated` + its text part, then the assistant's: the page's event stream has one `user` event and one `text` reply with only the assistant's text.
+⚬ part-before-role ordering: same result.
+⚬ reloaded transcript (`GET /chat/<id>` after the turn) shows no echoed "model" block.
+⚬ Non-vacuous: remove the role filter, the first test fails. pytest + ruff gate (rule 8).
+Live (user): send "hello" in a chat session; exactly one model block appears.
 Deviations:
 
 ### Unscheduled (GLM Coding Plan quota, 2026-11-25)

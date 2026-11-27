@@ -50,7 +50,11 @@ _TITLES = {
 TITLE_WIDTH = 40
 
 
-def _attempt_text(attempts: Sequence[Attempt], budget_usd: float | None = None) -> str:
+def _attempt_text(
+    attempts: Sequence[Attempt],
+    budget_usd: float | None = None,
+    plan_models: frozenset[str] = frozenset(),
+) -> str:
     if not attempts:
         return "not started"
     a = attempts[-1]
@@ -61,7 +65,9 @@ def _attempt_text(attempts: Sequence[Attempt], budget_usd: float | None = None) 
     else:
         state = a.outcome.replace("_", " ")
     cost = f", ${a.cost_usd:.2f}" if a.cost_usd else ""
-    if cost and budget_usd is not None:  # #58: the attempt's spend against its budget
+    # #58: the attempt's spend against its budget. A flat-fee plan model's calls skip the
+    # USD budget (their cost is list price only), so no "of $budget" for them.
+    if cost and budget_usd is not None and a.model not in plan_models:
         cost += f" of ${budget_usd:.2f}"
     return f"attempt {len(attempts)} ({a.trigger}, {a.model}, tier {a.tier}{cost}): {state}"
 
@@ -76,6 +82,7 @@ def _line(
     chat_waits: dict[int, tuple[int, ...]] | None = None,
     spend: Spend | None = None,
     pairs: dict[int, Pair] | None = None,
+    plan_models: frozenset[str] = frozenset(),
 ) -> str:
     title = " ".join(t.title.split())
     if len(title) > TITLE_WIDTH:
@@ -84,7 +91,7 @@ def _line(
     pair = (pairs or {}).get(t.id)
     if pair is not None:
         parts.append(pair_tag(pair, t, attempts))
-    parts.append(_attempt_text(attempts, budget_usd))
+    parts.append(_attempt_text(attempts, budget_usd, plan_models))
     if t.pr_number is not None:
         parts.append(f"PR #{t.pr_number}")
     line = "  ".join(parts)
@@ -254,6 +261,8 @@ def render_status(
     waits = {w.ticket_id: w.blockers for w in waiters}  # () when only a chat holds the files
     chat_waits = {w.ticket_id: w.chats for w in waiters if w.chats}
     budget = config.attempt_budget_usd if config is not None else None
+    models = config.models if config is not None else ()
+    plans = frozenset(m.name for m in models if m.plan_usd_month is not None)
     cap = int(config.max_open_prs_per_repo) if config is not None else None
     spend = Spend(store, config) if config is not None else None
     pairs = pair_map(store)
@@ -271,7 +280,18 @@ def render_status(
             header += f", latest {len(shown)}"
         out.append(header)
         out.extend(
-            _line(t, store.list_attempts(t.id), waits, store, budget, cap, chat_waits, spend, pairs)
+            _line(
+                t,
+                store.list_attempts(t.id),
+                waits,
+                store,
+                budget,
+                cap,
+                chat_waits,
+                spend,
+                pairs,
+                plans,
+            )
             for t in shown
         )
         if not items:

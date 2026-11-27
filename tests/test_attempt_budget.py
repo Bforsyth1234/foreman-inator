@@ -80,6 +80,8 @@ def test_cloud_attempt_stops_at_its_dollar_budget_without_asking(store):
     stop = spend.budget_stop(aid)
     assert stop is not None and stop.cap == "attempt" and not stop.needs_approval
     assert stop.flag_reason.startswith(f"{FLAG_ATTEMPT_BUDGET}: spent $0.90 of $1.00")
+    # The check is before the call, so the flag names the call that would have gone over.
+    assert "$1.00 (next call estimated at $0.30)" in stop.flag_reason
     assert spend.refusal_for_attempt(aid) is None  # no spend-cap pause either
     assert store.spend_total("live", since=SINCE) == pytest.approx(0.9)
     # Reaching the budget exactly is allowed (the caps' boundary).
@@ -224,7 +226,8 @@ def test_cloud_writer_that_keeps_answering_stops_at_the_attempt_budget(tmp_path:
             e.once(keeps_answering())
         assert len(e.attempts(n)) == 1  # no retry on this or any other tier
         t = e.ticket(n)
-        assert t.flag_reason.startswith("attempt_budget: spent $0.98 of $1.00 on tier 3 (glm)")
+        assert t.flag_reason.startswith("attempt_budget: spent $0.98 of $1.00 (next call estimated")
+        assert "on tier 3 (glm); stopped at the per-attempt budget" in t.flag_reason
         assert len(handover_comments(e, n)) == 1
         assert e.store.spend_total("live", since=SINCE) == pytest.approx(spent)
     finally:
@@ -246,3 +249,20 @@ def test_local_writer_stops_at_the_input_token_limit(tmp_path: Path):
         assert len(handover_comments(e, n)) == 1
     finally:
         e.close()
+
+
+# --------------------------------------------------------------------------- status
+
+
+def test_status_shows_the_dollar_budget_only_for_metered_models(store):
+    from foreman_inator.worker_status import _attempt_text
+
+    metered, plan = attempt(store, model="claude"), attempt(store, model="glm")
+    for aid in (metered, plan):
+        store.add_attempt_usage(aid, tokens_in=10, cost_usd=0.63)
+    text = lambda aid: _attempt_text(  # noqa: E731
+        [store.get_attempt(aid)], 1.5, frozenset({"glm"})
+    )
+    assert "$0.63 of $1.50" in text(metered)
+    # A flat-fee plan model skips the USD budget: its list-price cost stands alone.
+    assert "$0.63)" in text(plan) and "of $1.50" not in text(plan)
