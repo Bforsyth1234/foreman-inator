@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
 from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
@@ -174,6 +175,21 @@ def side_text(body: str | None, side: str) -> str | None:
     return None
 
 
+#: One lock per pair (keyed by side A's ticket id): sides A and B run as concurrent
+#: jobs and both check-then-post the pair's one status comment and the pair note.
+_PAIR_LOCKS: dict[int, threading.Lock] = {}
+_PAIR_LOCKS_GUARD = threading.Lock()
+
+
+def _pair_lock(pair: Any) -> threading.Lock:
+    key = int(pair.ticket_a)
+    with _PAIR_LOCKS_GUARD:
+        lock = _PAIR_LOCKS.get(key)
+        if lock is None:
+            lock = _PAIR_LOCKS[key] = threading.Lock()
+        return lock
+
+
 class StatusCommentSteps:
     # Provided by Worker.
     api: Any
@@ -298,6 +314,12 @@ class StatusCommentSteps:
         self, ticket: Any, pair: Any, state: str, text: str, pr_number: int | None
     ) -> None:
         """Rewrite this side's line of the pair's one comment (module docstring)."""
+        with _pair_lock(pair):
+            self._status_write_pair_locked(ticket, pair, state, text)
+        if state == "pr_opened":
+            self._status_pair_note(ticket, pair, pr_number)
+
+    def _status_write_pair_locked(self, ticket: Any, pair: Any, state: str, text: str) -> None:
         ids, last, labeled = self._status_state()
         sides, states, _ = self._status_pair_state()
         key = int(pair.ticket_a)
@@ -329,8 +351,6 @@ class StatusCommentSteps:
         last[key] = body
         if self._status_flag("status_label", STATUS_LABEL):
             self._status_pair_label(ticket, pair, state, labeled)
-        if state == "pr_opened":
-            self._status_pair_note(ticket, pair, pr_number)
 
     def _status_side_active(self, ticket_id: int) -> bool:
         """The side's last written state is active; unknown (a restart): in progress."""
@@ -353,6 +373,10 @@ class StatusCommentSteps:
 
     def _status_pair_note(self, ticket: Any, pair: Any, pr_number: int | None) -> None:
         """Post "Two PRs: #x, #y. ..." once both sides of a running pair have a PR."""
+        with _pair_lock(pair):
+            self._status_pair_note_locked(ticket, pair, pr_number)
+
+    def _status_pair_note_locked(self, ticket: Any, pair: Any, pr_number: int | None) -> None:
         _, _, noted = self._status_pair_state()
         if pair.id in noted:
             return

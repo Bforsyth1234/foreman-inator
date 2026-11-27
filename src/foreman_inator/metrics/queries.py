@@ -55,7 +55,9 @@ Readings shared by every metric (SPEC leaves these open; also listed in the item
 * **Pairs** (``ab:pair``, #34): a pair's losing side is a dropped ticket, so it is out of
   every metric like any dropped ticket, except that its spend is charged to the winner
   in cost per accepted ticket and the cost trend (``pair_loser_spend_usd``, decided
-  pairs only). ``pair_record`` is the W-L per model pair (``experiments.pair.score``);
+  pairs only, and only while the loser is ``dropped``: if a human merged both PRs,
+  each side is accepted and counts only its own spend). ``pair_record`` is the W-L
+  per model pair (``experiments.pair.score``);
   only the repo filter applies to it. Unpaired tickets read exactly as before.
 * **Local** = accepted on tier 1 or 2 (SPEC "Routing and escalation": tiers 1–2 are
   local, tier 3 is cloud).
@@ -291,10 +293,13 @@ started AS (
         (SELECT COALESCE(SUM(a.cost_usd), 0) FROM attempts a
          WHERE a.ticket_id = s.id) AS attempt_spend_usd,
         (SELECT COALESCE(SUM(pa.cost_usd), 0) FROM pairs p
-         JOIN attempts pa ON pa.ticket_id = p.ticket_a + p.ticket_b - s.id
+         JOIN tickets lt ON lt.id = p.ticket_a + p.ticket_b - s.id AND lt."column" = 'dropped'
+         JOIN attempts pa ON pa.ticket_id = lt.id
          WHERE p.status = 'decided' AND p.winner_ticket_id = s.id)
           + (SELECT COALESCE(SUM(r.cost_usd), 0) FROM pairs p
-             JOIN attempts ra ON ra.ticket_id = p.ticket_a + p.ticket_b - s.id
+             JOIN tickets lt ON lt.id = p.ticket_a + p.ticket_b - s.id
+               AND lt."column" = 'dropped'
+             JOIN attempts ra ON ra.ticket_id = lt.id
              JOIN reviews r ON r.attempt_id = ra.id
              WHERE p.status = 'decided' AND p.winner_ticket_id = s.id AND r.shadow = 0)
           AS pair_loser_spend_usd,

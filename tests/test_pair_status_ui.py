@@ -9,6 +9,8 @@ total. Runs on the real ``Store`` Pair API (migration 016) and the fake GitHub.
 
 from __future__ import annotations
 
+import threading
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -239,6 +241,44 @@ def test_label_stays_while_a_side_is_active_and_note_posts_once(
     assert len([c for c in gh.list_issue_comments(REPO, 1) if marker in c.body]) == 1
     assert len(_bot_status(gh, a.id)) == 1 and not _bot_status(gh, b.id)
     assert p.ticket_a == a.id  # the pair's comment is keyed by side A
+
+
+class _SlowFind:
+    """The GitHub fake, with a slow comment listing: widens the check-then-post window."""
+
+    def __init__(self, gh: FakeGitHub) -> None:
+        self._gh = gh
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._gh, name)
+
+    def list_issue_comments(self, *args: Any, **kwargs: Any) -> Any:
+        got = self._gh.list_issue_comments(*args, **kwargs)
+        time.sleep(0.2)
+        return got
+
+
+def test_both_sides_updating_at_once_share_one_comment(store: Store, gh: FakeGitHub) -> None:
+    a, b, _ = _pair(store)
+    slow = _SlowFind(gh)
+    go = threading.Barrier(2)
+
+    def side(t: Ticket, model: str) -> None:
+        go.wait()
+        W(slow, store).status_update(t, "attempt_started", attempt=1, tier=1, model=model)
+
+    jobs = [
+        threading.Thread(target=side, args=(a, "w-one")),
+        threading.Thread(target=side, args=(b, "w-alt")),
+    ]
+    for j in jobs:
+        j.start()
+    for j in jobs:
+        j.join()
+    (c,) = _bot_status(gh, a.id)
+    assert not _bot_status(gh, b.id)
+    assert "**Side A:** foreman-inator is working on this: attempt 1 on tier 1 (w-one)." in c.body
+    assert "**Side B:** foreman-inator is working on this: attempt 1 on tier 1 (w-alt)." in c.body
 
 
 # =========================================================================== summary

@@ -124,7 +124,8 @@ user applied it (7b, the same ``_applied_labels`` path as ``agent``); cursor
   comment. ``lifecycle.apply`` has no transition for it (the worker must handle it
   before ``apply``; unwired, it is logged as an ignored event and acked).
 * ``ab:pair`` removed by an allowed user while the pair is running → ``PairRemoved``
-  for the open side B (an undecided side B; a decided pair has no open side B).
+  for the open side B (an undecided side B; a decided pair has no open side B), only
+  while side A is still open: once A was rejected/dropped, B just continues alone.
 * Both open sides' PRs are read in the same poll, before the issue state, so the
   "Closes #n" issue close can't pre-empt the pick: a merged side → ``Merged(paired=True)``
   and ``PairLost`` for each unmerged open sibling. A sibling already ``done`` in the store
@@ -591,7 +592,10 @@ class Poller:
                             )
                         )
                     return
-            if pair.status == "running" and not _has(issue.labels, self.pair_label):
+            a_open = any(t.id == pair.ticket_a for t in live)
+            if pair.status == "running" and a_open and not _has(issue.labels, self.pair_label):
+                # Side A already rejected/dropped: B is the only side left, so it just
+                # carries on as a normal ticket (dropping it would orphan the issue).
                 remover = _last_unlabel_actor(events, self.pair_label)
                 if self._allowed(remover):
                     for t in [t for t in live if t.pair_side == "b"]:

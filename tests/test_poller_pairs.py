@@ -242,6 +242,19 @@ def test_pair_label_removed_drops_side_b(env: Driver):
     assert env.poll() == []
 
 
+def test_pair_label_removed_after_side_a_was_dropped_keeps_side_b(env: Driver):
+    a, b, pa, pb = env.paired_in_testing()
+    env.gh.close_pr_as(REPO, pa, by=ME)
+    env.poll()
+    assert env.store.get_ticket(a).column == "dropped"
+    env.gh.remove_label_as(REPO, 1, "ab:pair", by=ME)
+    assert env.poll() == []  # B is the only side left: it carries on, not dropped
+    assert env.store.get_ticket(b).column == "testing"
+    env.gh.merge_pr(REPO, pb, by=ME)
+    assert kinds(env.poll()) == ["Merged"]
+    assert env.store.get_ticket(b).column == "done"
+
+
 def test_pair_label_removed_by_stranger_is_ignored(env: Driver):
     env.paired_in_testing()
     env.gh.remove_label_as(REPO, 1, "ab:pair", by=STRANGER)

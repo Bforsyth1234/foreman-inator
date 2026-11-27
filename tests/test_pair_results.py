@@ -137,6 +137,20 @@ def test_cost_per_accepted_ticket_charges_the_losers_spend(env):
     assert q.cost_per_accepted_ticket(store).total == pytest.approx(7.0 + 1.0)
 
 
+def test_both_prs_merged_counts_each_sides_spend_once(env):
+    store, _ = env
+    played(store, 1, a_cost=2.0, b_cost=3.0, b_wins=True)
+    (p,) = store.list_pairs(repo=REPO, issue_number=1)
+    loser = store.get_ticket(p.ticket_a)
+    # a human merged the losing PR too: the loser is done, not dropped
+    accept(store, loser, store.list_attempts(loser.id)[0].id)
+    c = q.cost_per_accepted_ticket(store)
+    # A: 2 + .25, B: 3 + .25, each once (B is not also charged A's spend)
+    assert (c.count, c.total) == (2, pytest.approx(5.5))
+    [point] = q.trend(store)
+    assert point.spend_usd == pytest.approx(5.5)
+
+
 def test_pair_record_in_the_report_and_json(env):
     store, _ = env
     rep = q.report(store)
