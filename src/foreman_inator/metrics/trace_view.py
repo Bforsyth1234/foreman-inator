@@ -57,16 +57,16 @@ RowsFor = Callable[[int], "replay.TicketRows | None"]
 _STYLE = """<style>
 ol.steps { padding-left: 1.2rem; }
 ol.steps > li { margin: 0.25rem 0; }
-li.error > details > summary { color: #c0392b; }
-li.failure { outline: 2px solid #d35400; border-radius: 6px; padding: 0.2rem 0.4rem; }
-.failure-label { color: #d35400; font-weight: 600; }
+li.error > details > summary { color: var(--danger); }
+li.failure { outline: 2px solid var(--warn); border-radius: 6px; padding: 0.2rem 0.4rem; }
+.failure-label { color: var(--warn); font-weight: 600; }
 pre { white-space: pre-wrap; word-break: break-word; background: var(--row);
   padding: 0.5rem; border-radius: 6px; max-height: 30rem; overflow: auto; }
 .clipped { color: var(--muted); font-style: italic; }
 details.recording { border: 1px solid var(--line); border-radius: 8px;
   padding: 0.4rem 0.8rem; margin: 0.6rem 0; }
 details.recording > summary { font-weight: 600; cursor: pointer; }
-.diff td { color: #c0392b; }
+.diff td { color: var(--danger); }
 table.resources { width: auto; margin: 0.4rem 0; }
 </style>"""
 

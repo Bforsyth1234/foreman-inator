@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import contextvars
 import html
 import ipaddress
 import logging
@@ -78,6 +79,10 @@ def _host_name(header: str) -> str:
     return header.rsplit(":", 1)[0] if header.count(":") == 1 else header
 
 
+#: The path of the request being served, so ``render_page`` can mark the current nav link.
+_CURRENT_PATH: contextvars.ContextVar[str] = contextvars.ContextVar("current_path", default="")
+
+
 class LoopbackHostOnly:
     """Refuse requests whose Host header is not a loopback name (DNS rebinding)."""
 
@@ -92,6 +97,7 @@ class LoopbackHostOnly:
                 resp = PlainTextResponse("metrics are served to localhost only", 403)
                 await resp(scope, receive, send)
                 return
+            _CURRENT_PATH.set(scope.get("path", ""))
         await self.app(scope, receive, send)
 
 
@@ -389,81 +395,173 @@ def line_chart(
 # --- page -----------------------------------------------------------------------------
 
 _CSS = """
-:root { --bg: #fff; --fg: #1d1f23; --muted: #5d6470; --line: #e2e5ea; --accent: #2457c5;
-  --accent-fg: #fff; --row: #f6f8fa; --card: #fff; --btn: #f1f3f6; --btn-hover: #e4e8ee;
-  --danger: #c0392b; --radius: 8px; color-scheme: light dark; }
+:root { --bg: #f6f7f9; --fg: #16181d; --muted: #5f6673; --faint: #8a919c; --line: #e3e6eb;
+  --accent: #4f46e5; --accent-soft: #eef0ff; --accent-fg: #fff; --row: #f8f9fb;
+  --card: #fff; --side: #fff; --btn: #fff; --btn-hover: #f1f3f6; --head: #fafbfc;
+  --danger: #d93a2b; --danger-soft: #fdecea; --ok: #15803d; --ok-soft: #e7f6ec;
+  --warn: #b45309; --warn-soft: #fef3e2; --radius: 10px;
+  --shadow: 0 1px 2px rgba(16,24,40,.05), 0 1px 3px rgba(16,24,40,.04);
+  --mono: ui-monospace, SFMono-Regular, Menlo, monospace; color-scheme: light dark; }
 @media (prefers-color-scheme: dark) {
-  :root { --bg: #0f1114; --fg: #e6e8eb; --muted: #9aa3af; --line: #2a2f37;
-    --accent: #7aa2ff; --accent-fg: #0f1114; --row: #171a1f; --card: #15181c;
-    --btn: #22262d; --btn-hover: #2c313a; --danger: #ff7b6b; } }
+  :root { --bg: #0c0d10; --fg: #e7e9ee; --muted: #9ba3b0; --faint: #6b7280; --line: #23272f;
+    --accent: #8b85ff; --accent-soft: #1d1b3a; --accent-fg: #0c0d10; --row: #15171c;
+    --card: #121419; --side: #101216; --btn: #1a1d23; --btn-hover: #23272f; --head: #15171c;
+    --danger: #ff7b6b; --danger-soft: #2c1512; --ok: #4ade80; --ok-soft: #10261a;
+    --warn: #fbbf24; --warn-soft: #2a1f0b;
+    --shadow: 0 1px 2px rgba(0,0,0,.4); } }
+* { box-sizing: border-box; }
 body { margin: 0; background: var(--bg); color: var(--fg);
-  font: 15px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; }
-main { max-width: 1100px; margin: 0 auto; padding: 16px; }
-h1 { font-size: 1.4rem; margin: 0.4rem 0 0.2rem; }
-h2 { font-size: 1.1rem; margin: 0 0 0.6rem; }
-h3 { font-size: 0.95rem; margin: 1rem 0 0.4rem; }
+  font: 14.5px/1.5 -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased; }
+.shell { display: grid; grid-template-columns: 220px minmax(0, 1fr); min-height: 100vh; }
+aside.side { position: sticky; top: 0; height: 100vh; overflow-y: auto;
+  background: var(--side); border-right: 1px solid var(--line); padding: 18px 12px; }
+.brand { display: flex; align-items: center; gap: 0.55rem; padding: 0 0.5rem 1rem;
+  font-weight: 700; font-size: 0.98rem; letter-spacing: -0.01em; color: var(--fg); }
+.brand:hover { text-decoration: none; }
+.brand .mark { width: 26px; height: 26px; border-radius: 7px; display: grid;
+  place-items: center; background: var(--accent); color: var(--accent-fg);
+  font-size: 0.8rem; font-weight: 800; }
+nav.side-nav { display: flex; flex-direction: column; gap: 1px; }
+nav.side-nav .group { font-size: 0.68rem; font-weight: 600; text-transform: uppercase;
+  letter-spacing: 0.08em; color: var(--faint); padding: 0.9rem 0.6rem 0.3rem; }
+nav.side-nav a { display: block; padding: 0.38rem 0.6rem; border-radius: 7px;
+  color: var(--muted); font-weight: 500; font-size: 0.9rem; }
+nav.side-nav a:hover { background: var(--btn-hover); color: var(--fg); text-decoration: none; }
+nav.side-nav a.active { background: var(--accent-soft); color: var(--accent); }
+main { max-width: 1180px; width: 100%; margin: 0 auto; padding: 28px 32px 64px; overflow-x: auto; }
+@media (max-width: 820px) {
+  .shell { grid-template-columns: 1fr; }
+  aside.side { position: sticky; z-index: 5; height: auto; padding: 10px 12px;
+    border-right: 0; border-bottom: 1px solid var(--line); display: flex;
+    align-items: center; gap: 0.75rem; overflow-x: auto; }
+  .brand { padding: 0; } .brand span:not(.mark) { display: none; }
+  nav.side-nav { flex-direction: row; gap: 2px; }
+  nav.side-nav .group { display: none; }
+  nav.side-nav a { white-space: nowrap; }
+  main { padding: 18px 16px 48px; } }
+h1 { font-size: 1.55rem; font-weight: 700; letter-spacing: -0.02em; margin: 0 0 0.3rem; }
+h2 { font-size: 1.05rem; font-weight: 650; letter-spacing: -0.01em; margin: 2rem 0 0.7rem; }
+section.card > h2:first-child, h1 + h2 { margin-top: 0.4rem; }
+h3 { font-size: 0.88rem; font-weight: 600; margin: 1.3rem 0 0.5rem; color: var(--muted); }
+p { margin: 0.4rem 0 0.8rem; }
+p.lede { font-size: 0.95rem; max-width: 75ch; }
 p.lede, small, .empty { color: var(--muted); }
+.empty { font-style: italic; }
 a { color: var(--accent); text-decoration: none; }
 a:hover { text-decoration: underline; }
-nav { display: flex; flex-wrap: wrap; gap: 0.25rem 1rem; padding-bottom: 0.6rem;
-  border-bottom: 1px solid var(--line); margin-bottom: 0.6rem; }
-code { font: 0.88em ui-monospace, SFMono-Regular, Menlo, monospace; }
-section.card { background: var(--card); border: 1px solid var(--line);
-  border-radius: var(--radius); padding: 1rem 1.1rem; margin: 1rem 0; overflow-x: auto; }
-form { display: flex; flex-wrap: wrap; gap: 0.6rem 1rem; align-items: end;
-  padding: 0.8rem; border: 1px solid var(--line); border-radius: var(--radius); }
+code { font: 0.86em var(--mono); background: var(--row); border: 1px solid var(--line);
+  padding: 0.05em 0.35em; border-radius: 5px; }
+pre code { background: none; border: 0; padding: 0; }
+section.card { background: var(--card); border: 1px solid var(--line); box-shadow: var(--shadow);
+  border-radius: var(--radius); padding: 1.1rem 1.25rem; margin: 1.1rem 0; overflow-x: auto; }
+section.card table { border: 0; box-shadow: none; border-radius: 0; }
+form { display: flex; flex-wrap: wrap; gap: 0.7rem 1rem; align-items: end;
+  padding: 0.9rem 1rem; background: var(--card); border: 1px solid var(--line);
+  border-radius: var(--radius); box-shadow: var(--shadow); margin: 0.8rem 0; }
 form.inline, td form, li form { display: inline-flex; padding: 0; border: 0; gap: 0;
-  margin: 0; vertical-align: middle; }
-label { display: flex; flex-direction: column; gap: 0.2rem; font-size: 0.85rem;
-  color: var(--muted); }
-select, input { font: inherit; color: var(--fg); background: var(--bg);
-  padding: 0.35rem 0.5rem; border: 1px solid var(--line); border-radius: 6px; }
-select:focus, input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
-button { font: inherit; font-size: 0.85rem; color: var(--fg); background: var(--btn);
-  border: 1px solid var(--line); border-radius: 6px; padding: 0.3rem 0.75rem;
-  cursor: pointer; white-space: nowrap; }
+  margin: 0; vertical-align: middle; background: none; box-shadow: none; }
+label { display: flex; flex-direction: column; gap: 0.25rem; font-size: 0.78rem;
+  font-weight: 500; color: var(--muted); }
+select, input, textarea { font: inherit; font-size: 0.9rem; color: var(--fg);
+  background: var(--bg); padding: 0.4rem 0.6rem; border: 1px solid var(--line);
+  border-radius: 7px; min-height: 34px; }
+input[type=checkbox], input[type=radio] { min-height: 0; accent-color: var(--accent); }
+select:focus, input:focus, textarea:focus { outline: none; border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft); }
+button { font: inherit; font-size: 0.85rem; font-weight: 550; color: var(--fg);
+  background: var(--btn); border: 1px solid var(--line); border-radius: 7px;
+  padding: 0.38rem 0.85rem; min-height: 34px; cursor: pointer; white-space: nowrap;
+  box-shadow: var(--shadow); transition: background .12s, border-color .12s; }
 button:hover { background: var(--btn-hover); }
+button:focus-visible, a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 form:not(.inline) > button:last-child { background: var(--accent); color: var(--accent-fg);
   border-color: var(--accent); }
+form:not(.inline) > button:last-child:hover { filter: brightness(1.08); }
 td form, li form { margin-left: 0.3rem; }
+td button, li button, .actions button { min-height: 28px; padding: 0.2rem 0.65rem;
+  font-size: 0.8rem; }
 .actions { display: flex; flex-wrap: nowrap; justify-content: flex-end;
   align-items: center; gap: 0.35rem; }
 .actions form { margin: 0; }
 .actions a { font-size: 0.85rem; padding: 0 0.3rem; }
 form.danger button { color: var(--danger); }
-form.danger button:hover { background: var(--danger); color: var(--accent-fg);
-  border-color: var(--danger); }
+form.danger button:hover { background: var(--danger); color: #fff; border-color: var(--danger); }
 .scroll { overflow-x: auto; }
-table { border-collapse: collapse; width: 100%; }
-th, td { text-align: left; padding: 0.5rem 0.6rem; border-bottom: 1px solid var(--line);
+table { border-collapse: separate; border-spacing: 0; width: 100%; background: var(--card);
+  border: 1px solid var(--line); border-radius: var(--radius); box-shadow: var(--shadow);
+  font-variant-numeric: tabular-nums; margin: 0.4rem 0 0.8rem; }
+thead tr:first-child th:first-child, table > tr:first-child > th:first-child {
+  border-top-left-radius: var(--radius); }
+thead tr:first-child th:last-child, table > tr:first-child > th:last-child {
+  border-top-right-radius: var(--radius); }
+label:has(> input[type=checkbox]) { flex-direction: row; align-items: center; gap: 0.45rem;
+  font-size: 0.85rem; color: var(--fg); }
+th, td { text-align: left; padding: 0.55rem 0.8rem; border-bottom: 1px solid var(--line);
   vertical-align: middle; }
 tr:last-child td { border-bottom: 0; }
 tbody tr:hover td, table tr:not(:first-child):hover td { background: var(--row); }
-th { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.04em;
-  color: var(--muted); font-weight: 600; }
-td.muted { color: var(--muted); font-size: 0.88rem; }
-tr.all td { background: var(--row); font-weight: 600; }
-.headline { font-size: 1.05rem; }
+th { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.06em; background: var(--head);
+  color: var(--faint); font-weight: 600; white-space: nowrap; }
+td.muted { color: var(--muted); font-size: 0.86rem; }
+tr.all td { background: var(--accent-soft); font-weight: 600; }
+.headline { font-size: 1rem; padding: 0.8rem 1rem; background: var(--card);
+  border: 1px solid var(--line); border-left: 3px solid var(--accent);
+  border-radius: var(--radius); box-shadow: var(--shadow); }
 .charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
   gap: 1rem; }
 svg.chart { width: 100%; height: auto; }
 svg .grid { stroke: var(--line); stroke-width: 1; }
-svg .axis { fill: var(--muted); font-size: 12px; }
-svg .line { fill: none; stroke: var(--accent); stroke-width: 2; }
+svg .axis { fill: var(--faint); font-size: 11px; }
+svg .line { fill: none; stroke: var(--accent); stroke-width: 2.25; stroke-linejoin: round; }
 svg .dot { fill: var(--accent); }
 .error { color: var(--danger); }
+details > summary { cursor: pointer; color: var(--accent); font-size: 0.88rem; }
+hr { border: 0; border-top: 1px solid var(--line); margin: 1.5rem 0; }
 """
+
+#: Sidebar groups by path; links not listed here land in "More".
+_NAV_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("Live", ("/activity", "/chat")),
+    ("Insights", ("/", "/traces", "/failures", "/experiments", "/resources")),
+    ("Configure", ("/experiments/manage", "/settings", "/tiers")),
+)
+
+def _active_href(links: Sequence[tuple[str, str]], path: str) -> str | None:
+    """The link for ``path``: an exact match, else the longest ``href/`` prefix."""
+    hits = [h for h, _ in links if h == path or (h != "/" and path.startswith(h + "/"))]
+    return max(hits, key=len, default=None)
+
+
+def _nav_html(links: Sequence[tuple[str, str]]) -> str:
+    active = _active_href(links, _CURRENT_PATH.get())
+    placed: set[str] = set()
+    out: list[str] = []
+    by_href = dict(links)
+    groups = [*_NAV_GROUPS, ("More", tuple(h for h, _ in links))]
+    for name, hrefs in groups:
+        items = [h for h in hrefs if h in by_href and h not in placed]
+        if not items:
+            continue
+        out.append(f'<div class="group">{e(name)}</div>')
+        for h in items:
+            placed.add(h)
+            cur = ' class="active" aria-current="page"' if h == active else ""
+            out.append(f'<a{cur} href="{e(h)}">{e(by_href[h])}</a>')
+    return "".join(out)
 
 
 def render_page(title: str, body: str, *, nav: Sequence[tuple[str, str]] = ()) -> str:
     """The shared layout. ``title`` and ``nav`` are escaped; ``body`` is trusted HTML."""
     links = [("/", "Metrics"), *nav]
-    nav_html = "".join(f'<a href="{e(href)}">{e(text)}</a>' for href, text in links)
     return (
         '<!doctype html><html lang="en"><head><meta charset="utf-8">'
         '<meta name="viewport" content="width=device-width, initial-scale=1">'
-        f"<title>{e(title)}</title><style>{_CSS}</style></head>"
-        f"<body><main><nav>{nav_html}</nav>{body}</main></body></html>"
+        f"<title>{e(title)} · foreman-inator</title><style>{_CSS}</style></head>"
+        '<body><div class="shell"><aside class="side">'
+        '<a class="brand" href="/"><span class="mark">fi</span><span>foreman-inator</span></a>'
+        f'<nav class="side-nav">{_nav_html(links)}</nav></aside>'
+        f"<main>{body}</main></div></body></html>"
     )
 
 
