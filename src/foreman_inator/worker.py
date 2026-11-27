@@ -135,6 +135,7 @@ stores nothing, the proxy stops, exit 0.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import logging
 import threading
 import time
@@ -148,7 +149,7 @@ from foreman_inator.config import RELAY_MIN_POLL_GAP, Config, key_ref
 from foreman_inator.db.store import OPEN_COLUMNS, Store, Ticket
 from foreman_inator.github import relay as relay_mod
 from foreman_inator.github.client import GitHubAPI
-from foreman_inator.github.poller import Poller
+from foreman_inator.github.poller import PairReapplied, Poller
 from foreman_inator.locks import Locks
 from foreman_inator.pr.publisher import Publisher
 from foreman_inator.resources.ollama import OllamaWatch
@@ -158,7 +159,13 @@ from foreman_inator.runner.worktree import WorktreeManager
 from foreman_inator.spend import Spend
 from foreman_inator.tickets import lifecycle
 from foreman_inator.tickets.lifecycle import Action, IllegalTransition
-from foreman_inator.worker_actions import ActionHandlers, Ctx, flag_comment
+from foreman_inator.worker_actions import (
+    PAIR_DISABLED_TEXT,
+    PAIR_REAPPLIED_TEXT,
+    ActionHandlers,
+    Ctx,
+    flag_comment,
+)
 from foreman_inator.worker_attempt import AttemptSteps
 from foreman_inator.worker_background import BackgroundSteps
 from foreman_inator.worker_config_reload import ConfigReloadSteps
@@ -293,6 +300,11 @@ class Worker(
             Action.FLAG_TICKET: self._a_flag_ticket,
             Action.RECORD_CI: self._a_record_ci,
             Action.START_REBASE: self._a_start_rebase,
+            # #16 ab:pair (wave 24 wiring)
+            Action.CREATE_PAIR_SIDE: self._a_create_pair_side,
+            Action.CLOSE_OWN_PR: self._a_close_own_pr,
+            Action.DELETE_OWN_BRANCH: self._a_delete_own_branch,
+            Action.RECORD_PAIR_RESULT: self._a_record_pair_result,
         }
 
     # ================================================================== the loop
@@ -307,6 +319,9 @@ class Worker(
                     self.store.finish_attempt(a.id, "superseded")
                     fixed.append(a.id)
                     log.info("ticket %d: attempt %d was interrupted; marked superseded", t.id, a.id)
+        # #82 (GH #80): an approval those attempts were using carries over to the
+        # ticket's next attempt with what it has left; a spent one is closed.
+        self.spend.reopen_unspent_approvals(fixed)
         swept = self.locks.sweep()
         if swept:
             log.info("swept %d stale file lock(s)", swept)
@@ -485,6 +500,14 @@ class Worker(
         tid = getattr(event, "ticket_id", None)
         ticket = self.store.get_ticket(tid) if tid is not None else None
         column = ticket.column if ticket else None
+        is_pair_label = isinstance(event, PairReapplied | lifecycle.PairRequested)
+        if is_pair_label and ticket is not None and not self._pair_allowed(ticket, event):
+            return  # #16: answered with one comment; not a lifecycle event
+        pair_off = isinstance(event, lifecycle.TicketRequested) and event.pair
+        if pair_off and not self.config.pair_enabled:
+            event = dataclasses.replace(event, pair=False)  # #16: pair_enabled = false
+        else:
+            pair_off = False
         try:
             tr = lifecycle.apply(column, event)
         except IllegalTransition as exc:
@@ -495,7 +518,24 @@ class Worker(
             self._log_move(ticket, column, tr.column, event)
         if isinstance(event, lifecycle.NeedsInfoAnswered) and ticket is not None:
             log.info("ticket %d: needs-info %s by %s", ticket.id, event.how, event.by)
-        self._run_actions(Ctx(ticket, event), tr.actions)
+        ctx = Ctx(ticket, event)
+        self._run_actions(ctx, tr.actions)
+        if pair_off and ctx.ticket is not None:
+            self.post_once(ctx.ticket, "pair_disabled", PAIR_DISABLED_TEXT, name="pair_disabled")
+
+    def _pair_allowed(self, ticket: Ticket, event: Any) -> bool:
+        """#16: may this ``ab:pair`` labeling reach ``lifecycle.apply``? Not when pairs
+        are off (``pair_enabled = false``) or the ticket already had a pair
+        (``PairReapplied``); each is answered with one comment."""
+        if not self.config.pair_enabled:
+            self.post_once(ticket, "pair_disabled", PAIR_DISABLED_TEXT, name="pair_disabled")
+            return False
+        if isinstance(event, PairReapplied):
+            key = f"pair_reapplied:{event.label_event_id}"
+            self.post_once(ticket, key, PAIR_REAPPLIED_TEXT, name="pair_reapplied")
+            log.info("ticket %d: ab:pair re-added; pair #%d stands", ticket.id, event.pair_id)
+            return False
+        return True
 
     # ------------------------------------------------------------------ transitions
 

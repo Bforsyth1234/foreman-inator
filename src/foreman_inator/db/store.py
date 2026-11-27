@@ -60,6 +60,15 @@ REVIEW_MODES: tuple[str, ...] = ("off", "light", "normal", "strict")
 #: post_merge_signals.kind (#24, migration 009).
 SignalKind = Literal["reverted", "followup"]
 SIGNAL_KINDS: tuple[str, ...] = ("reverted", "followup")
+#: tickets.pair_side and the pairs table (#34 ab:pair, migration 016).
+PairSide = Literal["a", "b"]
+PAIR_SIDES: tuple[str, ...] = ("a", "b")
+OpponentReason = Literal["challenger", "next_rung", "lower_rung"]
+OPPONENT_REASONS: tuple[str, ...] = ("challenger", "next_rung", "lower_rung")
+PairStatus = Literal["running", "decided", "dropped"]
+PAIR_STATUSES: tuple[str, ...] = ("running", "decided", "dropped")
+LoserOutcome = Literal["merged_other", "rejected"]
+LOSER_OUTCOMES: tuple[str, ...] = ("merged_other", "rejected")
 CiStatus = Literal["passed", "failed", "base_red", "no_ci", "timed_out", "no_permission"]
 
 COLUMNS: tuple[str, ...] = ("todo", "in_progress", "testing", "done", "dropped")
@@ -158,6 +167,8 @@ class Ticket:
     routed_tier: int | None
     flag_reason: str | None
     flagged_at: datetime | None
+    # migration 016 (#34): 'a'/'b' on a paired ticket; None on an unpaired one (= side a).
+    pair_side: PairSide | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -326,6 +337,15 @@ class SpendApproval:
     ticket_id: int
     approved_at: datetime
     consumed_at: datetime | None
+    # migration 015 (#82): the attempt using it, how ('attempt': the thrifty writer gate;
+    # 'grant': an over-cap grant; None: neither, never carried), its room, the spend
+    # under it so far (every attempt that carried it), when it closed, times carried on.
+    attempt_id: int | None = None
+    kind: str | None = None
+    limit_usd: float | None = None
+    spent_usd: float = 0.0
+    settled_at: datetime | None = None
+    reopened: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -399,6 +419,36 @@ class PostMergeSignal:
     at: datetime
     detail: str
     recorded_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class Pair:
+    """#34 (migration 016): an ``ab:pair`` head-to-head, two sibling tickets on one issue.
+
+    ``winner_ticket_id`` is the record of the result; ``loser_outcome`` says how the other
+    side lost. Both are None until the pair is decided."""
+
+    id: int
+    repo: str
+    issue_number: int
+    ticket_a: int
+    ticket_b: int
+    opponent_variant: str
+    opponent_reason: OpponentReason
+    experiment_id: int | None
+    status: PairStatus
+    winner_ticket_id: int | None
+    loser_outcome: LoserOutcome | None
+    created_at: datetime
+    decided_at: datetime | None
+
+    def other(self, ticket_id: int) -> int:
+        """The sibling of ``ticket_id`` (which must be one of this pair's tickets)."""
+        if ticket_id == self.ticket_a:
+            return self.ticket_b
+        if ticket_id == self.ticket_b:
+            return self.ticket_a
+        raise StoreError(f"ticket {ticket_id} is not in pair {self.id}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -722,24 +772,27 @@ class Store:
         route_reason: str | None = None,
         trace_id: str | None = None,
         routed_tier: int | None = None,
+        pair_side: PairSide | None = None,
     ) -> Ticket:
-        ticket_id = self._insert(
-            "tickets",
-            {
-                "repo": repo,
-                "issue_number": issue_number,
-                "title": title,
-                "request": request,
-                "base_branch": base_branch,
-                "source": source,
-                "owned_files": owned_files,
-                "route_reason": route_reason,
-                "trace_id": trace_id,
-                "routed_tier": routed_tier,
-                "column": "todo",
-                "created_at": self.now(),
-            },
-        )
+        """A new ticket in ``todo``. ``pair_side`` (#34): 'b' for the opponent side of an
+        ``ab:pair`` (it may be open beside the issue's normal ticket); None otherwise."""
+        values: dict[str, Any] = {
+            "repo": repo,
+            "issue_number": issue_number,
+            "title": title,
+            "request": request,
+            "base_branch": base_branch,
+            "source": source,
+            "owned_files": owned_files,
+            "route_reason": route_reason,
+            "trace_id": trace_id,
+            "routed_tier": routed_tier,
+            "column": "todo",
+            "created_at": self.now(),
+        }
+        if pair_side is not None:
+            values["pair_side"] = pair_side
+        ticket_id = self._insert("tickets", values)
         return self.get_ticket(ticket_id)
 
     def get_ticket(self, ticket_id: int) -> Ticket:
@@ -749,13 +802,27 @@ class Store:
         return _row_to(Ticket, row)
 
     def find_open_ticket(self, repo: str, issue_number: int) -> Ticket | None:
-        """The ticket in todo/in_progress/testing for this issue, if any."""
+        """The ticket in todo/in_progress/testing for this issue, if any.
+
+        With an open ``ab:pair`` (#34) this is side A; side B only when it is the one
+        open ticket left. ``open_tickets_for_issue`` returns both."""
         row = self._one(
             "SELECT * FROM tickets WHERE repo = ? AND issue_number = ?"
-            " AND \"column\" IN ('todo', 'in_progress', 'testing')",
+            " AND \"column\" IN ('todo', 'in_progress', 'testing')"
+            " ORDER BY COALESCE(pair_side, 'a'), id LIMIT 1",
             (repo, issue_number),
         )
         return _row_to(Ticket, row) if row else None
+
+    def open_tickets_for_issue(self, repo: str, issue_number: int) -> list[Ticket]:
+        """Every open ticket for this issue (#34): side A first, then side B."""
+        rows = self.query(
+            "SELECT * FROM tickets WHERE repo = ? AND issue_number = ?"
+            " AND \"column\" IN ('todo', 'in_progress', 'testing')"
+            " ORDER BY COALESCE(pair_side, 'a'), id",
+            (repo, issue_number),
+        )
+        return [_row_to(Ticket, r) for r in rows]
 
     def tickets_for_issue(self, repo: str, issue_number: int) -> list[Ticket]:
         rows = self.query(
@@ -836,6 +903,183 @@ class Store:
             frozenset({"flag_reason", "flagged_at"}),
         )
         return self.get_ticket(ticket_id)
+
+    # -- pairs (#34 ab:pair, migration 016) --
+
+    def create_pair(
+        self,
+        *,
+        ticket_a: int,
+        ticket_b: int,
+        opponent_variant: str,
+        opponent_reason: OpponentReason,
+        experiment_id: int | None = None,
+    ) -> Pair:
+        """Link two sibling tickets on one issue as a running pair.
+
+        ``ticket_b`` must have been created with ``pair_side='b'``; ``ticket_a`` (the
+        issue's normal ticket, usually ``pair_side`` None) is marked side 'a' here.
+        Neither ticket may already be in a pair."""
+        with self.transaction() as conn:
+            a, b = self.get_ticket(ticket_a), self.get_ticket(ticket_b)
+            if (a.repo, a.issue_number) != (b.repo, b.issue_number):
+                raise StoreError(
+                    f"tickets {a.id} and {b.id} are on different issues"
+                    f" ({a.repo}#{a.issue_number}, {b.repo}#{b.issue_number})"
+                )
+            if b.pair_side != "b":
+                raise StoreError(f"ticket {b.id} is not a side-b ticket")
+            if a.pair_side == "b":
+                raise StoreError(f"ticket {a.id} is a side-b ticket")
+            for t in (a, b):
+                if self.pair_for_ticket(t.id) is not None:
+                    raise StoreError(f"ticket {t.id} is already in a pair")
+            if a.pair_side is None:
+                conn.execute("UPDATE tickets SET pair_side = 'a' WHERE id = ?", (a.id,))
+            pair_id = self._insert(
+                "pairs",
+                {
+                    "repo": a.repo,
+                    "issue_number": a.issue_number,
+                    "ticket_a": a.id,
+                    "ticket_b": b.id,
+                    "opponent_variant": opponent_variant,
+                    "opponent_reason": opponent_reason,
+                    "experiment_id": experiment_id,
+                    "status": "running",
+                    "created_at": self.now(),
+                },
+            )
+        return self.get_pair(pair_id)
+
+    def get_pair(self, pair_id: int) -> Pair:
+        row = self._one("SELECT * FROM pairs WHERE id = ?", (pair_id,))
+        if row is None:
+            raise NotFoundError(f"no pair {pair_id}")
+        return _row_to(Pair, row)
+
+    def pair_for_ticket(self, ticket_id: int) -> Pair | None:
+        """The pair this ticket is a side of (any status), or None for an unpaired one."""
+        row = self._one(
+            "SELECT * FROM pairs WHERE ticket_a = ? OR ticket_b = ?", (ticket_id, ticket_id)
+        )
+        return _row_to(Pair, row) if row else None
+
+    def sibling(self, ticket_id: int) -> Ticket | None:
+        """The other side's ticket (any column), or None for an unpaired ticket."""
+        pair = self.pair_for_ticket(ticket_id)
+        return None if pair is None else self.get_ticket(pair.other(ticket_id))
+
+    def decide_pair(
+        self, pair_id: int, *, winner_ticket_id: int, loser_outcome: LoserOutcome
+    ) -> Pair:
+        """Record the result of a running pair: ``winner_ticket_id`` won; the other side
+        lost by ``loser_outcome`` ('merged_other' or 'rejected').
+
+        Deciding again with the same result is a no-op (a re-read event); a different
+        result, or deciding a dropped pair, raises ``StoreError``."""
+        with self.transaction():
+            pair = self.get_pair(pair_id)
+            pair.other(winner_ticket_id)  # raises unless the winner is one of its sides
+            if pair.status == "decided":
+                if (pair.winner_ticket_id, pair.loser_outcome) == (
+                    winner_ticket_id,
+                    loser_outcome,
+                ):
+                    return pair
+                raise StoreError(
+                    f"pair {pair_id} is already decided (winner ticket {pair.winner_ticket_id})"
+                )
+            if pair.status != "running":
+                raise StoreError(f"pair {pair_id} is {pair.status}")
+            self._update(
+                "pairs",
+                "id",
+                pair_id,
+                {
+                    "status": "decided",
+                    "winner_ticket_id": winner_ticket_id,
+                    "loser_outcome": loser_outcome,
+                    "decided_at": self.now(),
+                },
+                frozenset({"status", "winner_ticket_id", "loser_outcome", "decided_at"}),
+            )
+        return self.get_pair(pair_id)
+
+    def set_pair_opponent(
+        self,
+        pair_id: int,
+        *,
+        opponent_variant: str,
+        opponent_reason: OpponentReason,
+        experiment_id: int | None = None,
+    ) -> Pair:
+        """Re-choose a running pair's opponent (#16: once side A is routed, before side
+        B's first attempt). A decided or dropped pair raises ``StoreError``."""
+        with self.transaction():
+            pair = self.get_pair(pair_id)
+            if pair.status != "running":
+                raise StoreError(f"pair {pair_id} is {pair.status}")
+            self._update(
+                "pairs",
+                "id",
+                pair_id,
+                {
+                    "opponent_variant": opponent_variant,
+                    "opponent_reason": opponent_reason,
+                    "experiment_id": experiment_id,
+                },
+                frozenset({"opponent_variant", "opponent_reason", "experiment_id"}),
+            )
+        return self.get_pair(pair_id)
+
+    def drop_pair(self, pair_id: int) -> Pair:
+        """End a running pair with no result (both PRs closed, issue closed, a label
+        removed). Dropping a dropped pair is a no-op; a decided pair keeps its result
+        and raises ``StoreError``."""
+        with self.transaction():
+            pair = self.get_pair(pair_id)
+            if pair.status == "dropped":
+                return pair
+            if pair.status != "running":
+                raise StoreError(f"pair {pair_id} is {pair.status}")
+            self._update(
+                "pairs",
+                "id",
+                pair_id,
+                {"status": "dropped", "decided_at": self.now()},
+                frozenset({"status", "decided_at"}),
+            )
+        return self.get_pair(pair_id)
+
+    def list_pairs(
+        self,
+        *,
+        repo: str | None = None,
+        issue_number: int | None = None,
+        status: PairStatus | Sequence[PairStatus] | None = None,
+        experiment_id: int | None = None,
+    ) -> list[Pair]:
+        """Pairs matching every given filter, oldest first."""
+        where: list[str] = []
+        params: list[Any] = []
+        if repo is not None:
+            where.append("repo = ?")
+            params.append(repo)
+        if issue_number is not None:
+            where.append("issue_number = ?")
+            params.append(issue_number)
+        if status is not None:
+            statuses = [status] if isinstance(status, str) else list(status)
+            where.append(f"status IN ({', '.join('?' for _ in statuses)})")
+            params.extend(statuses)
+        if experiment_id is not None:
+            where.append("experiment_id = ?")
+            params.append(experiment_id)
+        sql = "SELECT * FROM pairs"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        return [_row_to(Pair, r) for r in self.query(sql + " ORDER BY id", params)]
 
     # -- attempts --
 
@@ -1676,14 +1920,114 @@ class Store:
         )
         return _row_to(SpendApproval, row) if row else None
 
-    def consume_spend_approval(self, approval_id: int) -> bool:
-        """Use an approval once. False if it was already consumed or does not exist."""
+    def consume_spend_approval(
+        self,
+        approval_id: int,
+        *,
+        kind: str | None = None,
+        attempt_id: int | None = None,
+        limit_usd: float | None = None,
+    ) -> bool:
+        """Use an approval once. False if it was already consumed or does not exist.
+        ``kind`` / ``attempt_id`` / ``limit_usd`` (migration 015, #82): how, by which
+        attempt, and its room (set at its first use only; a carried approval keeps its
+        room and its spend). Only an approval with a ``kind`` is carried."""
+        sql = "UPDATE spend_approvals SET consumed_at = ?"
+        params: list[Any] = [_ts(self.now())]
+        if kind is not None:  # only then: a store migrated part-way (before 015) has no column
+            sql += ", kind = ?, attempt_id = ?, limit_usd = COALESCE(limit_usd, ?)"
+            params += [kind, attempt_id, limit_usd]
+        with self.transaction() as conn:
+            sql += " WHERE id = ? AND consumed_at IS NULL"
+            cur = conn.execute(sql, [*params, approval_id])
+            return cur.rowcount == 1
+
+    def get_spend_approval(self, approval_id: int) -> SpendApproval:
+        row = self._one("SELECT * FROM spend_approvals WHERE id = ?", (approval_id,))
+        if row is None:
+            raise NotFoundError(f"no spend approval {approval_id}")
+        return _row_to(SpendApproval, row)
+
+    def add_spend_approval_spend(self, approval_id: int, cost_usd: float) -> None:
+        """#82: cloud spend under an approval, kept with it (a restart still knows it)."""
+        with self.transaction() as conn:
+            conn.execute(
+                "UPDATE spend_approvals SET spent_usd = spent_usd + ? WHERE id = ?",
+                (max(float(cost_usd), 0.0), approval_id),
+            )
+
+    def bind_spend_approval(self, approval_id: int, attempt_id: int) -> None:
+        """#82: a thrifty approval's attempt made its first cloud call."""
+        with self.transaction() as conn:
+            conn.execute(
+                "UPDATE spend_approvals SET attempt_id = ? WHERE id = ?", (attempt_id, approval_id)
+            )
+
+    def unsettled_spend_approvals(self, ticket_id: int | None = None) -> list[SpendApproval]:
+        """#82: used approvals (with a ``kind``) not closed yet."""
+        sql = (
+            "SELECT * FROM spend_approvals WHERE consumed_at IS NOT NULL"
+            " AND kind IS NOT NULL AND settled_at IS NULL"
+        )
+        params: list[Any] = []
+        if ticket_id is not None:
+            sql += " AND ticket_id = ?"
+            params.append(ticket_id)
+        return [_row_to(SpendApproval, r) for r in self.query(sql + " ORDER BY id", params)]
+
+    def first_attempt_since(self, ticket_id: int, at: datetime) -> Attempt | None:
+        """The ticket's first attempt started at or after ``at`` (lowest id)."""
+        row = self._one(
+            "SELECT * FROM attempts WHERE ticket_id = ? AND started_at >= ? ORDER BY id LIMIT 1",
+            (ticket_id, _ts(at)),
+        )
+        return _row_to(Attempt, row) if row else None
+
+    def settle_spend_approval(self, approval_id: int, *, attempt_id: int | None = None) -> bool:
+        """#82: close a used approval (used up, or its attempt finished normally)."""
         with self.transaction() as conn:
             cur = conn.execute(
-                "UPDATE spend_approvals SET consumed_at = ? WHERE id = ? AND consumed_at IS NULL",
-                (_ts(self.now()), approval_id),
+                "UPDATE spend_approvals SET settled_at = ?, attempt_id = COALESCE(?, attempt_id)"
+                " WHERE id = ? AND consumed_at IS NOT NULL AND settled_at IS NULL",
+                (_ts(self.now()), attempt_id, approval_id),
             )
             return cur.rowcount == 1
+
+    def close_spend_approval(self, approval_id: int) -> bool:
+        """#82: close an approval whether or not it is in use (a carried one the user
+        replaces with a fresh approval). False if it was already closed."""
+        with self.transaction() as conn:
+            now = _ts(self.now())
+            cur = conn.execute(
+                "UPDATE spend_approvals SET consumed_at = COALESCE(consumed_at, ?),"
+                " settled_at = ? WHERE id = ? AND settled_at IS NULL",
+                (now, now, approval_id),
+            )
+            return cur.rowcount == 1
+
+    def reopen_spend_approval(self, approval_id: int) -> bool:
+        """#82: its attempt was cut short with room left: open again for the ticket's
+        next attempt, keeping its room and its spend. False if closed meanwhile."""
+        with self.transaction() as conn:
+            cur = conn.execute(
+                "UPDATE spend_approvals SET consumed_at = NULL, kind = NULL, attempt_id = NULL,"
+                " reopened = reopened + 1"
+                " WHERE id = ? AND consumed_at IS NOT NULL AND settled_at IS NULL",
+                (approval_id,),
+            )
+            return cur.rowcount == 1
+
+    def carried_spend_approvals(self) -> list[SpendApproval]:
+        """#82: approvals of open tickets, not closed, with spend under them already."""
+        marks = ", ".join("?" for _ in OPEN_COLUMNS)
+        rows = self.query(
+            "SELECT a.* FROM spend_approvals a JOIN tickets t ON t.id = a.ticket_id"
+            f' WHERE a.settled_at IS NULL AND a.spent_usd > 0 AND t."column" IN ({marks})'
+            " AND (a.consumed_at IS NULL OR a.kind IS NOT NULL)"
+            " ORDER BY a.ticket_id, a.id",
+            list(OPEN_COLUMNS),
+        )
+        return [_row_to(SpendApproval, r) for r in rows]
 
     # -- file locks --
 

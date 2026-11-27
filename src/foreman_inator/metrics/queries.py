@@ -52,8 +52,27 @@ Readings shared by every metric (SPEC leaves these open; also listed in the item
   were later reverted or followed up (``post_merge_signals``, found by
   ``metrics.quality.scan``). A reverted ticket still counts as accepted in every other
   metric here: the signal is shown next to the accepted count, not subtracted from it.
+* **Pairs** (``ab:pair``, #34): a pair's losing side is a dropped ticket, so it is out of
+  every metric like any dropped ticket, except that its spend is charged to the winner
+  in cost per accepted ticket and the cost trend (``pair_loser_spend_usd``, decided
+  pairs only, and only while the loser is ``dropped``: if a human merged both PRs,
+  each side is accepted and counts only its own spend). ``pair_record`` is the W-L
+  per model pair (``experiments.pair.score``);
+  only the repo filter applies to it. Unpaired tickets read exactly as before.
 * **Local** = accepted on tier 1 or 2 (SPEC "Routing and escalation": tiers 1–2 are
   local, tier 3 is cloud).
+* **Chat** (#60, docs/chat-design.md sections 5 and 6): chat sessions never feed the
+  router, so no ticket, writer, reviewer or router metric reads ``chat_sessions``,
+  ``chat_turns`` or a chat ledger row (a chat has no ticket and no attempt rows, so the
+  ticket queries above never see one). Chat shows up only in the spend split below.
+* **Spend split** (``spend_split``, ``spend_trend``, ``chat_status``): unlike the
+  ticket metrics, the date range filters on the ledger row's ``created_at`` (when the
+  money was spent). Flat-fee plan rows (``plan = 1``) are left out, as in the caps.
+  *Tickets* = bucket ``live`` rows with no ``chat_session_id``; *chat* = rows with one
+  (bucket ``live`` by contract, option C; any bucket is counted, as in
+  ``Store.chat_spend_total``); *experiments* = bucket ``experiments`` rows. The repo
+  filter matches a chat row by its session's repo and any other row by its ticket's
+  repo (a row with neither drops out under a repo filter); the model filter is ignored.
 """
 
 from __future__ import annotations
@@ -64,7 +83,10 @@ from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, time, timedelta
 from typing import Any, Literal
 
+from foreman_inator.config import DEFAULT_CHAT_MONTHLY_USD
 from foreman_inator.db.store import Store
+from foreman_inator.experiments import pair as pair_mod
+from foreman_inator.experiments.pair import PairRecord
 
 Bucket = Literal["day", "week", "month"]
 BUCKETS: tuple[str, ...] = ("day", "week", "month")
@@ -270,6 +292,17 @@ started AS (
              WHERE ra.ticket_id = s.id AND r.shadow = 0) AS spend_usd,
         (SELECT COALESCE(SUM(a.cost_usd), 0) FROM attempts a
          WHERE a.ticket_id = s.id) AS attempt_spend_usd,
+        (SELECT COALESCE(SUM(pa.cost_usd), 0) FROM pairs p
+         JOIN tickets lt ON lt.id = p.ticket_a + p.ticket_b - s.id AND lt."column" = 'dropped'
+         JOIN attempts pa ON pa.ticket_id = lt.id
+         WHERE p.status = 'decided' AND p.winner_ticket_id = s.id)
+          + (SELECT COALESCE(SUM(r.cost_usd), 0) FROM pairs p
+             JOIN tickets lt ON lt.id = p.ticket_a + p.ticket_b - s.id
+               AND lt."column" = 'dropped'
+             JOIN attempts ra ON ra.ticket_id = lt.id
+             JOIN reviews r ON r.attempt_id = ra.id
+             WHERE p.status = 'decided' AND p.winner_ticket_id = s.id AND r.shadow = 0)
+          AS pair_loser_spend_usd,
         (SELECT COALESCE(SUM(a.seconds), 0) FROM attempts a
          WHERE a.ticket_id = s.id) AS attempt_seconds,
         (SELECT COUNT(*) FROM kickbacks k JOIN attempts ka ON ka.id = k.attempt_id
@@ -383,10 +416,14 @@ def cost_per_accepted_ticket(store: Store, filt: MetricsFilter | None = None) ->
     Implemented: for closed tickets started on the model, the sum of every attempt's
     cost (failed, superseded and explore attempts included) plus every non-shadow AI
     review's cost ÷ the number of those tickets. Spend on tickets still open is left
-    out until they close (the denominator only has accepted tickets).
+    out until they close (the denominator only has accepted tickets). A ``ab:pair``
+    winner also carries its losing sibling's spend (attempts plus non-shadow reviews,
+    through ``pairs``): the loser is dropped, so without this its spend would vanish
+    from every metric, and the head-to-head is what bought the accepted change.
     """
     sql = _STARTED + (
-        "SELECT COALESCE(SUM(spend_usd), 0) AS total, COUNT(*) AS n FROM started WHERE closed"
+        "SELECT COALESCE(SUM(spend_usd + pair_loser_spend_usd), 0) AS total, COUNT(*) AS n"
+        " FROM started WHERE closed"
     )
     row = store.query(sql, _p(filt))[0]
     return Mean(float(row["total"]), int(row["n"]))
@@ -574,7 +611,7 @@ def trend(
         raise ValueError(f"bucket must be one of {BUCKETS}")
     sql = _STARTED + (
         f"SELECT {_BUCKET_SQL[bucket]} AS bucket, COUNT(*) AS accepted,"
-        " COALESCE(SUM(spend_usd), 0) AS spend,"
+        " COALESCE(SUM(spend_usd + pair_loser_spend_usd), 0) AS spend,"
         " COALESCE(SUM(accepted_tier IN (1, 2)), 0) AS local"
         " FROM started WHERE closed GROUP BY 1 ORDER BY 1"
     )
@@ -687,6 +724,258 @@ def filter_options(store: Store) -> FilterOptions:
     return FilterOptions(writer_models=by["w"], reviewer_models=by["r"], repos=by["p"])
 
 
+# --- spend split: tickets vs chat vs experiments (#60, chat-design section 5) ----------
+
+
+@dataclass(frozen=True, slots=True)
+class ChatSubCap:
+    """Chat's share of one month's live spend against ``chat_monthly_usd`` (option C)."""
+
+    month_start: str  # UTC instants of the month window [start, end)
+    month_end: str
+    used_usd: float  # ``Store.chat_spend_total`` over the window
+    cap_usd: float
+    remaining_usd: float = field(init=False)
+    share: float | None = field(init=False)  # used ÷ cap; None for a $0 cap
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "remaining_usd", max(0.0, self.cap_usd - self.used_usd))
+        object.__setattr__(self, "share", self.used_usd / self.cap_usd if self.cap_usd else None)
+
+
+@dataclass(frozen=True, slots=True)
+class SpendSplit:
+    """Ledger spend in the filter's range, split by who spent it, plus chat activity.
+
+    ``chat_fallback_turns`` is derived, not stored: a turn counts when its session has a
+    ledger row inside the turn's window (``started_at`` .. ``ended_at``, or the next
+    turn's start while it has no ``ended_at``) whose model is
+    not the turn's model. Local calls cost $0 and write no ledger row, so such a row is
+    the decision-2 cloud fallback ("local slot busy, used <model>"). Plan rows count here
+    (a fallback to a flat-fee plan model is still a fallback). It over-counts only when
+    the session's ``small_model`` (tier 1) is a cloud model and was called during a turn
+    on another model; the exact note lives in the turn's span (``chat.local_fallback``)."""
+
+    tickets_usd: float
+    chat_usd: float
+    experiments_usd: float
+    chat_sessions: int  # sessions started in the range
+    chat_turns: int  # turns started in the range
+    chat_turns_by_status: dict[str, int]  # finished / aborted / ... / running (NULL)
+    chat_fallback_turns: int
+    chat_subcap: ChatSubCap
+    live_usd: float = field(init=False)  # tickets + chat: what daily/monthly caps see
+    total_usd: float = field(init=False)
+
+    def __post_init__(self) -> None:
+        live = self.tickets_usd + self.chat_usd
+        object.__setattr__(self, "live_usd", live)
+        object.__setattr__(self, "total_usd", live + self.experiments_usd)
+
+
+@dataclass(frozen=True, slots=True)
+class SpendPoint:
+    """One trend bucket of the spend split (bucketed by the ledger row's day)."""
+
+    bucket: str  # ISO date of the bucket start
+    tickets_usd: float
+    chat_usd: float
+    experiments_usd: float
+
+
+@dataclass(frozen=True, slots=True)
+class ChatStatus:
+    """The chat figure on ``fman status``'s spend line (``SpendSummary``)."""
+
+    chat_today_usd: float
+    chat_month_usd: float
+    tickets_today_usd: float
+    tickets_month_usd: float
+    chat_cap_usd: float
+    chat_blocked: bool = field(init=False)  # the chat sub-cap is used up
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "chat_blocked", self.chat_month_usd >= self.chat_cap_usd - 1e-9)
+
+    def line(self) -> str:
+        out = (
+            f"chat ${self.chat_today_usd:.2f} today, ${self.chat_month_usd:.2f} of "
+            f"${self.chat_cap_usd:.2f} this month (tickets ${self.tickets_today_usd:.2f} "
+            f"today, ${self.tickets_month_usd:.2f} this month)"
+        )
+        return out + (" [chat sub-cap reached]" if self.chat_blocked else "")
+
+
+# led: plan = 0 ledger rows in the range, each with the repo it belongs to.
+_LEDGER = """
+led AS (
+    SELECT l.bucket, l.cost_usd, l.created_at, l.chat_session_id,
+           COALESCE(cs.repo, t.repo) AS repo
+    FROM spend_ledger l
+    LEFT JOIN chat_sessions cs ON cs.id = l.chat_session_id
+    LEFT JOIN tickets t ON t.id = l.ticket_id
+    WHERE l.plan = 0
+      AND (:since IS NULL OR l.created_at >= :since)
+      AND (:until IS NULL OR l.created_at < :until)
+)"""
+
+_SPLIT_SUMS = """
+    COALESCE(SUM(CASE WHEN bucket = 'live' AND chat_session_id IS NULL
+                      THEN cost_usd END), 0) AS tickets,
+    COALESCE(SUM(CASE WHEN chat_session_id IS NOT NULL THEN cost_usd END), 0) AS chat,
+    COALESCE(SUM(CASE WHEN bucket = 'experiments' AND chat_session_id IS NULL
+                      THEN cost_usd END), 0) AS experiments"""
+
+
+def _ts(value: datetime) -> str:
+    """Datetime → the store's text format (naive = UTC), for bind parameters."""
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=UTC)
+    return value.astimezone(UTC).isoformat(timespec="microseconds")
+
+
+def _split_sums(store: Store, params: dict[str, Any]) -> tuple[float, float, float]:
+    sql = "WITH " + _LEDGER + "\nSELECT" + _SPLIT_SUMS + " FROM led"
+    sql += " WHERE (:repo IS NULL OR repo = :repo)"
+    r = store.query(sql, params)[0]
+    return float(r["tickets"]), float(r["chat"]), float(r["experiments"])
+
+
+def utc_month(now: datetime) -> tuple[datetime, datetime]:
+    """The UTC calendar month containing ``now`` as [start, end). The caps use the
+    configured local month (``Spend.month_window``); callers that have it pass it."""
+    now = now.astimezone(UTC) if now.tzinfo else now.replace(tzinfo=UTC)
+    first = datetime(now.year, now.month, 1, tzinfo=UTC)
+    nxt = datetime(now.year + (now.month == 12), now.month % 12 + 1, 1, tzinfo=UTC)
+    return first, nxt
+
+
+def chat_subcap(
+    store: Store,
+    *,
+    chat_monthly_usd: float = DEFAULT_CHAT_MONTHLY_USD,
+    month: tuple[datetime, datetime] | None = None,
+) -> ChatSubCap:
+    """Chat spend in ``month`` (default: the UTC month of ``store.now()``) against the
+    chat sub-cap. Reads ``Store.chat_spend_total``, the number ``Spend`` checks."""
+    start, end = month or utc_month(store.now())
+    used = store.chat_spend_total(start, end)
+    return ChatSubCap(_ts(start), _ts(end), used, float(chat_monthly_usd))
+
+
+def spend_split(
+    store: Store,
+    filt: MetricsFilter | None = None,
+    *,
+    chat_monthly_usd: float = DEFAULT_CHAT_MONTHLY_USD,
+    month: tuple[datetime, datetime] | None = None,
+) -> SpendSplit:
+    """Live ticket spend vs chat spend vs experiments in the filter's range (ledger
+    ``created_at``; repo applies, model ignored), chat sessions and turns started in the
+    range, turns that used the cloud fallback, and the chat sub-cap for ``month``."""
+    params = _p(filt)
+    tickets, chat, experiments = _split_sums(store, params)
+    in_range = (
+        "(:since IS NULL OR {c} >= :since) AND (:until IS NULL OR {c} < :until)"
+        " AND (:repo IS NULL OR cs.repo = :repo)"
+    )
+    sessions = store.query(
+        "SELECT COUNT(*) AS n FROM chat_sessions cs WHERE " + in_range.format(c="cs.started_at"),
+        params,
+    )[0]["n"]
+    turn_where = in_range.format(c="ct.started_at")
+    by_status = {
+        r["status"]: int(r["n"])
+        for r in store.query(
+            "SELECT COALESCE(ct.status, 'running') AS status, COUNT(*) AS n FROM chat_turns ct"
+            " JOIN chat_sessions cs ON cs.id = ct.session_id WHERE "
+            + turn_where
+            + " GROUP BY 1 ORDER BY 1",
+            params,
+        )
+    }
+    fallback = store.query(
+        "SELECT COUNT(*) AS n FROM chat_turns ct JOIN chat_sessions cs ON cs.id = ct.session_id"
+        " WHERE "
+        + turn_where
+        + """ AND EXISTS (
+        SELECT 1 FROM spend_ledger l
+        WHERE l.chat_session_id = ct.session_id
+          AND l.created_at >= ct.started_at
+          AND (ct.ended_at IS NULL OR l.created_at <= ct.ended_at)
+          AND NOT EXISTS (SELECT 1 FROM chat_turns nx WHERE nx.session_id = ct.session_id
+                          AND nx.seq > ct.seq AND nx.started_at <= l.created_at)
+          AND l.model IS NOT NULL AND l.model != ct.model)""",
+        params,
+    )[0]["n"]
+    return SpendSplit(
+        tickets_usd=tickets,
+        chat_usd=chat,
+        experiments_usd=experiments,
+        chat_sessions=int(sessions),
+        chat_turns=sum(by_status.values()),
+        chat_turns_by_status=by_status,
+        chat_fallback_turns=int(fallback),
+        chat_subcap=chat_subcap(store, chat_monthly_usd=chat_monthly_usd, month=month),
+    )
+
+
+def spend_trend(
+    store: Store, filt: MetricsFilter | None = None, *, bucket: Bucket = "week"
+) -> list[SpendPoint]:
+    """The spend split per ``day`` / ``week`` (from Monday) / ``month`` of the ledger
+    row's ``created_at`` (UTC); empty buckets between the first and last are filled."""
+    if bucket not in _BUCKET_SQL:
+        raise ValueError(f"bucket must be one of {BUCKETS}")
+    sql = (
+        "WITH "
+        + _LEDGER
+        + f"\nSELECT {_BUCKET_SQL[bucket]} AS bucket,"
+        + _SPLIT_SUMS
+        + " FROM led WHERE (:repo IS NULL OR repo = :repo) GROUP BY 1 ORDER BY 1"
+    )
+    found = {
+        r["bucket"]: SpendPoint(
+            r["bucket"], float(r["tickets"]), float(r["chat"]), float(r["experiments"])
+        )
+        for r in store.query(sql, _p(filt))
+    }
+    if not found:
+        return []
+    keys = sorted(found)
+    out: list[SpendPoint] = []
+    d, last = date.fromisoformat(keys[0]), date.fromisoformat(keys[-1])
+    while d <= last:
+        k = d.isoformat()
+        out.append(found.get(k) or SpendPoint(k, 0.0, 0.0, 0.0))
+        d = _next_bucket(d, bucket)
+    return out
+
+
+def chat_status(
+    store: Store,
+    *,
+    day: tuple[datetime, datetime],
+    month: tuple[datetime, datetime],
+    chat_monthly_usd: float = DEFAULT_CHAT_MONTHLY_USD,
+) -> ChatStatus:
+    """Chat and ticket spend for ``fman status``: today and this month, in the windows
+    ``Spend.day_window`` / ``Spend.month_window`` give (so the figures match the caps)."""
+
+    def sums(w: tuple[datetime, datetime]) -> tuple[float, float, float]:
+        return _split_sums(store, {"since": _ts(w[0]), "until": _ts(w[1]), "repo": None})
+
+    t_day, c_day, _ = sums(day)
+    t_month, c_month, _ = sums(month)
+    return ChatStatus(
+        chat_today_usd=c_day,
+        chat_month_usd=c_month,
+        tickets_today_usd=t_day,
+        tickets_month_usd=t_month,
+        chat_cap_usd=float(chat_monthly_usd),
+    )
+
+
 # --- the whole report (the page and the JSON endpoint share it) ------------------------
 
 
@@ -722,6 +1011,11 @@ class Report:
     local_share: Rate
     trend: list[TrendPoint]
     recent: list[RecentTicket]
+    # #60: tickets vs chat vs experiments (never part of a writer/router metric)
+    spend: SpendSplit | None = None
+    spend_trend: list[SpendPoint] = field(default_factory=list)
+    # #34: ab:pair W-L per model pair (shown only; never gates promotion)
+    pairs: list[PairRecord] = field(default_factory=list)
 
 
 def writer_row(store: Store, filt: MetricsFilter) -> WriterRow:
@@ -740,9 +1034,17 @@ def writer_row(store: Store, filt: MetricsFilter) -> WriterRow:
     )
 
 
-def report(store: Store, filt: MetricsFilter | None = None, *, bucket: Bucket = "week") -> Report:
+def report(
+    store: Store,
+    filt: MetricsFilter | None = None,
+    *,
+    bucket: Bucket = "week",
+    chat_monthly_usd: float = DEFAULT_CHAT_MONTHLY_USD,
+    month: tuple[datetime, datetime] | None = None,
+) -> Report:
     """Every metric for the filter: an overall row plus one row per writer model, one
-    row per reviewer model, the pipeline comparison and the trend lines."""
+    row per reviewer model, the pipeline comparison and the trend lines, plus the spend
+    split (#60; ``chat_monthly_usd`` and ``month`` are for its chat sub-cap)."""
     filt = filt or MetricsFilter()
     opts = filter_options(store)
     writers: Sequence[str] = [filt.model] if filt.model else opts.writer_models
@@ -759,7 +1061,17 @@ def report(store: Store, filt: MetricsFilter | None = None, *, bucket: Bucket = 
         local_share=local_share(store, filt),
         trend=trend(store, filt, bucket=bucket),
         recent=recent_tickets(store, filt),
+        spend=spend_split(store, filt, chat_monthly_usd=chat_monthly_usd, month=month),
+        spend_trend=spend_trend(store, filt, bucket=bucket),
+        pairs=pair_record(store, filt),
     )
+
+
+def pair_record(store: Store, filt: MetricsFilter | None = None) -> list[PairRecord]:
+    """W-L and cost per win per model pair over decided ``ab:pair`` pairs (#34), from
+    ``experiments.pair.score``. Only the repo filter applies (a pair's two sides are on
+    two models, so the model filter does not pick one). Empty when nothing is paired."""
+    return pair_mod.score(store, repo=(filt or MetricsFilter()).repo)
 
 
 # --- failure steps per variant (#27, wired in #29) -------------------------------------
@@ -864,6 +1176,8 @@ __all__ = [
     "BUCKETS",
     "LOCAL_TIERS",
     "Bucket",
+    "ChatStatus",
+    "ChatSubCap",
     "Duration",
     "FailureSteps",
     "FilterOptions",
@@ -877,10 +1191,14 @@ __all__ = [
     "Report",
     "ReviewerMisses",
     "ReviewerRow",
+    "SpendPoint",
+    "SpendSplit",
     "TrendPoint",
     "WriterRow",
     "ai_kickbacks_per_ticket",
     "attempt_minutes_per_accepted_ticket",
+    "chat_status",
+    "chat_subcap",
     "cost_per_accepted_ticket",
     "escalation_rate",
     "failure_steps_by_variant",
@@ -888,14 +1206,18 @@ __all__ = [
     "first_try_accept_rate",
     "kickbacks_per_ticket",
     "local_share",
+    "pair_record",
     "post_merge_quality",
     "recent_tickets",
     "report",
     "reviewer_miss_rate",
     "reviewer_misses_by_variant",
     "router_hit_rate",
+    "spend_split",
+    "spend_trend",
     "time_to_accept",
     "trend",
+    "utc_month",
     "writer_reviewer_vs_strong_writer",
     "user_reviews_per_accepted_ticket",
     "writer_row",

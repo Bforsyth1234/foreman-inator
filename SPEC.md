@@ -305,6 +305,7 @@ The worker is the only piece that runs code. It authenticates as the GitHub App,
 | PR review: Request changes | Kickback: comment becomes the note, `kickback:<tag>` label gives the tag; new attempt |
 | PR review: Approve, then merge | Accept: record outcome, close issue, post summary comment |
 | Issue closed without merge | Drop the ticket |
+| `ab:pair` label (by an allowed user) with or after `agent` | Open side B: a second ticket and PR on another model; merging one closes the other |
 
 The PR stays a draft through AI review. Only a reviewer-approved PR (or one handed over after the loop cap) is marked ready for review, which is what notifies you.
 
@@ -325,6 +326,66 @@ worker's startup log list each plugin with its version. The dependency is one wa
 import foreman-inator, foreman-inator never imports a plugin by name. No hook can relax an
 invariant (7a-7g): plugins get no way around the user's merge, the allowed users, local by
 default, the secrets rules, the retry caps, reviewer independence or the sandbox.
+
+## Chat sessions
+
+`fman chat <repo>` (terminal) and `/chat` on the local metrics page are two front ends on one
+engine that drives OpenCode in a worktree through the same tiers, proxy, spend caps and sandbox
+as a ticket. It lives in the process that shows it, never in the worker. Design and decisions
+(2026-11-25): [docs/chat-design.md](docs/chat-design.md). How each invariant holds for chat:
+
+- **7a Nothing merges without the user.** Chat branches are `fman/chat/<id>`, cut from the
+  repo's base branch (never a ticket's `fman/` branch). `/pr` opens a **draft** with no AI
+  review; nothing marks it ready, approves or merges. The model has no token: only the
+  manager pushes, and only that branch.
+- **7b Only allowed users start work.** A chat starts only from loopback: the terminal, or the
+  metrics page (loopback bind, Host check, every POST behind the form token and own Origin).
+  Only on a watched repo; no GitHub text enters a chat unless the user pastes it.
+- **7c Local by default.** Sessions start on tier 1 (local). Cloud only on a tier configured
+  cloud (or the one-turn fallback when the local slot stays busy past
+  `chat_local_wait_seconds`), inside the live caps and the chat sub-cap `chat_monthly_usd`
+  (chat counts toward `monthly_usd`), every call a traced `llm.call`. A local-only repo never
+  reaches a cloud model. Recordings (`recordings/chat/`) and traces stay on the Mac.
+- **7d Secrets never in the repo.** Keys stay behind the proxy; OpenCode gets a dummy key and
+  a scrubbed environment; chat state lives in `~/.foreman-inator/`. Errors and user rows in
+  recordings are scrubbed.
+- **7e No silent loops.** One message is one turn, capped by `writer_timeout_seconds`,
+  `chat_turn_budget_usd` and the input-token limits. A refused or failed turn is never re-sent
+  by the engine: only `/approve` or the user's next message continues. An idle session ends
+  after `chat_idle_minutes`.
+- **7f The reviewer is independent.** No AI review runs on chat PRs (the user was in the loop).
+  Chats never feed the router, replays or experiments.
+- **7g Model-written code runs sandboxed.** OpenCode and its tools run under the writer
+  policy, `/verify` under the verify policy; no sandbox backend means no chat starts;
+  `sandbox = "off"` is shown on the page and in the PR. Network beyond the proxy only with the
+  per-repo `chat_network` opt-in (the dependency-install policy, ports 443/80).
+
+Chat sessions lock the files they edit (tickets wait; released on `/pr`, `/discard` or the end
+of the session); one session is open at a time (`chat_max_sessions = 1`).
+
+## Head-to-head pairs (ab:pair)
+
+`ab:pair` makes an issue two sibling tickets linked by a `pairs` row: side A is the
+normal ticket, side B copies A's route and runs an opponent on its first attempt (the
+running writer experiment's challenger when it fits A's tier, else the next rung up,
+else the rung below), then each side escalates, is reviewed and spends on its own.
+Design: todo #34 / GH #16. How each invariant holds:
+
+- **7a Nothing merges without the user.** The worker never merges either PR. You pick by
+  merging one; only then does the worker close the other PR, and it closes and deletes
+  only its own `fman/` PR and branch (the client refuses any head outside `fman/`).
+- **7b Only allowed users start work.** `ab:pair` counts only when an allowed user applied
+  it, like `agent`; the bot's own labels never count. Re-adding it to a ticket that was
+  already paired starts nothing (one comment).
+- **7c Local by default.** A local-only repo pairs only local models; with no second local
+  model there is no pair. A challenger opponent never sends a local ticket's code to the
+  cloud. Both sides count toward the spend caps; thrifty approvals are per side.
+- **7d Secrets never in the repo.** Unchanged: both sides run behind the same proxy.
+- **7e No silent loops.** Each side has its own retry, escalation, kickback and rebase caps;
+  side B is dropped (not run alone) when side A proposes a split.
+- **7f The reviewer is independent.** Each side gets its own AI review by a model of another
+  family than its writer, and never sees the other side's diff.
+- **7g Model-written code runs sandboxed.** Both sides run under the same sandbox policies.
 
 ## Open source and distribution
 

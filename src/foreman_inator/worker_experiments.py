@@ -58,7 +58,17 @@ champion against V, refused unless V's newest replay against that champion finis
 ``wins``, V's model is configured on the champion model's tier and is not cloud when the
 champion's model is local, and no other split against the champion is running.
 ``split stop <id>`` (``stop_split``) ends it as ``rejected``. The worker reads the
-running split on each first attempt (``worker_attempt``). ``ab:pair`` is not built.
+running split on each first attempt (``worker_attempt``).
+
+Head-to-head pairs (``ab:pair``, #34, GH #16)
+---------------------------------------------
+When side B's opponent is the running writer experiment's challenger
+(``pair.choose_opponent`` reason ``challenger``), ``ensure_pair`` returns the running
+``mode='pair'`` writer experiment of that champion and challenger (started if none); the
+pair row's ``experiment_id`` points at it. Its ``result_note`` holds the W-L and cost per
+win (``pair.note`` over ``pair.score``), refreshed by ``ensure_pair`` and by
+``refresh_pair_note`` after a pair is decided. Pair results are shown in ``status`` and
+promote output and never gate promotion (Decision 2).
 
 Rules replays (#43, todo #66)
 -----------------------------
@@ -88,6 +98,7 @@ from typing import Any
 from foreman_inator import paths, prompts
 from foreman_inator.config import Config, ConfigError
 from foreman_inator.db.store import Experiment, Store
+from foreman_inator.experiments import pair as pair_mod
 from foreman_inator.experiments import replay_runner as rr
 from foreman_inator.experiments import replay_sets as rs
 from foreman_inator.experiments import shadow, variants
@@ -414,6 +425,49 @@ def stop_split(store: Store, experiment_id: int) -> Experiment:
     j = split_mod.judge(c)
     note = f"stopped by `fman experiment split stop`\n{split_mod.comparison_note(c, j)}"
     return store.end_experiment(exp.id, "rejected", note)
+
+
+# =========================================================================== pair (#34)
+
+
+def running_pair_experiment(store: Store, champion: str, challenger: str) -> Experiment | None:
+    """The running writer ``mode='pair'`` experiment of this champion and challenger."""
+    for e in store.list_experiments(role="writer", status="running"):
+        if e.mode == "pair" and (e.champion_variant, e.challenger_variant) == (
+            champion,
+            challenger,
+        ):
+            return e
+    return None
+
+
+def refresh_pair_note(store: Store, experiment_id: int) -> Experiment:
+    """Rewrite a pair experiment's ``result_note`` from its decided pairs (W-L and cost
+    per win, ``pair.note``). Call after ``store.decide_pair`` of one of its pairs."""
+    note = pair_mod.note(pair_mod.score(store, experiment_id=experiment_id))
+    exp = store.get_experiment(experiment_id)
+    if exp.result_note == note:
+        return exp
+    return store.set_experiment_note(experiment_id, note)
+
+
+def ensure_pair(store: Store, opponent: Any, *, champion: str) -> Experiment | None:
+    """The running ``mode='pair'`` writer experiment side B's opponent counts toward, or
+    None when the opponent is not the running challenger (a rung opponent, or no
+    opponent). Started if none runs for (champion, challenger); its note is refreshed.
+    The worker passes its id as ``experiment_id`` to ``store.create_pair``."""
+    if opponent is None or getattr(opponent, "reason", None) != "challenger":
+        return None
+    challenger = getattr(opponent, "variant", None)
+    if not challenger or challenger == champion:
+        return None
+    exp = running_pair_experiment(store, champion, challenger)
+    if exp is None:
+        exp = store.create_experiment(
+            role="writer", champion_variant=champion, challenger_variant=challenger, mode="pair"
+        )
+        log.info("experiment %d: writer pairs %s vs %s started", exp.id, challenger, champion)
+    return refresh_pair_note(store, exp.id)
 
 
 CANCEL_NOTE = "cancelled from the metrics page"
@@ -1033,6 +1087,9 @@ __all__ = [
     "settings_from",
     "status_lines",
     "summary",
+    "ensure_pair",
+    "refresh_pair_note",
+    "running_pair_experiment",
     "split_lines",
     "start_split",
     "stop_split",

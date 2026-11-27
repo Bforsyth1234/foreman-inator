@@ -2,7 +2,8 @@
 
 One PR per ticket. Its head branch is the first attempt's branch (``pr_head_branch``),
 because a PR's head cannot change; later attempts are force-pushed onto it by the worker.
-This module never pushes and never merges.
+This module never pushes and never merges. An ``ab:pair`` side B (#16) has its own head
+(``fman/issue-<n>-b/a1``); while the pair runs, each side's body names the other's PR.
 
 Invariant 7a: ``Publisher.open_or_update_draft`` only creates drafts and edits bodies. It
 never marks a PR ready. ``Publisher.mark_ready`` exists for the worker alone, after the AI
@@ -93,11 +94,20 @@ class PublishResult:
 
 
 def pr_head_branch(ticket: Ticket) -> str:
-    """The PR's head branch for ``ticket``: its first attempt's branch, ``fman/issue-<n>/a1``.
+    """The PR's head branch for ``ticket``: its first attempt's branch, ``fman/issue-<n>/a1``
+    (an ``ab:pair`` side B, #16: ``fman/issue-<n>-b/a1``).
 
     The worker force-pushes every later attempt onto this branch.
     """
-    return branch_name(ticket.issue_number, 1)
+    return branch_name(ticket.issue_number, 1, ticket.pair_side)
+
+
+def pair_line(sibling_pr: int) -> str:
+    """#16: the line a paired PR's body carries, naming the other side's PR."""
+    return (
+        f"Head-to-head with #{int(sibling_pr)} (ab:pair): merge the one you prefer; "
+        "the other is closed."
+    )
 
 
 # --------------------------------------------------------------------------- rendering
@@ -261,6 +271,7 @@ def render_body(
     handover: Handover | None = None,
     sandbox: str | None = None,
     profile: str | None = None,
+    sibling_pr: int | None = None,
 ) -> str:
     """The full PR body. Pure: same inputs, same text.
 
@@ -270,6 +281,7 @@ def render_body(
     ``sandbox`` is ``runner.sandbox.describe(...)`` (#40); the attempt's ``ci_status``
     gives the CI line (#41). Both go at the end of the Verify section, then ``profile``
     (#51: ``routing.profile.pr_line``, given only for a repo whose profile is not default).
+    ``sibling_pr`` (#16): the other side's PR of a running ``ab:pair`` (``pair_line``).
     """
     ids = [a.id for a in attempts]
     if current.id not in ids:
@@ -280,6 +292,7 @@ def render_body(
     lines = [
         BODY_MARKER.format(ticket_id=ticket.id),
         f"Closes #{ticket.issue_number}",
+        *(["", pair_line(sibling_pr)] if sibling_pr is not None else []),
         "",
         *_handover(handover),
         "",
@@ -354,6 +367,7 @@ class Publisher:
             handover=handover,
             sandbox=self.sandbox_line,
             profile=self._profile_line(ticket.repo),
+            sibling_pr=self._sibling_pr(ticket),
         )
 
         pr = self._existing_pr(ticket, head)
@@ -375,6 +389,34 @@ class Publisher:
             action = "updated"
         note = None if pr.draft else "PR is no longer a draft (changed by a person); left as is"
         return PublishResult(pr, action, body, note)
+
+    def _sibling_pr(self, ticket: Ticket) -> int | None:
+        """#16: the PR number of the other side of the ticket's running pair, if opened."""
+        pair = self.store.pair_for_ticket(ticket.id)
+        if pair is None or pair.status != "running":
+            return None
+        return self.store.get_ticket(pair.other(ticket.id)).pr_number
+
+    def add_pair_line(self, ticket: Ticket) -> PullRequest | None:
+        """#16: put the head-to-head line into ``ticket``'s open PR body now that the
+        other side's PR exists (right under ``Closes #n``), without re-rendering the
+        rest. A no-op (None) with no PR, no running pair or sibling PR, a closed PR, or a
+        body that already has the line; the next full publish renders it anyway."""
+        ticket = self.store.get_ticket(ticket.id)
+        sibling = self._sibling_pr(ticket)
+        if ticket.pr_number is None or sibling is None:
+            return None
+        pr = self.gh.get_pr(ticket.repo, ticket.pr_number)
+        line = pair_line(sibling)
+        body = pr.body or ""
+        if pr.state != "open" or line in body:
+            return None
+        closes = f"Closes #{ticket.issue_number}"
+        if closes in body:
+            new = body.replace(closes, f"{closes}\n\n{line}", 1)
+        else:
+            new = f"{line}\n\n{body}"
+        return self.gh.update_pr(ticket.repo, pr.number, body=new)
 
     def _profile_line(self, repo: str) -> str | None:
         """#51: the repo profile line, or None for the default profile."""

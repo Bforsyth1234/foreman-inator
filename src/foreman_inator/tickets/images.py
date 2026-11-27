@@ -14,8 +14,14 @@ Safety (invariants 7b, 7c; SPEC "Untrusted input"):
   user-attachments/...``, ``https://user-images.githubusercontent.com/...`` and
   ``https://private-user-images.githubusercontent.com/...``; no port, no userinfo. A
   redirect is followed only to another allowed URL (at most ``MAX_REDIRECTS``), so a
-  crafted link cannot reach any other host (no SSRF). The App token is sent only to
-  ``github.com`` (private repos' ``user-attachments``), never to a redirect target.
+  crafted link cannot reach any other host (no SSRF). One exception, for redirects only
+  (todo #84, GitHub #83): a ``github.com/user-attachments/`` URL may redirect to GitHub's
+  asset bucket ``https://github-production-user-asset-6210df.s3.amazonaws.com/...``
+  (``_asset_redirect_ok``; exact host, https, no port, no userinfo). That host is never
+  a starting URL found in issue text, never reached from any other hop, and no other
+  bucket is allowed. The App token is sent only to ``github.com`` (private repos'
+  ``user-attachments``), never to a redirect target (headers are rebuilt per hop, so
+  ``Authorization`` is dropped on the cross-host hop to S3).
 * Size caps: ``MAX_IMAGE_BYTES`` per image (Content-Length first, then the bytes as they
   stream), ``MAX_TICKET_BYTES`` and ``MAX_IMAGES`` per ticket.
 * The type is checked by magic bytes (PNG, JPEG, GIF, WebP), never by the extension or
@@ -54,6 +60,20 @@ External APIs (rule 12, read 2026-11-25):
   attachments, PNG/JPEG/GIF/WebP, http(s) URLs not accepted). The installed 1.18.7 classic
   route ``POST /session/{id}/prompt_async`` takes ``parts`` (``runner/opencode.py``); the
   driver sends a single text part, so passing images needs a driver change (wiring).
+
+Attachment URLs and their redirects (rule 12, read 2026-11-25):
+
+* https://docs.github.com/en/get-started/writing-on-github/working-with-advanced-formatting/attaching-files
+  (public repos' uploads need no auth; private/internal ones only for people with repo
+  access) and https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/about-anonymized-urls
+  (uploads are "hosted under ``github.com/user-attachments/``"). Neither page documents
+  the redirect target; the 302 from ``github.com/user-attachments/assets/<id>`` to a
+  pre-signed (``X-Amz-*``) URL on ``github-production-user-asset-6210df.s3.amazonaws.com``
+  was observed on 2026-11-25 (bot-inator ticket #11, attempt 48).
+* ``private-user-images.githubusercontent.com`` URLs carry a short-lived signed JWT in
+  the query (https://github.blog/changelog/2023-05-09-more-secure-private-attachments,
+  read 2026-11-25). That host was already on the allow-list and gets no token (the JWT
+  is the credential), so it needs no change here; it is not a route to the S3 bucket.
 """
 
 from __future__ import annotations
@@ -102,6 +122,8 @@ _UPLOAD_HOSTS = frozenset(
 )
 _GITHUB = "github.com"
 _ATTACHMENTS_PATH = "/user-attachments/"
+# GitHub's attachment bucket: allowed only as the redirect target of a user-attachments URL.
+_ASSET_BUCKET = "github-production-user-asset-6210df.s3.amazonaws.com"
 
 _MD_IMAGE = re.compile(r"!\[[^\]]*\]\(\s*<?([^)\s>]+)>?(?:\s+\"[^\"]*\")?\s*\)")
 _IMG_TAG = re.compile(r"<img\b[^>]*?\bsrc\s*=\s*[\"']([^\"']+)[\"']", re.IGNORECASE)
@@ -130,6 +152,28 @@ def allowed_url(url: str) -> bool:
     if host in _UPLOAD_HOSTS:
         return True
     return host == _GITHUB and parts.path.startswith(_ATTACHMENTS_PATH)
+
+
+def _is_attachments_url(url: str) -> bool:
+    if not allowed_url(url):
+        return False
+    parts = urlsplit(url)
+    return (parts.hostname or "").lower() == _GITHUB and parts.path.startswith(_ATTACHMENTS_PATH)
+
+
+def _asset_redirect_ok(src: str, dst: str) -> bool:
+    """True only when ``src`` is a ``github.com/user-attachments/`` URL and ``dst`` is an
+    https URL on exactly GitHub's asset bucket host, with no port and no userinfo."""
+    if not _is_attachments_url(src):
+        return False
+    try:
+        parts = urlsplit(dst)
+        port = parts.port
+    except ValueError:
+        return False
+    if parts.scheme != "https" or port is not None or parts.username or parts.password:
+        return False
+    return (parts.hostname or "").lower() == _ASSET_BUCKET
 
 
 def image_urls(text: str) -> list[str]:
@@ -235,7 +279,7 @@ def fetch(
             with client.stream("GET", url, headers=headers) as resp:
                 if resp.is_redirect:
                     nxt = urljoin(url, resp.headers.get("location", ""))
-                    if not allowed_url(nxt):
+                    if not (allowed_url(nxt) or _asset_redirect_ok(url, nxt)):
                         raise ImageRefused(f"redirect off GitHub's attachment hosts: {nxt[:200]}")
                     url = nxt
                     continue

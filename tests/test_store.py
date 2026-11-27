@@ -91,7 +91,7 @@ ITEM_COLUMNS: dict[str, list[str]] = {
 
 # Beyond SPEC and the item: every addition is listed here so a change is deliberate.
 EXTRA_COLUMNS: dict[str, list[str]] = {
-    "tickets": ["routed_tier", "flag_reason", "flagged_at"],
+    "tickets": ["routed_tier", "flag_reason", "flagged_at", "pair_side"],  # 016: pair_side
     "attempts": [
         "started_at",
         "ended_at",
@@ -138,7 +138,19 @@ EXTRA_COLUMNS: dict[str, list[str]] = {
         "plan",  # migration 013: flat-fee plan calls, kept out of the caps
         "credits",  # migration 014 (#85): estimated GLM Coding Plan credits
     ],
-    "spend_approvals": ["id", "ticket_id", "approved_at", "consumed_at"],
+    "spend_approvals": [
+        "id",
+        "ticket_id",
+        "approved_at",
+        "consumed_at",
+        # migration 015 (#82): which attempt holds it, its room, and what it spent
+        "attempt_id",
+        "kind",
+        "limit_usd",
+        "spent_usd",
+        "settled_at",
+        "reopened",
+    ],
     "file_locks": ["repo", "path", "ticket_id", "acquired_at", "chat_session_id"],  # 012
     "schema_migrations": ["version", "name", "applied_at"],
     # migration 004 (#23)
@@ -222,6 +234,22 @@ EXTRA_COLUMNS: dict[str, list[str]] = {
         "decided_at",
         "experiment_id",
     ],  # fmt: skip
+    # migration 016 (#34)
+    "pairs": [
+        "id",
+        "repo",
+        "issue_number",
+        "ticket_a",
+        "ticket_b",
+        "opponent_variant",
+        "opponent_reason",
+        "experiment_id",
+        "status",
+        "winner_ticket_id",
+        "loser_outcome",
+        "created_at",
+        "decided_at",
+    ],
     # migration 012 (#60)
     "chat_sessions": [
         "id",

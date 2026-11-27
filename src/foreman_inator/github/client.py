@@ -70,6 +70,17 @@ Added in wave 15 (#24 / todo 47, rule 12, read 2026-11-25):
   ``YYYY-MM-DDTHH:MM:SSZ``); ``per_page`` max 100. Items have ``sha``, ``commit.message``,
   ``commit.committer.date`` and ``parents[].sha``. Pagination follows the ``Link`` header
   as for every other list here. https://docs.github.com/en/rest/commits/commits#list-commits
+
+Added for ab:pair (#16 / todo 34, rule 12, read 2026-11-26, same API version):
+- close a PR: "Update a pull request", ``PATCH /repos/{o}/{r}/pulls/{pull_number}``
+  ``{"state": "closed"}`` (``state`` is ``open`` | ``closed``) -> 200 with the PR; 403,
+  422 on validation failure or spam.
+  https://docs.github.com/en/rest/pulls/pulls#update-a-pull-request
+- delete a branch: "Delete a reference", ``DELETE /repos/{o}/{r}/git/refs/{ref}`` with
+  ``ref`` = ``heads/<branch>`` -> 204; 409 conflict; 422 on validation failure (e.g. the
+  default branch). Only ``fman/`` branches are ever deleted (invariant 7a); a ref that is
+  already gone is not swallowed (the caller decides).
+  https://docs.github.com/en/rest/git/refs#delete-a-reference
 """
 
 from __future__ import annotations
@@ -85,6 +96,7 @@ from urllib.parse import quote
 
 import httpx
 
+from ..runner.worktree import BranchRefused, check_branch
 from .app_auth import (
     API_URL,
     USER_AGENT,
@@ -266,6 +278,7 @@ class GitHubAPI(Protocol):
     def get_branch_sha(self, repo: str, branch: str) -> str: ...
     def create_branch(self, repo: str, branch: str, sha: str) -> Ref: ...
     def update_branch(self, repo: str, branch: str, sha: str, *, force: bool = False) -> Ref: ...
+    def delete_branch(self, repo: str, branch: str) -> None: ...
 
     def create_draft_pr(
         self, repo: str, *, head: str, base: str, title: str, body: str
@@ -274,6 +287,7 @@ class GitHubAPI(Protocol):
         self, repo: str, number: int, *, title: str | None = None, body: str | None = None
     ) -> PullRequest: ...
     def get_pr(self, repo: str, number: int) -> PullRequest: ...
+    def close_pr(self, repo: str, number: int) -> PullRequest: ...
     def find_pr_for_branch(self, repo: str, branch: str) -> PullRequest | None: ...
     def mark_ready_for_review(self, repo: str, number: int) -> PullRequest: ...
     def post_review(
@@ -304,8 +318,10 @@ WRITE_METHODS = frozenset(
         "close_issue",
         "create_branch",
         "update_branch",
+        "delete_branch",
         "create_draft_pr",
         "update_pr",
+        "close_pr",
         "mark_ready_for_review",
         "post_review",
     }
@@ -334,6 +350,21 @@ def label_applied_by(events: Iterable[IssueEvent], label: str) -> str | None:
 def require_fman_branch(branch: str) -> None:
     if not branch.startswith(BRANCH_PREFIX) or ".." in branch:
         raise ForbiddenOperation(f"branch {branch!r} is not a worker branch ({BRANCH_PREFIX}*)")
+
+
+def require_deletable_fman_branch(branch: str) -> None:
+    """``delete_branch``'s guard (7a): an ``fman/`` branch that is also a valid git branch
+    name (the worktree's ``check_branch`` / ``git check-ref-format`` rules) and carries no
+    ``%`` (a percent-escape could name another ref once the URL is decoded)."""
+    require_fman_branch(branch)
+    if branch.rstrip("/") + "/" == BRANCH_PREFIX:
+        raise ForbiddenOperation(f"branch {branch!r} names no worker branch")
+    if "%" in branch:
+        raise ForbiddenOperation(f"branch {branch!r} is not a worker branch name")
+    try:
+        check_branch(branch)
+    except BranchRefused as e:
+        raise ForbiddenOperation(str(e)) from e
 
 
 def _split(repo: str) -> tuple[str, str]:
@@ -719,9 +750,18 @@ class GitHubClient:
         require_fman_branch(branch)
         o, r = _split(repo)
         data = self._json(
-            "PATCH", f"/repos/{o}/{r}/git/refs/heads/{branch}", json={"sha": sha, "force": force}
+            "PATCH",
+            f"/repos/{o}/{r}/git/refs/heads/{quote(branch, safe='/')}",
+            json={"sha": sha, "force": force},
         )
         return ref_from_json(data)
+
+    def delete_branch(self, repo: str, branch: str) -> None:
+        """ab:pair (#16): delete the losing side's head branch. Refuses anything not under
+        ``fman/`` or not a valid branch name (invariant 7a) before any request."""
+        require_deletable_fman_branch(branch)
+        o, r = _split(repo)
+        self._json("DELETE", f"/repos/{o}/{r}/git/refs/heads/{quote(branch, safe='/')}")
 
     # -- pull requests
 
@@ -747,6 +787,14 @@ class GitHubClient:
     def get_pr(self, repo: str, number: int) -> PullRequest:
         o, r = _split(repo)
         return pr_from_json(self._json("GET", f"/repos/{o}/{r}/pulls/{number}"))
+
+    def close_pr(self, repo: str, number: int) -> PullRequest:
+        """ab:pair (#16): close the losing side's PR (never merges: there is no merge method).
+        Refuses, before any write, a PR whose head is not an ``fman/`` branch (7a)."""
+        require_fman_branch(self.get_pr(repo, number).head_ref)
+        o, r = _split(repo)
+        data = self._json("PATCH", f"/repos/{o}/{r}/pulls/{number}", json={"state": "closed"})
+        return pr_from_json(data)
 
     def find_pr_for_branch(self, repo: str, branch: str) -> PullRequest | None:
         o, r = _split(repo)

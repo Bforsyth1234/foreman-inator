@@ -35,6 +35,7 @@ as `"keychain:foreman-inator/<name>"`.
 | `max_open_prs_per_repo` | `5` | Open `fman/` PRs one repo may have before the worker waits to open another (attempts still run; only the draft PR waits, and `fman status` says `WAITING: open-PR cap`). 0 = no cap. |
 | `reviewer_order` | `"configured"` | How the AI reviewer is picked. `"configured"`: the first of `reviewer_models` of another family. `"cheapest"`: the cheapest cloud model (or one named in `reviewer_models`) of another family; a low-confidence verdict gets one more review by the `"configured"` pick, which decides. A local-only repo never gets that second review. |
 | `split_large` | `true` | For an issue the router calls large (tier 3), one tier 3 call proposes sub-issues as a comment and the ticket is flagged `split_proposed` instead of worked. You create and label the sub-issues you want; a `tier:N` label on the issue runs it as one ticket instead. Never for a local-only repo with a cloud tier 3. |
+| `pair_enabled` | `true` | Honour the `ab:pair` label: two models write the issue, two PRs, you merge one and the worker closes the other. `false`: the label is ignored, with one comment on the issue. |
 | `split_timeout_seconds` | `180` | Time limit for that proposal call. Above 0, at most 1800. |
 | `router_timeout_seconds` | `30` | Time limit for the router's classification call. Above 0, at most 600. |
 | `sandbox` | `"on"` | `"on"`: OpenCode, the verify command and the reviewer's checks run under `sandbox-exec`, and nothing runs if the sandbox cannot start. `"off"`: they run unsandboxed, and `fman status` and every PR description say so. |
@@ -65,7 +66,7 @@ as `"keychain:foreman-inator/<name>"`.
 | `status_comment` | `true` | Keep one comment on the issue up to date while work runs: attempt and tier, verifying, in review, PR opened, handed over, dropped. Edited in place, never one per step. A repo's settings row can turn it off. |
 | `status_label` | `false` | Also add the `fman:working` label while work runs (removed when it stops). It never starts work. |
 | `status_show_cost` | `false` | Put the spend so far in the status comment. Issue comments on a public repo are public. |
-| `chat_local_wait_seconds` | `5.0` | Chat sessions (#71, not usable yet): how long a chat turn waits for the local slot before it goes to the first cloud rung at or above its tier (never for a local-only repo, nor past a cap). 0 to 600. |
+| `chat_local_wait_seconds` | `5.0` | Chat sessions ([`fman chat`](commands.md#fman-chat) and the `/chat` page): how long a chat turn waits for the local slot before it goes to the first cloud rung at or above its tier (never for a local-only repo, nor past a cap). 0 to 600. |
 | `chat_start_tier` | `1` | Chat sessions: the tier a new session starts on. 1, 2 or 3. |
 | `chat_turn_budget_usd` | `attempt_budget_usd` | Chat sessions: cloud spend one chat message may use. Above 0. |
 | `chat_idle_minutes` | `30` | Chat sessions: an idle session ends after this (its worktree is kept). 1 to 1440. |
@@ -230,6 +231,7 @@ sandbox = "on"
 daily_usd = 5.0
 monthly_usd = 50.0
 experiments_monthly_usd = 10.0
+chat_monthly_usd = 20.0
 ```
 
 This file has no `[[models]]` tables, so it uses the five default models. A
@@ -255,8 +257,10 @@ These settings are kept in the worker's database rather than in `config.toml`:
 * the repo profile, set with `fman repo set-profile` (below);
 * the cloud setting, set with `fman repo set-cloud <owner/name> on|off`: `off`
   keeps the repo's code on this Mac (see [`fman repo set-cloud`](commands.md#fman-repo-set-cloud));
-* the chat network opt-in, set with `fman repo set-chat-network <owner/name> on|off`
-  (default off; chat sessions only, see
+* `chat_network`, the chat network opt-in, set with `fman repo set-chat-network
+  <owner/name> on|off` or on `/settings` (default off; chat sessions only: `on` gives
+  that repo's chat sandbox the outbound policy of a first-attempt dependency install,
+  ports 443/80, never your credentials; tickets are unaffected. See
   [`fman repo set-chat-network`](commands.md#fman-repo-set-chat-network)).
 
 ### Repo profiles

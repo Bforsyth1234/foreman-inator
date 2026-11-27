@@ -6,7 +6,8 @@ status | promote`` and ``replay`` (#29), ``repo add | remove | list`` (#56), ``p
 (#56), ``repo set-profile`` (#51), ``rules show`` (#42), ``repo set-cloud`` (#49),
 ``experiment split start | stop | status`` (#34), ``experiment run --mode seeded``
 (#35), ``sweep`` (#77), ``experiment propose | approve-draft | discard-draft`` (#49),
-``replay --fork`` (#18), ``retry`` (#73), ``repo set-chat-network`` (#71). Later waves
+``replay --fork`` (#18), ``retry`` (#73), ``repo set-chat-network`` (#71), ``chat
+OWNER/NAME | list | resume | pr | discard`` (#71, wave 21, ``chat_cli``). Later waves
 add ``@app.command()`` functions here.
 
 The callback below keeps `app` a multi-command group, so adding commands
@@ -675,6 +676,11 @@ def experiment_split_status(
 rules_app = typer.Typer(help="The rules (AGENTS.md, CLAUDE.md, rules_file) the models get.")
 app.add_typer(rules_app, name="rules")
 
+# #71 (wave 21): ``fman chat OWNER/NAME`` and its list / resume / pr / discard.
+from foreman_inator.chat_cli import chat_app  # noqa: E402 - registered with its peers
+
+app.add_typer(chat_app, name="chat")
+
 
 @rules_app.command("show")
 def rules_show_command(
@@ -956,7 +962,12 @@ def prune_command(
 
 @app.command("retry")
 def retry_command(
-    ticket: Annotated[str, typer.Argument(help="owner/repo#issue, or a ticket id.")],
+    ticket: Annotated[
+        str,
+        typer.Argument(
+            help="owner/repo#issue, owner/repo#issue:a|b (ab:pair side), or a ticket id."
+        ),
+    ],
     tier: Annotated[
         int | None,
         typer.Option("--tier", help="Retry on this tier (1-3).", show_default=False),

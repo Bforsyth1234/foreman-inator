@@ -12,6 +12,11 @@ contents, verify output, prompts or kickback notes: traces stay on the Mac (7c).
 the post when one written by the bot already carries this ticket's marker
 ``<!-- foreman-inator:summary ticket=<id> -->``. A re-labelled issue gets a new ticket id,
 so it gets its own summary.
+
+ab:pair (#34, GH #16, wave 23): for a side of a pair, ``post_summary`` adds the pair
+total, both sides' spend (``experiments.pair.ticket_cost``: attempts plus non-shadow
+reviews), right after the ticket's own cost: ``pair total $1.20 (both sides)``. The
+loser's spend is part of what the merged change cost. Unpaired lines are unchanged.
 """
 
 from __future__ import annotations
@@ -67,6 +72,7 @@ def summary_line(
     *,
     now: datetime | None = None,
     attempt_budget_usd: float | None = None,
+    pair_total_usd: float | None = None,
 ) -> str:
     """One line: who solved it, attempts, kickbacks, cost and time.
 
@@ -79,6 +85,8 @@ def summary_line(
       spend), formatted like the PR body. With ``attempt_budget_usd`` (#58) it adds the
       most one attempt spent against that per-attempt limit, and how many attempts
       stopped at their budget (``end_reason`` ``budget``) whenever any did.
+    * pair total (``pair_total_usd``, #34): both sides' spend when the ticket is a side
+      of an ``ab:pair``.
     * time: ``created_at`` → ``done_at`` (or ``now`` while ``done_at`` is not set yet).
     """
     ordered = sorted(attempts, key=lambda a: a.id)
@@ -105,6 +113,8 @@ def summary_line(
     parts.append(kb)
     cost = sum(a.cost_usd for a in attempts) + sum(r.cost_usd for r in reviews if not r.shadow)
     parts.append(f"cost {format_cost(cost)}")
+    if pair_total_usd is not None:
+        parts.append(f"pair total {format_cost(pair_total_usd)} (both sides)")
     budget = _attempt_budget_part(tries, attempt_budget_usd)
     if budget:
         parts.append(budget)
@@ -135,10 +145,17 @@ def summary_comment(
     *,
     now: datetime | None = None,
     attempt_budget_usd: float | None = None,
+    pair_total_usd: float | None = None,
 ) -> str:
     """The comment body: the hidden marker, then the one visible line."""
     line = summary_line(
-        ticket, attempts, reviews, kickbacks, now=now, attempt_budget_usd=attempt_budget_usd
+        ticket,
+        attempts,
+        reviews,
+        kickbacks,
+        now=now,
+        attempt_budget_usd=attempt_budget_usd,
+        pair_total_usd=pair_total_usd,
     )
     return f"{summary_marker(ticket.id)}\n{line}"
 
@@ -160,6 +177,20 @@ def find_summary(api: GitHubAPI, ticket: Ticket) -> Comment | None:
     return None
 
 
+def pair_total(store: Store, ticket_id: int) -> float | None:
+    """Both sides' spend when the ticket is a side of a pair, else None (also on a
+    database from before migration 016)."""
+    try:
+        pair = store.pair_for_ticket(ticket_id)
+    except Exception:
+        return None
+    if pair is None:
+        return None
+    from foreman_inator.experiments.pair import ticket_cost
+
+    return ticket_cost(store, pair.ticket_a) + ticket_cost(store, pair.ticket_b)
+
+
 def post_summary(
     api: GitHubAPI, store: Store, ticket_id: int, *, attempt_budget_usd: float | None = None
 ) -> SummaryResult:
@@ -176,6 +207,7 @@ def post_summary(
         store.list_kickbacks(ticket_id=ticket.id),
         now=store.now(),
         attempt_budget_usd=attempt_budget_usd,
+        pair_total_usd=pair_total(store, ticket.id),
     )
     existing = find_summary(api, ticket)
     if existing is not None:
@@ -189,6 +221,7 @@ __all__ = [
     "SummaryResult",
     "find_summary",
     "format_duration",
+    "pair_total",
     "post_summary",
     "summary_comment",
     "summary_line",

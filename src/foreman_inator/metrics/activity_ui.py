@@ -25,6 +25,12 @@ a Retry button on each flagged ticket (todo #79, GH #73).
 ``api_factory(config)`` (default: none) gives retry a GitHub client, which only a dropped
 ticket needs; the page offers Retry on flagged open tickets, so without one a dropped
 ticket's retry is refused with retry's own reason.
+
+ab:pair (#34, GH #16, wave 23): the two sides of a pair are grouped (side A's row, then
+side B's, when both are in one table) and carry a head-to-head badge (``pair #k · A vs
+#<sibling>``) and, once the pair is decided, a ``won`` / ``lost`` badge; both sides say
+"WAITING: on your pick: merge #x or #y" once both PRs are ready. Badge styles use the
+shared theme variables (the #81 restyle). Pages with no pair are unchanged.
 """
 
 from __future__ import annotations
@@ -43,7 +49,7 @@ from starlette.responses import HTMLResponse, Response
 from starlette.routing import BaseRoute, Route
 
 from foreman_inator.config import Config, ConfigError
-from foreman_inator.db.store import COLUMNS, OPEN_COLUMNS, Attempt, Store, Ticket
+from foreman_inator.db.store import COLUMNS, OPEN_COLUMNS, Attempt, Pair, Store, Ticket
 from foreman_inator.locks import Locks
 from foreman_inator.metrics import forms, web
 from foreman_inator.pr.publisher import format_cost
@@ -62,6 +68,13 @@ WRITER_TIMEOUT_SECONDS = 1200.0
 #: Closed tickets shown per column, as ``fman status`` (``closed_limit``).
 CLOSED_LIMIT = 5
 TIER_CHOICES = {"same": "same tier", "up": "move up a tier"}
+#: Badge styles for pair rows, on the shared theme variables; only on a page with a pair.
+PAIR_CSS = (
+    "<style>.badge { font-size: 0.75rem; border: 1px solid var(--line);"
+    " border-radius: 999px; padding: 0 0.45rem; color: var(--muted); white-space: nowrap; }"
+    " .badge.won { color: var(--accent); border-color: var(--accent); }"
+    " .badge.lost { color: var(--danger); border-color: var(--danger); }</style>"
+)
 
 e = html.escape
 
@@ -156,6 +169,43 @@ def _title(t: Ticket) -> str:
     return e(" ".join(t.title.split()))
 
 
+def pair_badge(pair: Pair | None, t: Ticket) -> str:
+    """The head-to-head badge (and ``won`` / ``lost`` once decided); "" unpaired."""
+    if pair is None:
+        return ""
+    side = "A" if t.id == pair.ticket_a else "B"
+    out = (
+        f' <span class="badge pair">pair #{int(pair.id)} · {e(side)} vs'
+        f" #{int(pair.other(t.id))}</span>"
+    )
+    if pair.status == "decided" and pair.winner_ticket_id is not None:
+        won = pair.winner_ticket_id == t.id
+        out += f' <span class="badge {"won" if won else "lost"}">{"won" if won else "lost"}</span>'
+    return out
+
+
+def group_pairs(tickets: Sequence[Ticket], pairs: dict[int, Pair]) -> list[Ticket]:
+    """``tickets`` in order, except a pair's two sides sit together (A then B) when both
+    are in the list, at the first side's place."""
+    ids = {t.id for t in tickets}
+    by_id = {t.id: t for t in tickets}
+    out: list[Ticket] = []
+    seen: set[int] = set()
+    for t in tickets:
+        if t.id in seen:
+            continue
+        p = pairs.get(t.id)
+        if p is not None and p.ticket_a in ids and p.ticket_b in ids:
+            for tid in (p.ticket_a, p.ticket_b):
+                if tid not in seen:
+                    out.append(by_id[tid])
+                    seen.add(tid)
+            continue
+        out.append(t)
+        seen.add(t.id)
+    return out
+
+
 def _elapsed(r: Running, timeout: float) -> str:
     text = format_duration(r.elapsed_seconds)
     if r.step not in ("writing", "verify"):
@@ -166,12 +216,17 @@ def _elapsed(r: Running, timeout: float) -> str:
     return out
 
 
-def _running_table(rows: Sequence[Running], timeout: float) -> str:
+def _running_table(
+    rows: Sequence[Running], timeout: float, pairs: dict[int, Pair] | None = None
+) -> str:
     head = "<h2>Running now</h2>"
     if not rows:
         return head + '<p class="empty">No attempt is running.</p>'
+    pairs = pairs or {}
+    rows = _regroup(rows, pairs)
     body = "".join(
-        f"<tr><td>#{r.ticket.id}</td><td>{issue_link(r.ticket)} {_title(r.ticket)}</td>"
+        f"<tr><td>#{r.ticket.id}{pair_badge(pairs.get(r.ticket.id), r.ticket)}</td>"
+        f"<td>{issue_link(r.ticket)} {_title(r.ticket)}</td>"
         f"<td>{e(r.attempt.model)}</td><td>{int(r.attempt.tier)}</td>"
         f"<td>{e(r.step)} <small>(attempt {r.number}, {e(r.attempt.trigger)})</small></td>"
         f"<td>{_elapsed(r, timeout)}</td>"
@@ -187,6 +242,11 @@ def _running_table(rows: Sequence[Running], timeout: float) -> str:
         f"<th>Cost</th><th>Files locked</th><th></th></tr></thead><tbody>{body}</tbody>"
         "</table></div>"
     )
+
+
+def _regroup(rows: Sequence[Running], pairs: dict[int, Pair]) -> list[Running]:
+    by_id = {r.ticket.id: r for r in rows}
+    return [by_id[t.id] for t in group_pairs([r.ticket for r in rows], pairs)]
 
 
 def retry_forms(guard: forms.FormGuard, t: Ticket) -> str:
@@ -225,6 +285,7 @@ def _ticket_notes(
     waits: dict[int, tuple[int, ...]],
     cap: int | None,
     chat_waits: dict[int, tuple[int, ...]] | None = None,
+    pairs: dict[int, Pair] | None = None,
 ) -> list[str]:
     """``fman status``'s FLAGGED / WAITING lines for one ticket (``worker_status._line``)."""
     ws = _ws()
@@ -245,6 +306,10 @@ def _ticket_notes(
     if chats:
         notes.append(f"WAITING: on files held by {ws._chat_holders(chats)}")
     notes.extend(f"WAITING: {why}" for why in ws._waits(t, attempts, store, cap))
+    pair = (pairs or {}).get(t.id)
+    pick = ws.pair_pick_wait(store, pair) if pair is not None else None
+    if pick:
+        notes.append(f"WAITING: {pick}")
     return notes
 
 
@@ -258,6 +323,7 @@ def _columns(store: Store, config: Config | None, closed_limit: int) -> tuple[st
     chat_waits = {w.ticket_id: w.chats for w in waiters if w.chats}
     budget = config.attempt_budget_usd if config is not None else None
     cap = int(config.max_open_prs_per_repo) if config is not None else None
+    pairs = ws.pair_map(store)
     out = ["<h2>Tickets by state</h2>"]
     flagged = waiting = 0
     for col in COLUMNS:
@@ -271,19 +337,27 @@ def _columns(store: Store, config: Config | None, closed_limit: int) -> tuple[st
         shown_ids = {x.id for x in shown}
         out.append(f'<h3 class="column" id="col-{e(col)}">{e(header)}</h3>')
         rows = []
-        for t in items:
+        for t in group_pairs(items, pairs):
             attempts = store.list_attempts(t.id)
-            notes = _ticket_notes(store, t, attempts, waits, cap, chat_waits)
+            notes = _ticket_notes(store, t, attempts, waits, cap, chat_waits, pairs)
             if t.column not in ("done", "dropped"):
                 spend = (t.flag_reason or "").startswith(FLAG_SPEND_CAP)
                 flagged += bool(t.flag_reason) and not spend
-                waiting += bool(t.id in waits or spend or ws._waits(t, attempts, store, cap))
+                waiting += bool(
+                    t.id in waits
+                    or spend
+                    or ws._waits(t, attempts, store, cap)
+                    or (t.id in pairs and ws.pair_pick_wait(store, pairs[t.id]))
+                )
             if t.id not in shown_ids:
                 continue
             pr = f"PR #{t.pr_number}" if t.pr_number is not None else ""
             extra = "".join(f'<br><small class="note">{e(n)}</small>' for n in notes)
+            pair = pairs.get(t.id)
+            attr = f' data-pair="{int(pair.id)}"' if pair is not None else ""
             rows.append(
-                f'<tr data-ticket="{t.id}"><td>#{t.id}</td><td>{issue_link(t)}</td>'
+                f'<tr data-ticket="{t.id}"{attr}><td>#{t.id}{pair_badge(pair, t)}</td>'
+                f"<td>{issue_link(t)}</td>"
                 f"<td>{_title(t)}{extra}</td>"
                 f"<td>{e(ws._attempt_text(attempts, budget))}</td><td>{e(pr)}</td></tr>"
             )
@@ -354,15 +428,16 @@ def render_activity(
     if timeout is None:
         timeout = config.writer_timeout_seconds if config is not None else WRITER_TIMEOUT_SECONDS
     rows = running(store, now=now, traces_dir=traces_dir)
+    pairs = _ws().pair_map(store)
     flagged = [t for t in store.list_tickets(column=OPEN_COLUMNS) if t.flag_reason]
     columns, summary = _columns(store, config, closed_limit)
-    body = "<h1>Activity</h1>"
+    body = (PAIR_CSS if pairs else "") + "<h1>Activity</h1>"
     if message:
         body += f'<p class="{"error" if error else "message"}">{e(message)}</p>'
     body += (
         f'<p class="lede">What the worker is doing now, as of {e(f"{now:%H:%M:%S}")} UTC; '
         f"this page reloads every {int(refresh_seconds)} seconds.</p>"
-        + _running_table(rows, float(timeout))
+        + _running_table(rows, float(timeout), pairs)
         + _flagged_table(guard, flagged)
         + columns
         + _summary_lines(store, config, summary)
@@ -469,7 +544,9 @@ __all__ = [
     "RETRY_PATH",
     "WRITER_TIMEOUT_SECONDS",
     "Running",
+    "group_pairs",
     "issue_link",
+    "pair_badge",
     "render_activity",
     "retry_forms",
     "routes",
